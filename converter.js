@@ -86,7 +86,7 @@ class NSZConverter {
                             onLog('error', `[CORRUPTED]  ${outputName} - hash mismatch!`);
                         }
                     } else {
-                        const expectedFromFilename = file.name.toLowerCase().replace('.nsz', '.nca');
+                        const expectedFromFilename = file.name.toLowerCase().replace(/\.(nsz|nspz|nsx)$/i, '.nca');
                         if (hash.startsWith(expectedFromFilename.substring(0, 32))) {
                             onLog('success', `[VERIFIED]   ${outputName}`);
                         }
@@ -226,7 +226,7 @@ class NSZConverter {
 
     async buildPFS0(files, writable = null, options = {}) {
         const { file = null, onLog = () => {}, fixPadding = false, onProgress = () => {} } = options;
-        const outputName = file ? file.name.replace(/\.nsz$/i, '.nsp') : 'output.nsp';
+        const outputName = file ? file.name.replace(/\.(nsz|nspz|nsx)$/i, '.nsp') : 'output.nsp';
         
         const stringTable = files.map(f => f.name).join('\0') + '\0';
         const headerSize = 0x10 + files.length * 0x18 + stringTable.length;
