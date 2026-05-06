@@ -52,15 +52,41 @@ The Python `nsz` tool processes multiple Nintendo compressed file formats. Each 
 
 **Detection:** `isCompressedGameFile(filePath)` — checks extension `.ncz`.
 
-**Structure:**
+**Structure (when stored inside NSZ PFS0 container) — VERIFIED AGAINST ORIGINAL nsz (nicoboss/nsz):**
 ```
-Offset  Size  Description
-0x0000 0x4000  Uncompressable header (NCA header)
-0x4000  0x08   Magic: "NCZSECTN"
-0x4008  0x08   Section count (u64 LE)
-...   variable   Section headers (Header.Section per section)
-...   variable   Block header (if NCZBLOCK) or zstd stream
+Offset (in NCZ file)  Size     Description
+0x0000               0x4000    NCA header (first 0x4000 bytes of original NCA, still encrypted)
+0x4000               0x08      Magic: "NCZSECTN" (8 bytes, ASCII)
+0x4008               0x08      Section count (u64 LE)
+0x4010               variable   Section headers (64 bytes each, see below)
+...                  variable   Compressed data (zstd stream or NCZBLOCK header + blocks)
 ```
+
+**Structure (standalone .ncz file — NOT inside NSZ container):**
+```
+Offset (in NCZ file)  Size     Description
+0x0000               0x08      Magic: "NCZSECTN"
+0x0008               0x08      Section count (u64 LE)
+0x0010               variable   Section headers (64 bytes each)
+...                  variable   Compressed data (zstd stream or NCZBLOCK)
+```
+
+**Key findings from original nsz Python code (discovered during debugging):**
+1. NCA header at 0x0000 is ALWAYS present when NCZ is inside NSZ container
+2. Python code flow: `nspf.seek(0)` → `header = nspf.read(0x4000)` reads NCA header first
+3. Then `magic = nspf.read(8)` reads "NCZSECTN" at position 0x4000
+4. NCA header is written to output FIRST: `f.write(header)` before decompression
+5. Section.offset = offset into COMPRESSED DATA (not absolute file offset)
+6. If `section[0].offset > 0x4000`, a FakeSection is inserted for the gap
+7. **First section gap handling**: Must skip `UNCOMPRESSABLE_HEADER_SIZE - sections[0].offset` bytes for first section
+8. **FakeSection cryptoType = 1** (plaintext), NOT 0
+
+**Correct JS implementation approach (FIXED):**
+- Check magic at offset 0: if "NCZSECTN", no NCA header (standalone .ncz)
+- If not, check magic at offset 0x4000: if "NCZSECTN", NCA header present (from NSZ container)
+- Save NCA header (sliceBytes(data, 0, 0x4000)) and set nczhdrOffset = 0x4000
+- Parse sections starting at offset nczhdrOffset + 8
+- Handle first section gap by adding uncompressedSize to the starting offset
 
 **Section header (`Header.Section`):**
 ```
@@ -73,15 +99,21 @@ Offset  Size  Description
 0x30    0x10   Crypto counter IV (16 bytes)
 ```
 
-**Decompression:**
-1. Read 0x4000 byte uncompressable header
-2. Read "NCZSECTN" magic
-3. Read section count and parse each section
+**Decompression (when NCZ data includes NCA header at offset 0):**
+1. Extract first 0x4000 bytes as NCA header (saved for output)
+2. Find "NCZSECTN" magic at offset 0x4000 within NCZ data
+3. Read section count and parse each section (starting at offset 0x4008)
 4. If `section[0].offset > 0x4000`, create `FakeSection` for the gap (cryptoType=1, plaintext)
 5. Check for "NCZBLOCK" magic to determine compression type
 6. Decompress each section with appropriate method
 7. Apply AES decryption if cryptoType is 3 or 4
-8. SHA256 verify against filename stem
+8. Prepend NCA header to decompressed output
+9. SHA256 verify against filename stem
+
+**Decompression (when NCZ data starts directly with "NCZSECTN" at offset 0):**
+1. Read "NCZSECTN" magic at offset 0
+2. Read section count and parse each section (starting at offset 0x8)
+3. Continue as above, but no NCA header to prepend
 
 ---
 
@@ -207,27 +239,33 @@ if hexHash[:32] == fileNameHash:
 
 ## 10. Key Differences from Our Implementation
 
-### Issues to check in nsz-js:
+### Bugs found and FIXED in nsz-js (during debugging session):
 
-1. **FakeSection handling** — When `section[0].offset > 0x4000`, a FakeSection is inserted for the uncompressed gap. Does our code handle this?
+1. **NCZ header handling (FIXED)** — NCZ data from NSZ container includes NCA header (0x4000 bytes) at offset 0, with "NCZSECTN" magic at offset 0x4000. Code now checks both locations and preserves NCA header for output.
 
-2. **NCZBLOCK magic detection** — Must check for `b'NCZBLOCK'` magic at the right position after sections. If present, use block decompression; otherwise use zstd stream.
+2. **FakeSection cryptoType (FIXED)** — Was incorrectly set to 0, should be 1 (plaintext). Fixed in `ncz.js` line 80.
 
-3. **Crypto type filtering** — Only apply AES-CTR when `cryptoType in (3, 4)`. Types 1 and 2 are not decrypted.
+3. **First section gap handling (FIXED)** — Missing logic to skip uncompressed gap for first section. Python code: `if firstSection: uncompressedSize = UNCOMPRESSABLE_HEADER_SIZE - sections[0].offset; i += uncompressedSize`. Added `firstSection` flag to both `_decompressWithStreaming` and `_decompressWithBlocks`.
 
-4. **AES-CTR counter** — Uses `offset >> 4` (not `offset`) as the initial counter value. The offset is divided by 16 (block size).
+4. **AES-CTR counter endianness (FIXED)** — Python's `Counter.new(64, prefix=nonce[0:8], initial_value=(offset >> 4))` uses big-endian for counter bytes. Fixed in `_decryptChunk` to write counter bytes in big-endian order: `ctr[8 + (7 - j)] = ofs & 0xff`.
 
-5. **Section offset interpretation** — `s.offset` is the offset INTO the compressed data, not absolute file offset. The first section's offset minus 0x4000 gives the gap size.
+### Issues still to verify in nsz-js:
 
-6. **Block header reading** — Block header is read immediately after sections, before compressed data. The `compressedBlockSizeList` array has `numberOfBlocks` entries of i32 LE.
+1. **NCZBLOCK magic detection** — Must check for `b'NCZBLOCK'` magic at the right position after sections. If present, use block decompression; otherwise use zstd stream.
 
-7. **XCI decompression** — When decompressing XCZ, the HFS0 partition is processed per-partition with `ExtractHashes`. The XCI stream copies original container settings via `originalXciPath`.
+2. **Crypto type filtering** — Only apply AES-CTR when `cryptoType in (3, 4)`. Types 1 and 2 are not decrypted.
 
-8. **PFS0 stream for NSZ** — Uses `container.getPaddedHeaderSize()` or `container.getFirstFileOffset()` for the PFS0 header size. Also uses `getStringTableSize()` for the string table.
+3. **Section offset interpretation** — `s.offset` is the offset INTO the compressed data, not absolute file offset. The first section's offset minus 0x4000 gives the gap size.
 
-9. **Verification mode** — In verify mode, `f=None` for `__decompressNcz`, which skips writing but still computes SHA256 hash.
+4. **Block header reading** — Block header is read immediately after sections, before compressed data. The `compressedBlockSizeList` array has `numberOfBlocks` entries of i32 LE.
 
-10. **BlockDecompressorReader** — This is a separate module for NCZBLOCK format. Need to check if our implementation handles this or if it only supports zstd.
+5. **XCI decompression** — When decompressing XCZ, the HFS0 partition is processed per-partition with `ExtractHashes`. The XCI stream copies original container settings via `originalXciPath`.
+
+6. **PFS0 stream for NSZ** — Uses `container.getPaddedHeaderSize()` or `container.getFirstFileOffset()` for the PFS0 header size. Also uses `getStringTableSize()` for the string table.
+
+7. **Verification mode** — In verify mode, `f=None` for `__decompressNcz`, which skips writing but still computes SHA256 hash.
+
+8. **BlockDecompressorReader** — This is a separate module for NCZBLOCK format. Need to check if our implementation handles this or if it only supports zstd.
 
 ---
 
@@ -281,12 +319,13 @@ if hexHash[:32] == fileNameHash:
 | `CRYPTO_BKTR` | 4 | 4 | ✅ |
 | `CRYPTO_NCA0` | 0x3041434E | 0x3041434E | ✅ |
 
-### NCZ format implementation (✅ mostly aligned):
-
+### NCZ format implementation (✅ mostly aligned, bugs fixed):
 - Magic: `NCZSECTN` — ✅ matches
 - Section header layout (offset/size/crypto/key/counter) — ✅ matches
-- FakeSection gap handling — ✅ implemented in nsz-js
+- FakeSection gap handling — ✅ FIXED (cryptoType=1, not 0)
+- First section gap handling — ✅ FIXED (skip UNCOMPRESSABLE_HEADER_SIZE - sections[0].offset)
 - NCZBLOCK detection — ✅ implemented in nsz-js
 - Block decompressor — ✅ implemented in `ncz.js`
-- AES-CTR counter (nonce[0:8] + BE64 blockIndex) — ✅ matches Python PyCryptodome
+- AES-CTR counter (nonce[0:8] + BE64 blockIndex) — ✅ FIXED (big-endian counter)
+- NCA header preservation — ✅ FIXED (detect and prepend when present)
 - AES-XTS support — ✅ implemented in `aesxts.js`
