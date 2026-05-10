@@ -39,7 +39,7 @@ async function main() {
     function printUsage() {
         console.log('NSZ to NSP Converter');
         console.log('');
-        console.log('Usage: node nsz-convert.js <input> [output] [keys.txt] [options]');
+        console.log('Usage: node nsz-cli.js <input> [output] [keys.txt] [options]');
         console.log('');
         console.log('Input formats:');
         console.log('  .nsz, .nspz, .nsx   -> .nsp');
