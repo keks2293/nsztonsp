@@ -315,17 +315,17 @@ if hexHash[:32] == fileNameHash:
 
 | Extension | Python nsz handler | nsz-js support | Status |
 |-----------|-------------------|----------------|--------|
-| `.xci` | `Xci` | ✅ Partial (`xci.js` — XCIReader + HFS0Reader exist) | Read-only parser, no decompression |
-| `.xcz` | `Xci` | ❌ Not supported | Missing |
-| `.nsp` | `Nsp` | ✅ Partial (PFS0 reader/writer in `pfs0.js`) | Can parse, but no explicit NSP handling |
-| `.nsz` | `Nsp` | ✅ Fully implemented | Main focus of nsz-js |
-| `.nspz` | `Nsp` | ❌ Not supported | Missing |
-| `.nsx` | `Nsp` | ❌ Not supported | Missing |
-| `.nca` | `Nca` | ❌ Not supported | Missing |
-| `.ncz` | `File` | ✅ Partial (`ncz.js` — NCZDecompressor) | Only via NSZ container, not standalone |
+| `.xci` | `Xci` | ✅ `xci.js` — XCIReader + HFS0Reader | Read/write via XCZ→XCI |
+| `.xcz` | `Xci` | ✅ Full | `nsz-cli.js` and browser |
+| `.nsp` | `Nsp` | ✅ `pfs0.js` — PFS0 reader/writer | Output only |
+| `.nsz` | `Nsp` | ✅ Full | Main focus |
+| `.nspz` | `Nsp` | ✅ Full | Same format as `.nsz` |
+| `.nsx` | `Nsp` | ✅ Full | Same format as `.nsz` |
+| `.nca` | `Nca` | ❌ Not supported | No standalone NCA handler |
+| `.ncz` | `File` | ✅ `ncz.js` — NCZDecompressor | Standalone + inside NSZ |
 | `.nacp` | `Nacp` | ❌ Not supported | Missing |
-| `.tik` | `Ticket` | ❌ Not supported | Missing |
-| `.cnmt` | `Cnmt` | ❌ Not supported | Missing |
+| `.tik` | `Ticket` | ✅ Partial (`ticket.js` — Ticket parser) | Reading only, no handling |
+| `.cnmt` | `Cnmt` | ✅ Partial (`ticket.js` — Cnmt parser + hash extraction) | Reading only |
 | `normal` | `Hfs0` | ❌ Not supported | Missing |
 | `logo` | `Hfs0` | ❌ Not supported | Missing |
 | `update` | `Hfs0` | ❌ Not supported | Missing |
@@ -333,21 +333,13 @@ if hexHash[:32] == fileNameHash:
 
 ### Key gaps in nsz-js:
 
-1. **XCZ decompression** — XCI/XCZ is the primary format for Switch cartridge dumps. Python nsz handles both XCI (uncompressed) and XCZ (compressed) via the same `Xci` handler. nsz-js has `xci.js` with `XCIReader` and `HFS0Reader` parsers, but no decompression logic.
+1. **`.nca` files** — Python nsz supports parsing and processing individual `.nca` files. Not implemented in nsz-js.
 
-2. **`.nspz` format** — Python nsz treats `.nspz` identically to `.nsz` (both use `Nsp` handler). nsz-js only checks for `.nsz` extension in `main.js:150,159`.
+2. **`.nacp` files** — Python nsz has a dedicated NACP parser. Not implemented in nsz-js.
 
-3. **`.nsx` format** — Newer format in Python nsz (added in later versions), treated as `Nsp`. Not in nsz-js at all.
+3. **HFS0 partitions (`normal`, `logo`, `update`, `secure`)** — Python nsz handles these as virtual partitions within XCI. nsz-js has `HFS0Reader` in `xci.js` but no partition-level processing.
 
-4. **Standalone `.ncz`** — Python nsz supports `.ncz` as a single-file format (not just inside NSZ). nsz-js only handles NCZ sections within NSZ containers.
-
-5. **`.nca` files** — Python nsz supports parsing and processing individual `.nca` files. Not implemented in nsz-js.
-
-6. **`.nacp`, `.tik`, `.cnmt` files** — Python nsz has dedicated parsers for these Nintendo formats. nsz-js has partial CNMT parsing in `ticket.js` but no standalone file handlers.
-
-7. **HFS0 partitions (`normal`, `logo`, `update`, `secure`)** — Python nsz handles these as virtual partitions within XCI. nsz-js has `HFS0Reader` in `xci.js` but no partition-level processing.
-
-8. **Extension detection** — Python nsz uses `isNspNsz()` and `isXciXcz()` functions that check file content (magnets), not just extensions. nsz-js only checks file extension strings.
+4. **Extension detection** — Python nsz uses `isNspNsz()` and `isXciXcz()` functions that check file content (magnets), not just extensions. nsz-js only checks file extension strings.
 
 ### Crypto type constants (✅ aligned):
 
@@ -364,12 +356,12 @@ if hexHash[:32] == fileNameHash:
 - Section header layout (offset/size/crypto/key/counter) — ✅ matches
 - FakeSection gap handling — ✅ FIXED (cryptoType=1, not 0)
 - First section gap handling — ✅ FIXED (skip UNCOMPRESSABLE_HEADER_SIZE - sections[0].offset)
-- NCZBLOCK detection — ✅ implemented in nsz-js
+- NCZBLOCK detection — ✅ implemented in `ncz.js`
 - Block decompressor — ✅ implemented in `ncz.js`
 - AES-CTR counter (nonce[0:8] + BE64 blockIndex) — ✅ FIXED (big-endian counter)
 - NCA header preservation — ✅ FIXED (detect and prepend when present)
-- AES-XTS support — ✅ implemented in `aesxts.js`
 - Browser zstd decompression — `DecompressionStream('zstd')` NOT supported in any browser. Uses zstddec WASM library via `static/zstddec.mjs`. Handles any window size. See `BROWSER-ZSTD-LIMITATION.md`.
+- Shellcode zstd detection — ✅ implemented in `ncz.js`
 
 ### Chunk size comparison (nsz v4.6.1):
 
