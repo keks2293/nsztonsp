@@ -19,6 +19,8 @@
 
 3. **Hoisted dynamic SHA256 imports in CLI (`nsz-cli.js`)** — `SHA256` imported statically at module level instead of 3 separate `await import()` calls inside decompression loops.
 
+4. **Async zstd streaming wrapper (`crypto/zstddec-stream.js`)** — New module monkey-patches `ZSTDDecoder._init` to capture the WASM instance, then implements an async generator that reads+decompresses one chunk at a time. Browser streaming path in `fs/ncz.js` no longer accumulates all compressed chunks before decompression — peak compressed memory drops from file-size to `READ_CHUNK_SIZE` (16 MB).
+
 ## ✅ Recent Changes (2026-05-13)
 
 1. **SW streaming: fixed `<a download>` not intercepted by SW** — Chrome's download manager bypasses the Service Worker for `<a download>` fetches (no `[SW] fetch` log seen). Replaced with `window.open(streamUrl)` — navigation fetches are always routed through the SW. The SW responds with `Content-Disposition: attachment` which triggers the download.

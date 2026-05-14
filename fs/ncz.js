@@ -466,22 +466,20 @@ class NCZDecompressor {
             }
             await exitPromise;
         } else {
-            console.log('[ZSTD] Using zstddec WASM streaming decompression');
-            const compressedChunks = [];
+            console.log('[ZSTD] Using zstddec WASM streaming decompression (async)');
+            const { initZstddec, decodeStream } = await import('../crypto/zstddec-stream.js');
+            await initZstddec();
             let pos = headerEnd;
             let toRead = remaining;
-            while (toRead > 0) {
+            let decompOffset = UNCOMPRESSABLE_HEADER_SIZE;
+            for await (const decompChunk of decodeStream(async () => {
+                if (toRead <= 0) return null;
                 const size = Math.min(toRead, READ_CHUNK_SIZE);
                 const chunk = await this.reader.read(pos, size);
-                compressedChunks.push(chunk);
                 pos += size;
                 toRead -= size;
-            }
-            const { ZSTDDecoder } = await import('../static/zstddec.mjs');
-            const decoder = new ZSTDDecoder();
-            await decoder.init();
-            let decompOffset = UNCOMPRESSABLE_HEADER_SIZE;
-            for (const decompChunk of decoder.decodeStreaming(compressedChunks)) {
+                return chunk;
+            })) {
                 decompOffset = await this._processStreamDecompressedChunk(decompChunk, decompOffset, sortedSections, sectionAesCtrs, progressCallback, writeChunk, ncaSize);
             }
         }

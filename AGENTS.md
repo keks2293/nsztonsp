@@ -52,6 +52,11 @@ The `static/` folder contains downloaded/copied dependencies for browser use:
 
 When original files from npm don't work directly in the target environment:
 
+- **Problem**: `zstddec`'s `decodeStreaming()` is a synchronous generator — requires all input chunks to be available synchronously. Browser `File` API reads are async, forcing pre-reading the entire compressed stream into `compressedChunks[]` (~2.5 GB peak for large NSZ).
+  **Solution**: Monkey-patch `ZSTDDecoder.prototype._init` in `crypto/zstddec-stream.js` to capture the WASM `instance` object. Then implement an async generator that reads one chunk at a time from the `File` and feeds it directly to `ZSTD_decompressStream`. Peak compressed memory drops from file-size to one 16 MB chunk.
+  
+  Update when upgrading `zstddec`: the monkey-patch may break if `_init` signature changes. Verify by running the browser test page.
+
 - **Problem**: `DecompressionStream` API doesn't support `'zstd'` format in any browser — constructor throws `"Failed to construct 'DecompressionStream': Unsupported compression format: 'zstd'"`.
   **Solution**: Use `zstddec` (WASM-based native zstd) for all decompression in browser via `static/zstddec.mjs`. Imported in `crypto/zstd.js` and `fs/ncz.js`.
 
