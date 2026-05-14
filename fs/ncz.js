@@ -301,11 +301,8 @@ class NCZDecompressor {
             const result = Buffer.concat(chunks);
             decompressed = new Uint8Array(result.buffer, result.byteOffset, result.byteLength);
         } else {
-            console.log('[ZSTD] Using zstddec WASM for browser');
-            const { ZSTDDecoder } = await import('../static/zstddec.mjs');
-            const decoder = new ZSTDDecoder();
-            await decoder.init();
-            decompressed = decoder.decode(compressedData, 0);
+            console.log('[ZSTD] Using zstddec WASM (shared decoder)');
+            decompressed = await ZstdDecompressor.decompressBuffer(compressedData);
         }
 
         const streaming = writeChunk !== null;
@@ -559,7 +556,7 @@ class AsyncBlockDecompressorReader {
         if (compressedSize < decompressedSize) {
             const decompressor = new ZstdDecompressor();
             await decompressor.load();
-            this.currentBlock = decompressor.decompress(compressedData);
+            this.currentBlock = await decompressor.decompress(compressedData);
         } else {
             this.currentBlock = compressedData;
         }
