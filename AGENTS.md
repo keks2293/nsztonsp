@@ -28,17 +28,20 @@ PROGRESS.md is the single source of truth for what works and what doesn't.
 The `static/` folder contains downloaded/copied dependencies for browser use:
 - `static/zstddec.mjs` - Copied from `node_modules/zstddec/dist/zstddec-stream.modern.js` (ES Module, imports directly). WASM-based native zstd decoder. Used for streaming decompression in browser. Handles any window size.
 - `static/prod.keys` - User-provided Nintendo Switch keys file
+- `static/hash-wasm.mjs` - Copied from `node_modules/hash-wasm/dist/index.esm.min.js` (ES Module, imports directly). WASM-based hash functions (SHA-256, etc.). Used for near-native speed SHA-256 in browser. 211 kB (all algorithms included).
 
 ### How to update static files:
 
 1. Update the npm packages:
    ```bash
    npm install zstddec@x.x.x
+   npm install hash-wasm@x.x.x
    ```
 
 2. Copy the files to `static/` **WITHOUT ANY MODIFICATIONS**:
    ```bash
    cp node_modules/zstddec/dist/zstddec-stream.modern.js static/zstddec.mjs
+   cp node_modules/hash-wasm/dist/index.esm.min.js static/hash-wasm.mjs
    ```
 
 3. **NO manual editing of static files** - If the original files don't work as-is:
@@ -70,5 +73,6 @@ Browser HTML files load dependencies:
 
 Current versions (update this when upgrading):
 - `zstddec`: 0.2.0 (use streaming ESM version: `zstddec/dist/zstddec-stream.modern.js`)
+- `hash-wasm`: 4.12.0
 
 

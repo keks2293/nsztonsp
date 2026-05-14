@@ -1,5 +1,20 @@
 # NSZ to NSP Converter - Status Report
 
+## ✅ Recent Changes (2026-05-14)
+
+1. **Replaced pure-JS SHA-256 with hash-wasm (WASM)** — `crypto/sha256.js` now uses `hash-wasm` for near-native speed SHA-256 (~424 ms/100MB vs ~752 ms pure-JS). WASM binary embedded as base64 in `static/hash-wasm.mjs` (211 kB, covers all hash algorithms). Module-level `await` pre-initializes WASM at import time, keeping all methods synchronous — no caller changes needed.
+
+   **SHA-256 implementation benchmarks (100MB):**
+   | Approach | Time | vs Native |
+   |----------|------|-----------|
+   | **Node native** (OpenSSL) | **55 ms** | 1.0× |
+   | **hash-wasm WASM** | **436 ms** | 0.13× |
+   | **32-bit pure JS** (streaming class) | **752 ms** | 0.07× |
+   | **8-bit pure JS** (one-shot tight loop) | **650 ms** | 0.08× |
+   | **64-bit BigInt** | **~26 s** | 0.002× (broken — `RR` used 64-bit mask instead of 32-bit, wrong hash) |
+
+   WASM is 1.7× faster than the pure-JS streaming class. BigInt is catastrophically slow — never use for SHA-256.
+
 ## ✅ Recent Changes (2026-05-13)
 
 1. **SW streaming: fixed `<a download>` not intercepted by SW** — Chrome's download manager bypasses the Service Worker for `<a download>` fetches (no `[SW] fetch` log seen). Replaced with `window.open(streamUrl)` — navigation fetches are always routed through the SW. The SW responds with `Content-Disposition: attachment` which triggers the download.
