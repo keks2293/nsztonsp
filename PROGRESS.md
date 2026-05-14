@@ -15,6 +15,10 @@
 
    WASM is 1.7× faster than the pure-JS streaming class. BigInt is catastrophically slow — never use for SHA-256.
 
+2. **Streaming decompression memory fix (`fs/ncz.js`)** — `_decompressWithStreamingStream` no longer accumulates all compressed chunks in memory before piping to zstd stdin on Node.js. Reads chunk → immediately writes to stdin, eliminating peak memory doubling for large NSZ files. Browser path still accumulates as before (WASM `decodeStreaming` requires array).
+
+3. **Hoisted dynamic SHA256 imports in CLI (`nsz-cli.js`)** — `SHA256` imported statically at module level instead of 3 separate `await import()` calls inside decompression loops.
+
 ## ✅ Recent Changes (2026-05-13)
 
 1. **SW streaming: fixed `<a download>` not intercepted by SW** — Chrome's download manager bypasses the Service Worker for `<a download>` fetches (no `[SW] fetch` log seen). Replaced with `window.open(streamUrl)` — navigation fetches are always routed through the SW. The SW responds with `Content-Disposition: attachment` which triggers the download.
