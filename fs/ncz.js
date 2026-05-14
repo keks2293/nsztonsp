@@ -554,9 +554,7 @@ class AsyncBlockDecompressorReader {
         const compressedData = await this.reader.read(this.baseOffset + relOffset, compressedSize);
 
         if (compressedSize < decompressedSize) {
-            const decompressor = new ZstdDecompressor();
-            await decompressor.load();
-            this.currentBlock = await decompressor.decompress(compressedData);
+            this.currentBlock = await ZstdDecompressor.decompressBuffer(compressedData);
         } else {
             this.currentBlock = compressedData;
         }
