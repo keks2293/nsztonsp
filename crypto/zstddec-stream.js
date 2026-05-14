@@ -14,36 +14,38 @@ export async function initZstddec() {
     await decoder.init();
 }
 
+function memView() {
+    return new DataView(ownInstance.exports.memory.buffer);
+}
+
 export async function* decodeStream(readChunk) {
     if (!ownInstance) throw new Error('Call initZstddec() first');
     const $ = ownInstance.exports;
     const dctx = $.ZSTD_createDCtx();
     const outSize = $.ZSTD_DStreamOutSize();
     const outBuf = $.malloc(outSize);
-    const SZ_P = 4, SZ_T = 4;
-    const inP = $.malloc(SZ_P + SZ_T * 2);
-    const outP = $.malloc(SZ_P + SZ_T * 2);
+    const SZ_P = 4, SZ_T = 4, offPos = SZ_P + SZ_T, offSize = SZ_P + SZ_T * 2;
+    const inP = $.malloc(offSize);
+    const outP = $.malloc(offSize);
     let ret = 0;
     try {
         while (true) {
             const array = await readChunk();
             if (!array || !array.byteLength) break;
             const cp = $.malloc(array.byteLength);
-            const h = new Uint8Array(ownInstance.exports.memory.buffer);
-            h.set(array, cp);
-            const v = new DataView(h.buffer);
-            v.setInt32(inP, cp, true);
-            v.setInt32(inP + SZ_P, array.byteLength, true);
-            v.setInt32(inP + SZ_P + SZ_T, 0, true);
-            while (v.getUint32(inP + SZ_P + SZ_T, true) < v.getUint32(inP + SZ_P, true)) {
-                v.setInt32(outP, outBuf, true);
-                v.setInt32(outP + SZ_P, outSize, true);
-                v.setInt32(outP + SZ_P + SZ_T, 0, true);
+            new Uint8Array(ownInstance.exports.memory.buffer).set(array, cp);
+            let mv = memView();
+            mv.setInt32(inP, cp, true);
+            mv.setInt32(inP + SZ_P, array.byteLength, true);
+            mv.setInt32(inP + offPos, 0, true);
+            while (mv.getUint32(inP + offPos, true) < mv.getUint32(inP + SZ_P, true)) {
+                mv.setInt32(outP, outBuf, true);
+                mv.setInt32(outP + SZ_P, outSize, true);
+                mv.setInt32(outP + offPos, 0, true);
                 ret = $.ZSTD_decompressStream(dctx, outP, inP);
-                const buf = ownInstance.exports.memory.buffer;
-                const v2 = new DataView(buf);
-                const outputPos = v2.getUint32(outP + SZ_P + SZ_T, true);
-                yield new Uint8Array(buf, outBuf, outputPos);
+                mv = memView();
+                const outputPos = mv.getUint32(outP + offPos, true);
+                yield new Uint8Array(ownInstance.exports.memory.buffer, outBuf, outputPos);
             }
             $.free(cp);
         }
