@@ -126,10 +126,11 @@ window.addEventListener('DOMContentLoaded', async () => {
     let lastPercent = -1;
     function updateProgress(progress, text) {
         const percent = Math.round(progress * 100);
-        if (percent === lastPercent) return;
-        lastPercent = percent;
-        progressFill.style.width = `${percent}%`;
-        progressPercent.textContent = `${percent}%`;
+        if (percent !== lastPercent) {
+            lastPercent = percent;
+            progressFill.style.width = `${percent}%`;
+            progressPercent.textContent = `${percent}%`;
+        }
         progressText.textContent = text;
     }
 
@@ -278,6 +279,7 @@ window.addEventListener('DOMContentLoaded', async () => {
         for (let i = 0; i < files.length; i++) {
             const file = files[i];
             addLog('info', `Processing ${i + 1}/${files.length}: ${file.name}`);
+            progressTitle.textContent = file.name;
 
             try {
                 const fileType = detectFileType(file.name);
@@ -366,7 +368,8 @@ window.addEventListener('DOMContentLoaded', async () => {
         status.textContent = 'Done!';
         status.className = 'status ok';
         convertBtn.disabled = false;
-        updateProgress(1, 'Done');
+        progressTitle.textContent = 'Done';
+        updateProgress(1, '');
     });
 
     await converter.init().catch(e => {
