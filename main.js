@@ -95,6 +95,8 @@ window.addEventListener('DOMContentLoaded', async () => {
         }
     }
 
+    overwriteBtn.classList.toggle('hidden', downloadMode !== 'fsa');
+
     const converter = new NSZConverter();
     const files = [];
     const fileStatus = [];
@@ -255,6 +257,7 @@ window.addEventListener('DOMContentLoaded', async () => {
             document.querySelectorAll('.pill[data-mode]').forEach(b => b.classList.remove('on'));
             btn.classList.add('on');
             downloadMode = radio.value;
+            overwriteBtn.classList.toggle('hidden', downloadMode !== 'fsa');
         });
     });
 
