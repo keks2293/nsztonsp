@@ -232,6 +232,7 @@ async function main() {
         for (const file of e.target.files) {
             if (isCompressedGame(file.name)) files.push(file);
         }
+        fileInput.value = '';
         updateFileList();
     });
 
