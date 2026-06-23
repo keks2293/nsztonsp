@@ -320,6 +320,7 @@ class NCZDecompressor {
             let aesCtr = null;
             if (section.cryptoType === 3 || section.cryptoType === 4) {
                 aesCtr = new AESCTR(section.cryptoKey, section.cryptoCounter);
+                aesCtr.seek(i);
             }
 
             while (i < end) {
@@ -329,7 +330,7 @@ class NCZDecompressor {
 
                 let data = chunk;
                 if (aesCtr) {
-                    data = await aesCtr.decrypt(chunk, i);
+                    data = await aesCtr.decrypt(chunk);
                 }
 
                 await writeChunk(data, i);
@@ -411,6 +412,8 @@ class NCZDecompressor {
 
     async _processStreamDecompressedChunk(decompChunk, decompOffset, sortedSections, sectionAesCtrs, progressCallback, writeChunk, ncaSize) {
         let offset = 0;
+        let lastDecryptEnd = -1;
+        let lastAesCtr = null;
         while (offset < decompChunk.length) {
             const ncaPos = decompOffset + offset;
             let aesCtr = null;
@@ -426,7 +429,14 @@ class NCZDecompressor {
             }
             const subSize = boundary - offset;
             let data = decompChunk.slice(offset, offset + subSize);
-            if (aesCtr) data = await aesCtr.decrypt(data, ncaPos);
+            if (aesCtr) {
+                if (aesCtr !== lastAesCtr || ncaPos !== lastDecryptEnd) {
+                    aesCtr.seek(ncaPos);
+                }
+                data = await aesCtr.decrypt(data);
+                lastDecryptEnd = ncaPos + data.length;
+                lastAesCtr = aesCtr;
+            }
             await writeChunk(data, ncaPos);
             offset += subSize;
             if (progressCallback) progressCallback((decompOffset + offset) / ncaSize);
