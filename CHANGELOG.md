@@ -14,6 +14,12 @@
 
 6. **Remove dead `hfs0Data` field from nsz-cli partitionMetas** — `nsz-cli.js:129,139`. `hfs0Data: null` was set in partition metadata objects but never read. Left over from pre-HFS0Writer refactoring when CLI built HFS0 in memory. Still alive in `converter.js` (local variable, used for XCI build).
 
+7. **Add CNMT verification to CLI NSZ path** — `nsz-cli.js:278-291,335-337,345-347`. `decompressNSZ` was missing CNMT hash collection and `verifyHash` calls. Added: same pattern as `decompressXCZ` — collect CNMT hashes from `.cnmt.nca` files via `NSZConverter.extractCnmtHashes`, then verify each NCA hash against the expected set. `[VERIFIED]`/`[CORRUPTED]` logs now appear for NSZ→NSP conversion too.
+
+8. **Fix `extractCnmtHashes` returning 0 hashes** — `converter.js`. CNMT NCA section data is wrapped in a PFS0 filesystem, but `extractCnmtHashes` passed it directly to `Cnmt.parse`. Added PFS0 unwrapping: check for `PFS0\0` magic, parse as PFS0, extract first file, then pass to `Cnmt.parse`. This caused `Found 0 expected NCA hashes from CNMT` and no `[VERIFIED]`/`[CORRUPTED]` output even with Verify enabled.
+
+9. **Remove dead `decompressNCZtoNCA`, add `verifyFileNameHash` fallback** — `converter.js`, `nsz-cli.js`. Standalone NCZ conversion (`decompressNCZtoNCA`) was dead code — never called from anywhere. Removed. Added `verifyFileNameHash(hash, nczName, ncaName, onLog)` — extracts first 32 chars from NCZ filename stem, compares against `hash[:32]`. Used as fallback in all verification paths when `cnmtHashes` is empty (no CNMT available). Follows Python nsz `NszDecompressor.py:28-32`.
+
 ## ✅ Recent Changes (2026-06-24)
 
 1. **Extract `verifyHash` to standalone function** — `verifyHash` was defined inside `decompressNSZtoNSP` (line 92-101) but not in `decompressXCZtoXCI` (line 277). When `verify=true` was passed to XCZ conversion, all 4 call sites threw `ReferenceError: verifyHash is not defined`, crashing the conversion. Also: dead top-level `verifyHash` referenced undefined `onLog`. Fixed: single standalone `verifyHash(hash, name, fileHashes, onLog)` at module level. Follows ESLint `class-methods-use-this`.
