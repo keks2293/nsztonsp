@@ -25,3 +25,6 @@ npm-debug.log*
 
 # Build output
 out/
+
+# opencode agent artifacts
+.mimocode/
