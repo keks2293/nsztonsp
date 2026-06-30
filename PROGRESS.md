@@ -1,5 +1,9 @@
 # NSZ to NSP Converter - Status Report
 
+## ✅ Recent Changes (2026-06-30)
+
+1. **Refactor NCZ decompression: unified section loop** — `fs/ncz.js`. Replaced three separate methods (`_decompressBlocks`, `_decompressStream`, `_processStreamDecompressedChunk`) with a single per-section loop in `_decompressSections()`. Added `ZstdStreamReader` — buffered `.read(n)` wrapper for streaming zstd (Node CLI spawn + WASM async generator), enabling block decompressor (`AsyncBlockDecompressorReader`) and streaming decompressor to share the same section loop. Created `_createBlockReader()`/`_createStreamReader()` factory methods. `AsyncBlockDecompressorReader.read()` returns `null` at end-of-stream (was empty `Uint8Array`). All existing tests pass unchanged.
+
 ## ✅ Recent Changes (2026-06-29)
 
 1. **Refactor: extract converters into shared modules** — `fs/xcz-convert.js`, `fs/nsz-convert.js` (new).

@@ -8,20 +8,6 @@ function allocByte(n) {
     return new Uint8Array(n);
 }
 
-function concatBytes(...arrays) {
-    let totalLength = 0;
-    for (const arr of arrays) {
-        totalLength += arr.length;
-    }
-    const result = new Uint8Array(totalLength);
-    let offset = 0;
-    for (const arr of arrays) {
-        result.set(arr, offset);
-        offset += arr.length;
-    }
-    return result;
-}
-
 function bytesToAscii(bytes, start, end) {
     let str = '';
     for (let i = start; i < end; i++) {
@@ -38,11 +24,6 @@ function readBigUInt64LE(bytes, offset) {
 function readUInt32LE(bytes, offset) {
     const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
     return view.getUint32(offset, true);
-}
-
-function readUInt16LE(bytes, offset) {
-    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-    return view.getUint16(offset, true);
 }
 
 function sliceBytes(bytes, start, end) {
@@ -194,6 +175,71 @@ class FakeSection {
     }
 }
 
+// Buffered .read(n) wrapper for streaming zstd decompression (CLI or WASM).
+// Producer pushes decompressed chunks via push(), consumer reads via read(n).
+class ZstdStreamReader {
+    constructor() {
+        this._chunks = [];
+        this._offset = 0;
+        this._done = false;
+        this._error = null;
+        this._waiters = [];
+        this._cleanup = null;
+    }
+
+    push(data) {
+        this._chunks.push(data);
+        this._notify();
+    }
+
+    end() {
+        this._done = true;
+        this._notify();
+    }
+
+    error(err) {
+        this._error = err;
+        this._done = true;
+        this._notify();
+    }
+
+    setCleanup(fn) {
+        this._cleanup = fn;
+    }
+
+    _notify() {
+        const w = this._waiters;
+        this._waiters = [];
+        for (const fn of w) fn();
+    }
+
+    async read(n) {
+        while (this._chunks.length === 0) {
+            if (this._done) return null;
+            if (this._error) throw this._error;
+            await new Promise(resolve => this._waiters.push(resolve));
+        }
+
+        const chunk = this._chunks[0];
+        const avail = chunk.length - this._offset;
+        const take = Math.min(avail, n);
+        const result = chunk.subarray(this._offset, this._offset + take);
+        this._offset += take;
+        if (this._offset >= chunk.length) {
+            this._chunks.shift();
+            this._offset = 0;
+        }
+        return result;
+    }
+
+    close() {
+        if (this._cleanup) {
+            this._cleanup();
+            this._cleanup = null;
+        }
+    }
+}
+
 class NCZDecompressor {
     constructor(data, keys = null) {
         if (data instanceof DataReader) {
@@ -209,21 +255,22 @@ class NCZDecompressor {
         const { sections, ncaSize, headerEnd } = await this.getSections();
         console.log('[NCZ] sections:', sections.length, 'ncaSize:', ncaSize, 'headerEnd:', headerEnd);
 
-        // Read compressed data magic to determine mode
-        const magicBytes = await this.reader.read(headerEnd, 8);
-        const blockMagic = bytesToAscii(magicBytes, 0, 8);
-        const useBlockCompression = blockMagic === 'NCZBLOCK';
-        console.log('[NCZ] compression mode:', useBlockCompression ? 'block' : 'streaming');
+        // Determine compression mode and create reader
+        let reader = null;
+        if (headerEnd < this.reader.length) {
+            const magicBytes = await this.reader.read(headerEnd, 8);
+            const blockMagic = bytesToAscii(magicBytes, 0, 8);
+            const useBlockCompression = blockMagic === 'NCZBLOCK';
+            console.log('[NCZ] compression mode:', useBlockCompression ? 'block' : 'streaming');
+
+            reader = useBlockCompression
+                ? await this._createBlockReader(headerEnd)
+                : await this._createStreamReader(headerEnd);
+        }
 
         if (writeChunk) {
             if (this.ncaHeader) {
                 await writeChunk(this.ncaHeader, 0);
-            }
-            if (useBlockCompression) {
-                console.log('[NCZ] Using streaming block decompression');
-                await this._decompressBlocks(sections, ncaSize, headerEnd, progressCallback, writeChunk);
-            } else {
-                await this._decompressStream(sections, ncaSize, headerEnd, progressCallback, writeChunk);
             }
         } else {
             // Memory mode (Node.js): allocate full output buffer
@@ -231,13 +278,67 @@ class NCZDecompressor {
             if (this.ncaHeader) {
                 output.set(this.ncaHeader, 0);
             }
-            const collectChunk = async (chunk, pos) => { output.set(chunk, pos); };
-            if (useBlockCompression) {
-                await this._decompressBlocks(sections, ncaSize, headerEnd, progressCallback, collectChunk);
-            } else {
-                await this._decompressStream(sections, ncaSize, headerEnd, progressCallback, collectChunk);
+            const writeFn = async (chunk, pos) => { output.set(chunk, pos); };
+            if (reader) {
+                try {
+                    await this._decompressSections(reader, sections, ncaSize, progressCallback, writeFn);
+                } finally {
+                    reader.close();
+                }
             }
             return output;
+        }
+
+        if (reader) {
+            try {
+                await this._decompressSections(reader, sections, ncaSize, progressCallback, writeChunk);
+            } finally {
+                reader.close();
+            }
+        }
+    }
+
+    async _decompressSections(reader, sections, ncaSize, progressCallback, writeChunk) {
+        let decompressedOffset = UNCOMPRESSABLE_HEADER_SIZE;
+        let isFirstSection = true;
+
+        for (const section of sections) {
+            let i = section.offset;
+            const end = section.offset + section.size;
+
+            if (isFirstSection) {
+                isFirstSection = false;
+                const skip = UNCOMPRESSABLE_HEADER_SIZE - sections[0].offset;
+                if (skip > 0) {
+                    i += skip;
+                }
+            }
+
+            let aesCtr = null;
+            if (section.cryptoType === 3 || section.cryptoType === 4) {
+                aesCtr = new AesCtr(section.cryptoKey, section.cryptoCounter);
+                aesCtr.seek(i);
+            }
+
+            while (i < end) {
+                const chunkSize = Math.min(SECTION_CHUNK_SIZE, end - i);
+                const chunk = await reader.read(chunkSize);
+                if (!chunk || chunk.length === 0) break;
+
+                let data = chunk;
+                if (aesCtr) {
+                    data = await aesCtr.decrypt(data);
+                }
+
+                await writeChunk(data, i);
+
+                i += chunk.length;
+                decompressedOffset += chunk.length;
+
+                if (progressCallback) {
+                    progressCallback(decompressedOffset / ncaSize);
+                }
+            }
         }
     }
 
@@ -293,169 +394,94 @@ class NCZDecompressor {
         return { sections, ncaSize, headerEnd: offset };
     }
 
-    async _decompressBlocks(sections, ncaSize, headerEnd, progressCallback = null, writeChunk = null) {
-        console.log('[NCZ] _decompressBlocks start, headerEnd:', headerEnd, 'ncaSize:', ncaSize);
+    async _createBlockReader(headerEnd) {
         const blockHeaderData = await this.reader.read(headerEnd, 24);
-        console.log('[NCZ] blockHeaderData read:', blockHeaderData.length, 'bytes');
         const blockHeader = new NCZBlockHeader(blockHeaderData, 0);
         if (blockHeader.blockSizeExponent < 14 || blockHeader.blockSizeExponent > 32) {
             throw new Error(`Corrupted NCZBLOCK header: Block size must be between 14 and 32, got ${blockHeader.blockSizeExponent}`);
         }
-        console.log('[NCZ] block magic:', JSON.stringify(blockHeader.magic), 'numBlocks:', blockHeader.numberOfBlocks, 'blockSize:', Math.pow(2, blockHeader.blockSizeExponent), 'decompressedSize:', blockHeader.decompressedSize);
         const sizeListSize = blockHeader.numberOfBlocks * 4;
-        console.log('[NCZ] reading size list:', sizeListSize, 'bytes at offset', headerEnd + 24);
         const sizeListData = await this.reader.read(headerEnd + 24, sizeListSize);
-        console.log('[NCZ] size list read:', sizeListData.length, 'bytes');
-        const blockDecompressor = new AsyncBlockDecompressorReader(
-            this.reader,
-            headerEnd,
-            blockHeader.blockSizeExponent,
-            blockHeader.numberOfBlocks,
-            blockHeader.decompressedSize,
-            sizeListData
+        return new AsyncBlockDecompressorReader(
+            this.reader, headerEnd,
+            blockHeader.blockSizeExponent, blockHeader.numberOfBlocks,
+            blockHeader.decompressedSize, sizeListData
         );
-
-        let decompressedOffset = UNCOMPRESSABLE_HEADER_SIZE;
-        let firstSection = true;
-
-        for (const section of sections) {
-            let i = section.offset;
-            const end = section.offset + section.size;
-
-            if (firstSection) {
-                firstSection = false;
-                const uncompressedSize = UNCOMPRESSABLE_HEADER_SIZE - sections[0].offset;
-                if (uncompressedSize > 0) {
-                    i += uncompressedSize;
-                }
-            }
-
-            let aesCtr = null;
-            if (section.cryptoType === 3 || section.cryptoType === 4) {
-                aesCtr = new AesCtr(section.cryptoKey, section.cryptoCounter);
-                aesCtr.seek(i);
-            }
-
-            while (i < end) {
-                const chunkSize = Math.min(SECTION_CHUNK_SIZE, end - i);
-                const chunk = await blockDecompressor.read(chunkSize);
-                if (chunk.length === 0) break;
-
-                let data = chunk;
-                if (aesCtr) {
-                    data = await aesCtr.decrypt(chunk);
-                }
-
-                await writeChunk(data, i);
-
-                i += chunk.length;
-                decompressedOffset += chunk.length;
-
-                if (progressCallback) {
-                    progressCallback(decompressedOffset / ncaSize);
-                }
-            }
-        }
     }
 
-    async _decompressStream(sections, ncaSize, headerEnd, progressCallback, writeChunk) {
-        console.log('[NCZ] Streaming (non-block) mode with chunked decompression');
+    async _createStreamReader(headerEnd) {
         const remaining = this.reader.length - headerEnd;
-        const sortedSections = [...sections].sort((a, b) => a.offset - b.offset);
-        const sectionAesCtrs = new Map();
-        for (const s of sortedSections) {
-            if (s.cryptoType === 3 || s.cryptoType === 4) {
-                sectionAesCtrs.set(s, new AesCtr(s.cryptoKey, s.cryptoCounter));
-            }
-        }
+        const reader = new ZstdStreamReader();
+
         if (typeof process !== 'undefined' && process.versions && process.versions.node) {
             console.log('[ZSTD] Using zstd CLI for Node.js streaming');
             const { spawn } = await import('node:child_process');
             const proc = spawn('zstd', ['-d', '--no-check'], { stdio: ['pipe', 'pipe', 'pipe'] });
             let stderr = '';
-            proc.stderr.on('data', (c) => stderr += c.toString());
+            proc.stderr.on('data', c => stderr += c.toString());
+            proc.stdout.on('data', chunk =>
+                reader.push(new Uint8Array(chunk.buffer, chunk.byteOffset, chunk.byteLength))
+            );
             const exitPromise = new Promise((resolve, reject) => {
-                proc.on('exit', (code) => code === 0 ? resolve() : reject(new Error(`zstd failed: ${stderr}`)));
-                proc.on('error', reject);
+                proc.on('exit', code => {
+                    if (code === 0) reader.end();
+                    else reader.error(new Error(`zstd decompress failed (exit ${code}): ${stderr}`));
+                    resolve();
+                });
+                proc.on('error', err => { reader.error(err); resolve(); });
             });
 
-            // Read stdout concurrently to avoid pipe deadlock
-            const stdoutReader = (async () => {
-                let decompOffset = UNCOMPRESSABLE_HEADER_SIZE;
-                for await (const nodeChunk of proc.stdout) {
-                    const dc = new Uint8Array(nodeChunk.buffer, nodeChunk.byteOffset, nodeChunk.byteLength);
-                    decompOffset = await this._processStreamDecompressedChunk(dc, decompOffset, sortedSections, sectionAesCtrs, progressCallback, writeChunk, ncaSize);
+            reader.setCleanup(() => { if (!proc.killed) proc.kill(); });
+
+            // Feed compressed data to zstd stdin
+            (async () => {
+                try {
+                    let pos = headerEnd;
+                    let toRead = remaining;
+                    while (toRead > 0) {
+                        const size = Math.min(toRead, READ_CHUNK_SIZE);
+                        const chunk = await this.reader.read(pos, size);
+                        if (!proc.stdin.write(chunk)) {
+                            await new Promise(r => proc.stdin.once('drain', r));
+                        }
+                        pos += size;
+                        toRead -= size;
+                    }
+                    proc.stdin.end();
+                } catch (err) {
+                    reader.error(err);
                 }
             })();
-
-            let pos = headerEnd;
-            let toRead = remaining;
-            while (toRead > 0) {
-                const size = Math.min(toRead, READ_CHUNK_SIZE);
-                const chunk = await this.reader.read(pos, size);
-                if (!proc.stdin.write(chunk)) {
-                    await new Promise(r => proc.stdin.once('drain', r));
-                }
-                pos += size;
-                toRead -= size;
-            }
-            proc.stdin.end();
-
-            await stdoutReader;
-            await exitPromise;
         } else {
             console.log('[ZSTD] Using zstddec WASM streaming decompression (async)');
             const { initZstddec, decodeStream } = await import('../crypto/zstddec-stream-wrapper.js');
             await initZstddec();
-            let pos = headerEnd;
-            let toRead = remaining;
-            let decompOffset = UNCOMPRESSABLE_HEADER_SIZE;
-            for await (const decompChunk of decodeStream(async () => {
-                if (toRead <= 0) return null;
-                const size = Math.min(toRead, READ_CHUNK_SIZE);
-                const chunk = await this.reader.read(pos, size);
-                pos += size;
-                toRead -= size;
-                return chunk;
-            })) {
-                decompOffset = await this._processStreamDecompressedChunk(decompChunk, decompOffset, sortedSections, sectionAesCtrs, progressCallback, writeChunk, ncaSize);
-            }
+
+            (async () => {
+                try {
+                    let pos = headerEnd;
+                    let toRead = remaining;
+                    for await (const chunk of decodeStream(async () => {
+                        if (toRead <= 0) return null;
+                        const size = Math.min(toRead, READ_CHUNK_SIZE);
+                        const data = await this.reader.read(pos, size);
+                        pos += size;
+                        toRead -= size;
+                        return data;
+                    })) {
+                        reader.push(chunk);
+                    }
+                    reader.end();
+                } catch (err) {
+                    reader.error(err);
+                }
+            })();
         }
+
+        return reader;
     }
 
-    async _processStreamDecompressedChunk(decompChunk, decompOffset, sortedSections, sectionAesCtrs, progressCallback, writeChunk, ncaSize) {
-        let offset = 0;
-        let lastDecryptEnd = -1;
-        let lastAesCtr = null;
-        while (offset < decompChunk.length) {
-            const ncaPos = decompOffset + offset;
-            let aesCtr = null;
-            let boundary = decompChunk.length;
-            for (const section of sortedSections) {
-                if (ncaPos >= section.offset && ncaPos < section.offset + section.size) {
-                    if (sectionAesCtrs.has(section)) {
-                        aesCtr = sectionAesCtrs.get(section);
-                    }
-                    boundary = Math.min(boundary, offset + (section.offset + section.size - ncaPos));
-                    break;
-                }
-            }
-            const subSize = boundary - offset;
-            let data = decompChunk.subarray(offset, offset + subSize);
-            if (aesCtr) {
-                if (aesCtr !== lastAesCtr || ncaPos !== lastDecryptEnd) {
-                    aesCtr.seek(ncaPos);
-                }
-                data = await aesCtr.decrypt(data);
-                lastDecryptEnd = ncaPos + data.length;
-                lastAesCtr = aesCtr;
-            }
-            await writeChunk(data, ncaPos);
-            offset += subSize;
-            if (progressCallback) progressCallback((decompOffset + offset) / ncaSize);
-        }
-        return decompOffset + decompChunk.length;
-    }
+
 }
 
 class AsyncBlockDecompressorReader {
@@ -533,7 +559,19 @@ class AsyncBlockDecompressorReader {
             remaining -= toRead;
         }
 
-        return concatBytes(...buffer);
+        if (buffer.length === 0) return null;
+        if (buffer.length === 1) return buffer[0];
+
+        let totalLength = 0;
+        for (const b of buffer) totalLength += b.length;
+        const result = new Uint8Array(totalLength);
+        let offset = 0;
+        for (const b of buffer) { result.set(b, offset); offset += b.length; }
+        return result;
+    }
+
+    close() {
+        // No resources to release
     }
 }
 
