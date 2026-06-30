@@ -469,7 +469,7 @@ class NCZDecompressor {
                         toRead -= size;
                         return data;
                     })) {
-                        reader.push(chunk);
+                        reader.push(new Uint8Array(chunk));
                     }
                     reader.end();
                 } catch (err) {
@@ -540,34 +540,16 @@ class AsyncBlockDecompressorReader {
     }
 
     async read(size) {
-        const buffer = [];
-        let remaining = size;
+        const blockId = this.position >>> this.blockSizeExp;
+        if (blockId >= this.numberOfBlocks) return null;
 
-        while (remaining > 0) {
-            const blockOffset = this.position & (this.blockSize - 1);
-            const blockId = this.position >>> this.blockSizeExp;
+        const blockOffset = this.position & (this.blockSize - 1);
+        const block = await this.getBlock(blockId);
+        const available = block.length - blockOffset;
+        const toRead = Math.min(available, size);
 
-            if (blockId >= this.numberOfBlocks) break;
-
-            const block = await this.getBlock(blockId);
-            const available = block.length - blockOffset;
-            const toRead = Math.min(remaining, available);
-
-            buffer.push(sliceBytes(block, blockOffset, blockOffset + toRead));
-
-            this.position += toRead;
-            remaining -= toRead;
-        }
-
-        if (buffer.length === 0) return null;
-        if (buffer.length === 1) return buffer[0];
-
-        let totalLength = 0;
-        for (const b of buffer) totalLength += b.length;
-        const result = new Uint8Array(totalLength);
-        let offset = 0;
-        for (const b of buffer) { result.set(b, offset); offset += b.length; }
-        return result;
+        this.position += toRead;
+        return sliceBytes(block, blockOffset, blockOffset + toRead);
     }
 
     close() {
