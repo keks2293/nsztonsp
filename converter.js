@@ -6,8 +6,7 @@ import { SHA256 } from './crypto/sha256.js';
 import { Cnmt } from './fs/cnmt.js';
 import { NCAHeader } from './fs/nca.js';
 import { XCIReader } from './fs/xci.js';
-import { AesXts } from './crypto/aesxts.mjs';
-import { AesCtr } from './crypto/aesctr.mjs';
+import { AesCtr, AesXts } from './crypto/aes-ops.mjs';
 import { decompressXCZStreaming, decompressXCZMemory } from './fs/xcz-decompress.js';
 import { decompressNSZStreaming, decompressNSZMemory } from './fs/nsz-decompress.js';
 
