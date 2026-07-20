@@ -30,6 +30,8 @@ Prioritized areas for improvement identified 2026-05-30.
 
 - ✅ **Duplicated NSZ→NSP streaming logic between converter.js and nsz-cli.js** — ~113 lines of identical streaming algorithm reimplemented with different I/O APIs. Core logic extracted into `fs/nsz-decompress.js` with same adapter interface. CLI `decompressNSZ` reduced from ~113 to ~30 lines.
 
+- ✅ **NSZ→NSP memory path duplicated PFS0 header build** — `fs/nsz-decompress.js` had `buildPfs0Blob`/`buildPfs0Header` reimplementing the PFS0 assembly that `decompressNSZStreaming` already did, and crucially NOT reusing the input `stringTableSize` (so it diverged from nsz). Fixed: `decompressNSZMemory` is now a thin wrapper over `decompressNSZStreaming` with a blob-backed adapter that accumulates `write(offset, data)` chunks and assembles a `Blob` at the end. Single PFS0 build path (`PFS0Writer`) for both streaming (FS Access / CLI) and memory (browser download) routes. Verified byte-identical output on Trackline Express .nsz (size 223285520) for both paths.
+
 - ❌ **No `npm test` script** — `package.json:8-10`. Tests exist but require manual discovery. Prevents automated CI. **Not needed for this project.**
 
 - ✅ **Deleted `_decompressBuffered`** — Memory path now uses `_decompressStream` with `collectChunk` wrapper. Reads input as stream, collects output into buffer. `_decompressBuffered` (entire file in memory before decompression) removed.
