@@ -157,7 +157,7 @@ async function decompressXCZ(inReader, inputFd, inputPath, outputDir, keys, veri
             progress: () => {},
             createHash: () => {
                 const h = crypto.createHash('sha256');
-                return { update: (d) => h.update(d), digest: () => h.digest('hex') };
+                return { update: (d) => h.update(d), hex: () => h.digest('hex') };
             },
             extractCnmtHashMap: makeExtractCnmtHashMap(keys),
         });
@@ -197,7 +197,7 @@ async function decompressNSZ(inReader, inputFd, inputPath, outputDir, keys, fixP
             progress: () => {},
             createHash: () => {
                 const h = crypto.createHash('sha256');
-                return { update: (d) => h.update(d), digest: () => h.digest('hex') };
+                return { update: (d) => h.update(d), hex: () => h.digest('hex') };
             },
             extractCnmtHashMap: makeExtractCnmtHashMap(keys),
         });

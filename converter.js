@@ -63,7 +63,7 @@ class NSZConverter {
         const fileReader = new FileSliceReader(file, 0, file.size);
         const createHash = () => {
             const h = new SHA256();
-            return { update: (d) => h.update(d), digest: () => h.hexdigest() };
+            return { update: (d) => h.update(d), hex: () => h.hex() };
         };
 
         const result = await decompressNSZ(fileReader, this.keys, writable ? { writable } : { memory: true }, {
@@ -86,7 +86,7 @@ class NSZConverter {
         const fileReader = new FileSliceReader(file);
         const createHash = () => {
             const h = new SHA256();
-            return { update: (d) => h.update(d), digest: () => h.hexdigest() };
+            return { update: (d) => h.update(d), hex: () => h.hex() };
         };
 
         const result = await decompressXCZ(fileReader, this.keys, writable ? { writable } : { memory: true }, {
