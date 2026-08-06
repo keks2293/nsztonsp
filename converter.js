@@ -68,7 +68,7 @@ class NSZConverter {
             return { update: (d) => h.update(d), hex: () => h.hex() };
         };
 
-        const result = await decompressNSZ(fileReader, this.keys, writable ? { writable } : { memory: true }, {
+        const result = await decompressNSZ(fileReader, writable ? { writable } : { memory: true }, {
             verify, fixPadding,
             log: onLog,
             progress: onProgress,
