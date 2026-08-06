@@ -101,7 +101,7 @@ async function main() {
         console.log('  --rm-source          Delete input file(s) after successful operation');
         console.log('  --no-verify, -nv     Skip SHA256 verification [decompress]');
         console.log('  --fix-padding, -p    Re-pad PFS0 header to 0x20 boundary [decompress] (default: reuse input string-table size, matching Python nsz)');
-        console.log('  --keys <file>        Keys file [decompress, split] (needed for --split CNMT parsing and .xcz partition decryption)');
+        console.log('  --keys <file>        Keys file [split] (required for --split CNMT parsing; used by decompress --verify for CNMT hash checks)');
         console.log('');
     }
 
@@ -194,7 +194,7 @@ async function loadKeys(keysPath, warnNoKeys) {
     if (!keys) {
         const msg = warnNoKeys
             ? 'Warning: No keys loaded - CNMT parsing for --split may fail'
-            : 'Warning: No keys loaded - NCA verification and .xcz decryption may be limited';
+            : 'Warning: No keys loaded - decompress --verify CNMT hash checks will be skipped';
         console.log(msg);
     }
     return keys;
@@ -316,7 +316,7 @@ async function decompressXCZ(inReader, inputFd, inputPath, outputDir, keys, veri
 
     const outputFd = fs.openSync(outPath, 'w');
     try {
-        await decompressXCZFile(inReader, keys, { fd: outputFd }, {
+        await decompressXCZFile(inReader, { fd: outputFd }, {
             verify,
             log: (level, msg) => console.log(msg),
             progress: () => {},

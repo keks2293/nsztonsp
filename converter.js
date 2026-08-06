@@ -91,7 +91,7 @@ class NSZConverter {
             return { update: (d) => h.update(d), hex: () => h.hex() };
         };
 
-        const result = await decompressXCZ(fileReader, this.keys, writable ? { writable } : { memory: true }, {
+        const result = await decompressXCZ(fileReader, writable ? { writable } : { memory: true }, {
             verify,
             log: onLog,
             progress: onProgress,
