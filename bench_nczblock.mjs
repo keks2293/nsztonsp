@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // In-memory NCZBLOCK real-pipeline benchmark: builds a synthetic NCZ image in
 // RAM, decompresses it through the full pipeline (parseNczSections ->
-// parseBlockSchedule -> AsyncBlockDecompressorReader -> decompressBlockData),
+// parseBlockSchedule -> AsyncBlockDecompressorReader -> decompressBlock),
 // output DISCARDED (dev-null) so no bytes hit the SSD. Reports best of N runs
 // in MB/s. Run: node bench_nczblock.mjs [runs]
 import { zstdCompressSync } from 'node:zlib';
