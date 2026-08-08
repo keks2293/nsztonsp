@@ -309,58 +309,59 @@ class NCZDecompressor {
 
 }
 
-// Parse the NCZBLOCK size list into an independent block schedule: for each
-// block its relOffset (from baseOffset), compressedSize and decompressedSize
-// (last block short). Pure — no I/O, no container globals — so a parallel block
-// decoder can build per-block jobs from this and run decompressBlock in workers.
+// Parse the NCZBLOCK size list into an independent block schedule: per-block
+// relOffset (from baseOffset) and compressedSize in two parallel flat arrays,
+// plus blockSize and the last (short) block's decompressedSize derived from
+// decompressedSize % blockSize. Flat parallel arrays (not per-block objects)
+// for cache locality and zero heap churn on huge NCZ. Pure — no I/O, no
+// container globals — so a parallel block decoder can pair relOffsets[i] with
+// sizes[i] as per-block jobs and run decompressBlock in workers.
 function parseBlockSchedule(blockSizeExponent, numberOfBlocks, decompressedSize, sizeListData) {
     const blockSize = Math.pow(2, blockSizeExponent);
-    const blocks = [];
+    const sizes = new Array(numberOfBlocks);
+    const relOffsets = new Array(numberOfBlocks);
     let offset = 24 + numberOfBlocks * 4;
     for (let i = 0; i < numberOfBlocks; i++) {
         const compressedSize = readUInt32LE(sizeListData, i * 4);
-        let expectedSize = blockSize;
-        if (i === numberOfBlocks - 1) {
-            const remainder = decompressedSize % blockSize;
-            if (remainder > 0) expectedSize = remainder;
-        }
-        blocks.push({
-            relOffset: offset,
-            compressedSize,
-            decompressedSize: expectedSize,
-        });
+        sizes[i] = compressedSize;
+        relOffsets[i] = offset;
         offset += compressedSize;
     }
-    return blocks;
+    const remainder = decompressedSize % blockSize;
+    return { sizes, relOffsets, blockSize, remainder };
 }
 
 class AsyncBlockDecompressorReader {
     constructor(reader, baseOffset, blockSizeExponent, numberOfBlocks, decompressedSize, sizeListData) {
         this.reader = reader;
         this.baseOffset = baseOffset;
-        this.blockSize = Math.pow(2, blockSizeExponent);
-        this.decompressedSize = decompressedSize;
         this.currentBlock = null;
         this.currentBlockIndex = -1;
 
-        this.blocks = parseBlockSchedule(blockSizeExponent, numberOfBlocks, decompressedSize, sizeListData);
+        this.schedule = parseBlockSchedule(blockSizeExponent, numberOfBlocks, decompressedSize, sizeListData);
     }
 
     async nextBlock() {
-        this.currentBlockIndex++;
-        if (this.currentBlockIndex >= this.blocks.length) {
+        const i = ++this.currentBlockIndex;
+        const { sizes, relOffsets, blockSize, remainder } = this.schedule;
+        if (i >= sizes.length) {
             this.currentBlock = null;
             return null;
         }
 
-        const block = this.blocks[this.currentBlockIndex];
-        const compressedData = await this.reader.read(this.baseOffset + block.relOffset, block.compressedSize);
+        const compressedSize = sizes[i];
+        let decompressedSize = blockSize;
+        if (i === sizes.length - 1 && remainder > 0) {
+            decompressedSize = remainder;
+        }
+
+        const compressedData = await this.reader.read(this.baseOffset + relOffsets[i], compressedSize);
 
         // The raw/incompressible-vs-compressed decision is container knowledge:
         // a stored raw block fits in less space than the decompressed size, so
         // no zstd decode is needed. The raw fast path returns the bytes
         // directly (no Promise), so it stays free of a per-block microtask.
-        if (block.compressedSize < block.decompressedSize) {
+        if (compressedSize < decompressedSize) {
             this.currentBlock = await decompressBlock(compressedData);
         } else {
             this.currentBlock = compressedData;
