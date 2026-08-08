@@ -351,43 +351,36 @@ class AsyncBlockDecompressorReader {
         this.currentBlock = null;
         this.currentBlockIndex = -1;
 
-        const compressedBlockSizeList = [];
+        const blocks = [];
+        let offset = 24 + numberOfBlocks * 4;
         for (let i = 0; i < numberOfBlocks; i++) {
-            compressedBlockSizeList.push(readUInt32LE(sizeListData, i * 4));
+            const compressedSize = readUInt32LE(sizeListData, i * 4);
+            let expectedSize = this.blockSize;
+            if (i === numberOfBlocks - 1) {
+                const remainder = decompressedSize % this.blockSize;
+                if (remainder > 0) expectedSize = remainder;
+            }
+            blocks.push({
+                relOffset: offset,
+                compressedSize,
+                decompressedSize: expectedSize,
+            });
+            offset += compressedSize;
         }
-
-        const blockDataOffset = 24 + numberOfBlocks * 4;
-        this.compressedBlockOffsetList = [blockDataOffset];
-        for (let i = 0; i < numberOfBlocks - 1; i++) {
-            this.compressedBlockOffsetList.push(
-                this.compressedBlockOffsetList[i] + compressedBlockSizeList[i]
-            );
-        }
-        this.compressedBlockSizeList = compressedBlockSizeList;
+        this.blocks = blocks;
     }
 
     async nextBlock() {
         this.currentBlockIndex++;
-        if (this.currentBlockIndex >= this.numberOfBlocks) {
+        if (this.currentBlockIndex >= this.blocks.length) {
             this.currentBlock = null;
             return null;
         }
 
-        const blockId = this.currentBlockIndex;
-        const relOffset = this.compressedBlockOffsetList[blockId];
-        const compressedSize = this.compressedBlockSizeList[blockId];
+        const block = this.blocks[this.currentBlockIndex];
+        const compressedData = await this.reader.read(this.baseOffset + block.relOffset, block.compressedSize);
 
-        let decompressedSize = this.blockSize;
-        if (blockId >= this.numberOfBlocks - 1) {
-            const remainder = this.decompressedSize % this.blockSize;
-            if (remainder > 0) {
-                decompressedSize = remainder;
-            }
-        }
-
-        const compressedData = await this.reader.read(this.baseOffset + relOffset, compressedSize);
-
-        if (compressedSize < decompressedSize) {
+        if (block.compressedSize < block.decompressedSize) {
             if (isNode) {
                 const { zstdDecompressSync } = await nodeZlibPromise;
                 this.currentBlock = new Uint8Array(zstdDecompressSync(compressedData));
