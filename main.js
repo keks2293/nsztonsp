@@ -488,7 +488,6 @@ async function main() {
         const decompressOptions = [];
         if (fixPadding) decompressOptions.push('fix-padding');
         if (verify) decompressOptions.push('verify');
-        if (!converter.keys) decompressOptions.push('no-keys');
         addLog('info', `Options: ${decompressOptions.join(', ') || 'none'}`);
 
         const totalBytes = files.reduce((s, f) => s + f.size, 0);
@@ -627,7 +626,6 @@ async function main() {
         const mergeOptions = [];
         if (latestWins) mergeOptions.push('latest');
         if (noDeltas) mergeOptions.push('nodelta');
-        if (!converter.keys) mergeOptions.push('no-keys');
         addLog('info', `Options: ${mergeOptions.join(', ') || 'none'}`);
 
         const totalBytes = files.reduce((s, f) => s + f.size, 0);
