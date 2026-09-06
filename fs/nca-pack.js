@@ -1111,43 +1111,32 @@ export async function writeProgramNcaTwoPass({ meta, adapter, ncaOffset, streamE
 
     // The two-pass path is for sequential outputs: every write must land exactly
     // where the previous one ended. A mismatch means the output would be corrupt
-    // (SW adapter fills the gap with zeros), so fail loudly instead.
+    // (SW adapter fills the gap with zeros), so fail loudly instead. Every NCA
+    // byte flows through w(), so the progress fraction (ncaDone / ncaSize, per
+    // chunk — the per-phase bar is the heartbeat) is accumulated here too: it is
+    // then impossible to write without reporting. The size is read BEFORE
+    // adapter.write: the SW adapter transfers full-buffer chunks (detaches
+    // them), which zeroes byteLength on the caller's view.
     let expected = ncaOffset;
+    let ncaDone = 0;
     const w = async (pos, data) => {
         if (pos !== expected) {
             throw new Error(`writeProgramNcaTwoPass: non-sequential write at 0x${pos.toString(16)} (expected 0x${expected.toString(16)}, gap=${pos - expected}) — output would be corrupt`);
         }
-        expected += data.byteLength;
+        const n = data.byteLength;
+        expected += n;
+        ncaDone += n;
+        _prog(Math.min(1, ncaDone / L.ncaSize));
         return await adapter.write(pos, data);
     };
 
-    // Progress + activity logs (a pass-2 merge can take a while with no other
-    // output — the UI would otherwise look frozen). track() takes a SIZE (number):
-    // the SW adapter transfers full-buffer chunks (detaches them), so lengths
-    // must be captured before the write, never read off the chunk afterwards.
-    let ncaDone = 0;
-    const track = (n) => {
-        ncaDone += n;
-        if ((ncaDone & 0x3FFFFFF) === 0) {
-            _log('info', `  Program NCA: ${(ncaDone / 1048576).toFixed(0)} / ${(L.ncaSize / 1048576).toFixed(0)} MB`);
-            _prog(Math.min(1, ncaDone / L.ncaSize));
-        }
-    };
-
-    const hdrLen = encHeader.byteLength;
     await w(ncaOffset, encHeader);
-    track(hdrLen);
-    const htabLen = exeHash.hashTable.byteLength;
     await w(ncaOffset + L.sec0Start, exeHash.hashTable);
-    track(htabLen);
     await streamExefs(async (chunk, off) => {
-        const n = chunk.byteLength;
         await w(ncaOffset + L.sec0DataOff + off, chunk);
-        track(n);
     });
     if (L.exePaddingSize > 0) {
         await w(ncaOffset + L.sec0DataOff + L.exefsSize, new Uint8Array(L.exePaddingSize));
-        track(L.exePaddingSize);
     }
     let lvOff = 0;
     for (let i = 0; i < romIvfc.hashLevels.length; i++) {
@@ -1158,7 +1147,6 @@ export async function writeProgramNcaTwoPass({ meta, adapter, ncaOffset, streamE
         const lvlLen = lvl.length;
         await w(ncaOffset + L.sec1Start + lvOff, lvl);
         lvOff += lvlLen;
-        track(lvlLen);
     }
     _log('info', `  RomFS streaming: ${(L.romfsDataSize / 1048576).toFixed(0)} MB to merge/write...`);
     // Seekable output: restore the SHA256 mid-state (has header + exefs +
@@ -1169,7 +1157,6 @@ export async function writeProgramNcaTwoPass({ meta, adapter, ncaOffset, streamE
     await streamRomfs(async (chunk, off) => {
         if (sha) sha.update(chunk);
         await w(ncaOffset + L.sec1DataOff + off, chunk);
-        track(chunk.byteLength);
     });
     if (L.romPaddingSize > 0) {
         const pad = new Uint8Array(L.romPaddingSize);
