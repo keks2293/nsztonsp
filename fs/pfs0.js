@@ -1,3 +1,10 @@
+// Layout sizes mirror hacpack's packed structs (pfs0.h): pfs0_header_t
+// (magic, num_files, string_table_size, reserved) and pfs0_file_entry_t
+// (offset, size, string_table_offset, reserved). hacpack computes the header
+// as sizeof(pfs0_header_t) + sizeof(pfs0_file_entry_t)·N + stringtable.
+const PFS0_HEADER_SIZE = 0x10;
+const PFS0_ENTRY_SIZE = 0x18;
+
 class PFS0 {
     constructor(data) {
         this._data = new Uint8Array(data);
@@ -8,11 +15,11 @@ class PFS0 {
     }
 
     static async open(reader) {
-        const head = new Uint8Array(await reader.read(0, 16));
+        const head = new Uint8Array(await reader.read(0, PFS0_HEADER_SIZE));
         const view = new DataView(head.buffer, head.byteOffset, head.byteLength);
         const fileCount = view.getUint32(4, true);
         const stringTableSize = view.getUint32(8, true);
-        const headerSize = 0x10 + fileCount * 0x18 + stringTableSize;
+        const headerSize = PFS0_HEADER_SIZE + fileCount * PFS0_ENTRY_SIZE + stringTableSize;
         const buf = new Uint8Array(await reader.read(0, headerSize));
         return new PFS0(buf);
     }
@@ -26,14 +33,14 @@ class PFS0 {
         const fileCount = this._view.getUint32(4, true);
         const stringTableSize = this._view.getUint32(8, true);
         this.stringTableSize = stringTableSize;
-        this.headerSize = 0x10 + fileCount * 0x18 + stringTableSize;
+        this.headerSize = PFS0_HEADER_SIZE + fileCount * PFS0_ENTRY_SIZE + stringTableSize;
 
-        const stringTableOffset = 0x10 + fileCount * 0x18;
+        const stringTableOffset = PFS0_HEADER_SIZE + fileCount * PFS0_ENTRY_SIZE;
 
         let stringEndOffset = stringTableSize;
 
         for (let i = fileCount - 1; i >= 0; i--) {
-            const entryOffset = 0x10 + i * 0x18;
+            const entryOffset = PFS0_HEADER_SIZE + i * PFS0_ENTRY_SIZE;
             const relOffset = Number(this._view.getBigUint64(entryOffset, true));
             const size = Number(this._view.getBigUint64(entryOffset + 8, true));
             const nameOffset = this._view.getUint32(entryOffset + 16, true);
@@ -60,6 +67,20 @@ class PFS0 {
     }
 }
 
+// PFS0 header size as a pure function of the member name LENGTHS (not the data
+// sizes — data offsets come after the header). Lets a caller compute the layout
+// before the names are known, as long as their lengths are fixed (e.g. an NSP
+// program NCA named by its contentId: 32 hex chars + ".nca" = always 36).
+export function pfs0HeaderSize(nameLengths, { fixPadding = false, inputStringTableSize = null, headerAlign = 0x20 } = {}) {
+    const stringTableLen = nameLengths.reduce((sum, len) => sum + len + 1, 0);
+    const rawSize = PFS0_HEADER_SIZE + nameLengths.length * PFS0_ENTRY_SIZE + stringTableLen;
+    const pad = (headerAlign - (rawSize % headerAlign)) % headerAlign;
+    const paddedSize = fixPadding
+        ? stringTableLen + pad
+        : (inputStringTableSize ?? (stringTableLen + pad));
+    return PFS0_HEADER_SIZE + nameLengths.length * PFS0_ENTRY_SIZE + paddedSize;
+}
+
 class PFS0Writer {
     // headerAlign: 0x20 (Python nsz rule — `Pfs0.getStringTableSize()` pads so the
     // TOTAL header is 0x20-aligned; note hacpack is different: `pfs0.c:121`
@@ -84,18 +105,14 @@ class PFS0Writer {
     }
 
     buildHeader() {
-        const namesLen = this.files.reduce((sum, f) => sum + f.name.length + 1, 0);
-        const rawSize = 0x10 + this.files.length * 0x18 + namesLen;
         const stringTable = this.files.map(f => f.name).join('\0') + '\0';
-        const pad = (this.headerAlign - (rawSize % this.headerAlign)) % this.headerAlign;
-        const paddedSize = this.fixPadding
-            ? stringTable.length + pad
-            : (this.inputStringTableSize ?? (stringTable.length + pad));
+        const headerSize = pfs0HeaderSize(this.files.map(f => f.name.length),
+            { fixPadding: this.fixPadding, inputStringTableSize: this.inputStringTableSize, headerAlign: this.headerAlign });
+        const paddedSize = headerSize - PFS0_HEADER_SIZE - this.files.length * PFS0_ENTRY_SIZE;
         const padded = stringTable.length < paddedSize
             ? stringTable + '\0'.repeat(paddedSize - stringTable.length)
             : stringTable;
         const namesBytes = new TextEncoder().encode(padded);
-        const headerSize = 0x10 + this.files.length * 0x18 + paddedSize;
         const buf = new Uint8Array(headerSize);
         const v = new DataView(buf.buffer);
 
@@ -107,7 +124,7 @@ class PFS0Writer {
         let soff = 0;
         for (let i = 0; i < this.files.length; i++) {
             const f = this.files[i];
-            const pos = 0x10 + i * 0x18;
+            const pos = PFS0_HEADER_SIZE + i * PFS0_ENTRY_SIZE;
             v.setBigUint64(pos, BigInt(f.offset), true);
             v.setBigUint64(pos + 8, BigInt(f.size), true);
             v.setUint32(pos + 16, soff, true);
@@ -115,7 +132,7 @@ class PFS0Writer {
             soff += f.name.length + 1;
         }
 
-        buf.set(namesBytes, 0x10 + this.files.length * 0x18);
+        buf.set(namesBytes, PFS0_HEADER_SIZE + this.files.length * PFS0_ENTRY_SIZE);
         return { buffer: buf, headerSize };
     }
 }
