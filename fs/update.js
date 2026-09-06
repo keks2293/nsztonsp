@@ -1,4 +1,4 @@
-import { PFS0, PFS0Writer } from './pfs0.js';
+import { PFS0, PFS0Writer, pfs0HeaderSize } from './pfs0.js';
 import { buildAdapter, buildRead, collectBlob } from './adapter.js';
 import { openContainer } from './container.js';
 import { NCZDecompressor, AdapterNCZReader, parseNczSections } from './ncz.js';
@@ -28,6 +28,12 @@ function u16le(v) {
 function programNcaSize(exefsSize, romfsDataSize) {
     return computeProgramNcaLayout(exefsSize, romfsDataSize).ncaSize;
 }
+
+// Output NSP member names are derived from the contentId (32 hex chars), so their
+// LENGTHS are fixed regardless of the actual contentId — the PFS0 header size is
+// therefore known before the Program NCA (and its contentId) is written.
+const PROGRAM_NCA_NAME_LEN = 32 + '.nca'.length;
+const CNMT_NAME_LEN = 32 + '.cnmt.nca'.length;
 
 // Read the first NCA_HEADER_SIZE bytes of a Program NCA, returning its raw
 // plaintext header plus (for NCZ) the parsed section table. NCZ needs a short
@@ -364,12 +370,14 @@ async function writeTwoPassProgramAndFinish({ adapter, base, update, keys, log, 
         return finalizeOutputNsP(adapter, { pfs0Header, pw, otherNcas, totalData, rebuilt, output, log, progress, phaseLabel: 'Writing output (2/2)', phaseBaseDone: programSize, phaseTotal });
     }
 
-    // Seekable: compute the layout in memory only (temp names are the same
-    // LENGTH as the real ones — 36/41 chars — so headerSize and offsets are
-    // identical to the final header), write the NCA, then the real header at 0.
-    const TEMP_PROG = '0'.repeat(36);
-    const TEMP_CNMT = '0'.repeat(41); // matches `${id}.cnmt.nca` length
-    const { pfs0Header: layoutHdr, totalData: layoutTotal, programNcaPfs0Offset } = buildFinalPfs0(TEMP_PROG, programSize, otherNcas, { name: TEMP_CNMT, nca: new Uint8Array(0) });
+    // Seekable: the NCA is written first (the adapter zero-fills [0..offset)),
+    // so its offset must be known before the contentId — the header size is a
+    // pure function of the fixed name lengths (see the constants above).
+    // The real PFS0 header overwrites offset 0 after the NCA.
+    const programNcaPfs0Offset = pfs0HeaderSize(
+        [PROGRAM_NCA_NAME_LEN, ...otherNcas.map(m => m.name.length), CNMT_NAME_LEN],
+        { fixPadding: true, headerAlign: 0x10 },
+    );
     const id = await writeProgramNcaTwoPass({
         meta, adapter, ncaOffset: programNcaPfs0Offset,
         streamExefs: makeStreamExefs(), streamRomfs: makeStreamRomfs(), log,
@@ -642,15 +650,14 @@ export async function update(readers, output, options = {}) {
 
             const otherNcas = collectOtherNcas(update);
 
-            // Compute PFS0 headerSize without writing: both names are fixed-length
-            // (program 36 chars, CNMT 42 chars), so the layout matches the final header.
-            const layoutPw = new PFS0Writer(true, null, 0x10);
-            layoutPw.add(`${'0'.repeat(32)}.nca`, programSize);
-            for (const m of otherNcas) layoutPw.add(m.name, m.outLen);
-            layoutPw.add(`${'0'.repeat(32)}.cnmt.nca`, 0);
-            const pfs0Header = layoutPw.buildHeader();
-            const programNcaPfs0Offset = pfs0Header.headerSize + layoutPw.files[0].offset;
-            log('info', `PFS0 layout: ${pfs0Header.headerSize} bytes header, ${layoutPw.files.length} members, Program NCA at 0x${programNcaPfs0Offset.toString(16)}`);
+            // The Program NCA is the first file (data offset 0), so its output
+            // offset is the PFS0 header size — a pure function of the member name
+            // lengths (all fixed before the contentId is known, see above).
+            const programNcaPfs0Offset = pfs0HeaderSize(
+                [PROGRAM_NCA_NAME_LEN, ...otherNcas.map(m => m.name.length), CNMT_NAME_LEN],
+                { fixPadding: true, headerAlign: 0x10 },
+            );
+            log('info', `PFS0 layout: ${programNcaPfs0Offset} bytes header, ${otherNcas.length + 2} members, Program NCA at 0x${programNcaPfs0Offset.toString(16)}`);
 
             // One write phase: program work (exefs + romfs writes + the full-NCA
             // re-read for the contentId, mirroring streamTotal in packProgramNcaStream)
@@ -676,8 +683,7 @@ export async function update(readers, output, options = {}) {
             await adapter.write(0, realPfs0.buffer);
             log('info', `PFS0 header ${realPfs0.headerSize} bytes, ${realPw.files.length} members`);
 
-            // Tail uses the layout header (pfs0Header), size-identical to realPfs0.
-            return finalizeOutputNsP(adapter, { pfs0Header, pw: realPw, otherNcas, totalData, rebuilt, output, log, progress, phaseLabel: 'Writing output (1/1)', phaseBaseDone: streamWork, phaseTotal });
+            return finalizeOutputNsP(adapter, { pfs0Header: realPfs0, pw: realPw, otherNcas, totalData, rebuilt, output, log, progress, phaseLabel: 'Writing output (1/1)', phaseBaseDone: streamWork, phaseTotal });
         }
 
         // ── Two-pass path (sequential output): no data buffer ───────────────
