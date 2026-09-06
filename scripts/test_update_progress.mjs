@@ -69,6 +69,12 @@ function checkProtocol(name, events, expectedLabels, buf) {
     const evs = s.events;
     assert(evs.length > 0, `${s.label}: events reported`);
     assert(evs.every(e => e.p >= 0 && e.p <= 1 + 1e-9), `${s.label}: p within [0,1]`);
+    if (s.label.startsWith('Writing output')) {
+      // The Program NCA (~699 MB) crosses ~10 stride boundaries on its way; a
+      // pass that reports only the final _prog(1) (e.g. a progress gate that
+      // never fires) would leave the UI frozen for the whole write.
+      assert(evs.length >= 5, `${s.label}: multiple events across the phase (got ${evs.length})`);
+    }
     assert(evs.every((e, i) => i === 0 || evs[i - 1].p <= e.p + 1e-12), `${s.label}: monotonic within phase (program→tail continuity)`);
     assert(evs[evs.length - 1].p === 1, `${s.label}: phase ends at exactly 1.0 (got ${evs[evs.length - 1].p})`);
     assert(evs.every(e => typeof e.phaseBytes === 'number' && e.phaseBytes > 0), `${s.label}: phaseBytes reported`);
