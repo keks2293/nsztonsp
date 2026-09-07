@@ -2,7 +2,7 @@ import { AesCtr } from '../crypto/aes-ops.mjs';
 import { decryptNcaHeader } from './nca.js';
 import { BufferRangeSource } from './range-source.js';
 import { readLeU64, readLeU32 } from './bytes.js';
-import { isNode } from '../crypto/platform.js';
+import { yieldToEventLoop } from './event-loop.js';
 import { decryptNcaHeaderBytes, fsHeaderAt, reversedSectionCtr, extractTitlekeyFromTik, deriveTitlekeyFromKeyArea, IVFC_LEVEL_HDR, IVFC_LEVELS_OFFSET, IVFC_MAX_LEVEL, FS_HDR } from './nca-utils.js';
 import {
     parseBktrHeader,
@@ -26,29 +26,6 @@ function toNcaInput(nca) {
 }
 
 const BKTR_MAGIC = 0x52544B42; // "BKTR"
-
-// Event-loop yield (a real macrotask → browser paint boundary), faster than
-// setTimeout(0)'s 1 ms minimum delay: a port message is queued as a task with
-// no minimum. The BKTR patch path is synchronous JS end to end (buffered
-// subarray reads + AesEcb block loop + hash — microtask-only boundaries), so
-// without it the browser cannot repaint the progress bar mid-merge and the UI
-// looks frozen. Called after every emitted chunk in streaming mode; the merge
-// awaits it sequentially, so one shared channel is safe.
-//
-// Node: a used MessagePort is a ref'd handle that never releases (unref() is
-// ignored once onmessage is attached), so the process would hang after the
-// script's work is done. setImmediate is an equally fast macrotask there and
-// holds no ref — the port is only created for the browser path. (A CLI progress
-// bar also needs the yield: the merge is a synchronous JS stretch, and without
-// a macrotask boundary the buffered stdout writes only flush all at once.)
-const YIELD_CHANNEL = isNode ? null : new MessageChannel();
-function yieldToEventLoop() {
-    if (!YIELD_CHANNEL) return new Promise(resolve => setImmediate(resolve));
-    return new Promise(resolve => {
-        YIELD_CHANNEL.port1.onmessage = resolve;
-        YIELD_CHANNEL.port2.postMessage(null);
-    });
-}
 
 export async function mergeRomFS(baseNcaData, updateNcaData, options = {}) {
     const { keys, onChunk, onProgress, baseTitlekey: providedBaseTitlekey, updateTitlekey: providedUpdateTitlekey, baseTik, updateTik, titlekeysFile } = options;
