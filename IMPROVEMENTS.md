@@ -4,6 +4,8 @@ Prioritized areas for improvement identified 2026-05-30.
 
 ## High Impact
 
+- ❌ **Buffered full-NCA contentId hash → WebCrypto one-shot (deferred, "option 2" for now)** — `fs/nca-pack.js` `preparePlaintextProgramNca`. The ~700 MB contentId hash stays pure-JS incremental (16 MiB chunks, #76/#77) because a one-shot `crypto.subtle.digest()` (bench: 439 ms vs 4441 ms JS) requires assembling the NCA layout into one temporary 699 MB contiguous buffer (+700 MB RAM peak for ~0.5 s). Deferred by user decision 2026-09-07; enable when memory headroom is confirmed (peak would be ~1.4 GB in SW+buffered).
+
 - ✅ **`--update` merged Program NCA — fully implemented, matches yanu** — `fs/update.js`, `fs/nca-pack.js`, `fs/bktr-merge.js`. Full pipeline: BKTR table parse/decrypt → AesCtrEx patch decrypt (ctrVal BE) → merged RomFS → ExeFS PFS0 extraction → plaintext Program NCA pack → CNMT rebuild → NSP assembly. Verified on Stardew Valley v0+v1310720: 701,767,968 B / 4 members, Program NCA contentId=01f0e396…, all tests pass. See `DOC-REPACK.md` for full documentation (yanu/hacpack pipeline reference, NCA layout, IVFC hash tree, header encryption, CNMT rebuild, merge strategies, key files, test/verification details).
   - **NCA pack modes** — `fs/nca-pack.js` `packNca()` dispatcher for all hacpack ncatypes. Yanu uses only PROGRAM(--plaintext/CRYPT_NONE sections) and META(CRYPT_CTR section). CONTROL/DATA/MANUAL/PUBLICDATA are RomFS-only stubs (copied as-is from update, not rebuilt).
 
