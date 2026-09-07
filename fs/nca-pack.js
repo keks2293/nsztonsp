@@ -808,19 +808,30 @@ export function createExefsAcidFilter(opts = {}, log = () => {}) {
 //
 // Returns: { data, hashHex, size } where `data` holds everything needed by
 // `writePlaintextProgramNca()`.
-export async function preparePlaintextProgramNca(exefsData, romfsData, controlData, titleId, keys, log) {
+export async function preparePlaintextProgramNca(exefsData, romfsData, controlData, titleId, keys, log, progress) {
     const _log = typeof log === 'function' ? log : () => {};
+    const _prog = typeof progress === 'function' ? progress : () => {};
     _log('info', '----> Preparing Program NCA:');
+
+    // Progress over ALL hash work: PFS0 table (exefs) + IVFC (romfs) + the
+    // full-NCA SHA256 (ncaSize, chunked below). ncaSize comes from the pure
+    // layout helper — the same formula as the layout computed below.
+    const prepLayout = computeProgramNcaLayout(exefsData.length, romfsData.length);
+    const workTotal = exefsData.length + romfsData.length + prepLayout.ncaSize;
+    let done = 0;
+    const rep = (n) => { done += n; _prog(done / workTotal); };
 
     // ── Pass 1: Compute hashes (same as buffer version) ────────────────────
     _log('info', '  Computing ExeFS PFS0 hash table...');
     const exeHash = buildPfs0HashTable(exefsData, PFS0_EXEFS_HASH_BLOCK_SIZE);
+    rep(exefsData.length);
     const exeHtablePadded = exeHash.hashTable;
     const exePfs0Offset = exeHtablePadded.length;
     const exeSectionSize = pad200(exePfs0Offset + exefsData.length);
 
     _log('info', '  Computing IVFC hash tree (5 levels + data)...');
     const romIvfc = buildIvfcHashTree(romfsData);
+    rep(romfsData.length);
     // Pad RomFS data level to 0x4000 (IVFC_HASH_BLOCK_SIZE) to match Nintendo's canonical
     // layout (base NCA data level is 0x4000-aligned) and hacpack (romfs_build pads to
     // IVFC_HASH_BLOCK_SIZE). pad200 left it 0x200-aligned.
@@ -843,29 +854,42 @@ export async function preparePlaintextProgramNca(exefsData, romfsData, controlDa
     });
 
     // ── Compute full NCA hash (sha256 over header + all section bytes) ─────
+    // Chunked (16 MiB) so the progress callback reports through the ~700 MB
+    // hash; unchunked it would be one silent synchronous stretch.
+    _log('info', '  Calculating NCA hash...');
     const ncaHasher = new SHA256();
+    const updateChunked = (data) => {
+        for (let off = 0; off < data.length; off += 0x1000000) {
+            const n = Math.min(0x1000000, data.length - off);
+            ncaHasher.update(data.subarray(off, off + n));
+            rep(n);
+        }
+    };
     ncaHasher.update(encHeader);
+    rep(NCA_HEADER_SIZE);
     ncaHasher.update(exeHtablePadded);
-    ncaHasher.update(exefsData);
+    rep(exeHtablePadded.length);
+    updateChunked(exefsData);
 
     // Hash ExeFS section padding (zeros between ExeFS data end and RomFS start)
     const exePaddingSize = exeSectionSize - (exePfs0Offset + exefsData.length);
     if (exePaddingSize > 0) {
         ncaHasher.update(new Uint8Array(exePaddingSize));
+        rep(exePaddingSize);
     }
 
-    // Hash RomFS section: IVFC levels concatenated
+    // Hash RomFS section: IVFC levels concatenated (last = the RomFS data)
     for (const levelData of romIvfc.levelFiles) {
-        ncaHasher.update(levelData);
+        updateChunked(levelData);
     }
 
     // Hash RomFS section trailing padding (zeros after RomFS data to align to 0x200)
     const romPaddingSize = romSectionSize - romIvfc.physicalSize;
     if (romPaddingSize > 0) {
         ncaHasher.update(new Uint8Array(romPaddingSize));
+        rep(romPaddingSize);
     }
 
-    _log('info', '  Calculating NCA hash...');
     const hashHex = ncaHasher.hex();
     _log('info', '  ----> Prepared Program NCA: ' + ncaSize + ' bytes sha256=' + hashHex);
 
@@ -881,11 +905,35 @@ export async function preparePlaintextProgramNca(exefsData, romfsData, controlDa
 // Writes a previously prepared plaintext Program NCA to the output adapter.
 // The bytes written are byte-identical to what `preparePlaintextProgramNca`
 // hashed, so `prepared.hashHex` remains valid.
-export async function writePlaintextProgramNca(prepared, outputAdapter, log, baseOffset = 0) {
+export async function writePlaintextProgramNca(prepared, outputAdapter, log, baseOffset = 0, progress) {
     const _log = typeof log === 'function' ? log : () => {};
+    const _prog = typeof progress === 'function' ? progress : () => {};
     const { encHeader, exeHtablePadded, exePfs0Offset, exefsData, romIvfc,
             sec0Start, exePaddingSize, romPaddingSize } = prepared.data;
     _log('info', '  Writing NCA to output adapter (streaming)...');
+
+    // Progress over the whole NCA, reported per 16 MiB write chunk — the large
+    // sections (ExeFS ~91 MB, RomFS data ~606 MB) are written chunked instead
+    // of as single multi-MB writes (in SW mode a single write is a single
+    // multi-MB postMessage, and the UI would sit frozen for the whole NCA).
+    const total = prepared.size;
+    let done = 0;
+    const rep = (n) => { done += n; _prog(done / total); };
+    const CHUNK = 0x1000000;
+    const writeAll = async (pos, data) => {
+        for (let off = 0; off < data.length; off += CHUNK) {
+            const n = Math.min(CHUNK, data.length - off);
+            await outputAdapter.write(baseOffset + pos + off, data.subarray(off, off + n));
+            rep(n);
+        }
+    };
+    const writeZeros = async (pos, len) => {
+        for (let off = 0; off < len; off += CHUNK) {
+            const n = Math.min(CHUNK, len - off);
+            await outputAdapter.write(baseOffset + pos + off, new Uint8Array(n));
+            rep(n);
+        }
+    };
 
     // Snapshot all lengths BEFORE any writes — postMessage transfer can
     // detach buffers, making .length return 0 for full-buffer Uint8Arrays.
@@ -894,28 +942,25 @@ export async function writePlaintextProgramNca(prepared, outputAdapter, log, bas
 
     // Write header (at baseOffset)
     await outputAdapter.write(baseOffset, encHeader);
+    rep(encHeader.length);
 
     // Write ExeFS section: hash_table + PFS0 data + section padding
     await outputAdapter.write(baseOffset + sec0Start, exeHtablePadded);
-    await outputAdapter.write(baseOffset + sec0Start + exePfs0Offset, exefsData);
-    if (exePaddingSize > 0) {
-        await outputAdapter.write(baseOffset + sec0Start + exePfs0Offset + exefsLen,
-            new Uint8Array(exePaddingSize));
-    }
+    rep(htableLen);
+    await writeAll(sec0Start + exePfs0Offset, exefsData);
+    if (exePaddingSize > 0) await writeZeros(sec0Start + exePfs0Offset + exefsLen, exePaddingSize);
 
-    // Write RomFS section: IVFC levels concatenated
+    // Write RomFS section: IVFC levels concatenated (last = the RomFS data)
     // Snapshot level lengths BEFORE writing — postMessage transfer detaches buffers,
     // making .length return 0 for full-buffer Uint8Arrays.
     const levelLengths = romIvfc.levelFiles.map(l => l.length);
     let romPos = sec0Start + htableLen + exefsLen + exePaddingSize;
     for (let lvl = 0; lvl < romIvfc.levelFiles.length; lvl++) {
         const levelData = romIvfc.levelFiles[lvl];
-        await outputAdapter.write(baseOffset + romPos, levelData);
+        await writeAll(romPos, levelData);
         romPos += levelLengths[lvl];
     }
-    if (romPaddingSize > 0) {
-        await outputAdapter.write(baseOffset + romPos, new Uint8Array(romPaddingSize));
-    }
+    if (romPaddingSize > 0) await writeZeros(romPos, romPaddingSize);
 }
 
 // ── Fully streaming Program NCA pack (seekable output, no data buffer) ─────────

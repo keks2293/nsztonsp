@@ -51,7 +51,7 @@ function yieldToEventLoop() {
 }
 
 export async function mergeRomFS(baseNcaData, updateNcaData, options = {}) {
-    const { keys, onChunk, baseTitlekey: providedBaseTitlekey, updateTitlekey: providedUpdateTitlekey, baseTik, updateTik, titlekeysFile } = options;
+    const { keys, onChunk, onProgress, baseTitlekey: providedBaseTitlekey, updateTitlekey: providedUpdateTitlekey, baseTik, updateTik, titlekeysFile } = options;
 
     if (!keys) throw new Error('BKTR: keys required');
 
@@ -188,20 +188,22 @@ export async function mergeRomFS(baseNcaData, updateNcaData, options = {}) {
 
     // One place for "land a decrypted chunk at its virtual offset": streaming
     // emits only the overlap with the level-5 data region (both loops share
-    // this clip) and yields to the event loop afterwards (the patch path is
-    // synchronous JS — without a real task boundary the browser cannot
-    // repaint the progress bar mid-merge); buffered stores into `merged`.
+    // this clip); buffered stores into `merged`. Both modes then report the
+    // merge position (onProgress — the buffered path has no onChunk) and yield
+    // to the event loop: the merge is synchronous JS end to end, so without a
+    // real task boundary the browser cannot repaint the progress bar mid-merge.
     const emitChunk = async (chunk, virtOffset) => {
         if (streaming) {
             const a = Math.max(virtOffset, dataStart);
             const b = Math.min(virtOffset + chunk.length, dataEnd);
             if (b > a) {
                 await onChunk(chunk.subarray(a - virtOffset, b - virtOffset), a - dataStart);
-                await yieldToEventLoop();
             }
         } else {
             merged.set(chunk, virtOffset);
         }
+        onProgress?.(virtOffset + chunk.length, totalSize);
+        await yieldToEventLoop();
     };
 
     while (pos < totalSize && entryIdx < relocBlock.entries.length) {
