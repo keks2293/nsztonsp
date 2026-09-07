@@ -358,16 +358,23 @@ async function writeTwoPassProgramAndFinish({ adapter, base, update, keys, log, 
 
     if (appendOnly) {
         // contentId is final after Pass 1 → real PFS0 header first, then the NCA.
+        let t0 = performance.now();
         const rebuilt = await rebuildCnmtNca(base, update, keys, log, { hashHex: contentId, size: programSize });
         const { pw, pfs0Header, totalData, programNcaPfs0Offset } = buildFinalPfs0(`${contentId.slice(0, 32)}.nca`, programSize, otherNcas, rebuilt);
         await adapter.write(0, pfs0Header.buffer);
         log('info', `PFS0 header ${pfs0Header.headerSize} bytes, ${pw.files.length} members`);
+        log('info', `[timing] CNMT + PFS0 header: ${((performance.now() - t0) / 1000).toFixed(1)}s`);
+        t0 = performance.now();
         await writeProgramNcaTwoPass({
             meta, adapter, ncaOffset: programNcaPfs0Offset, contentId,
             streamExefs: makeStreamExefs(), streamRomfs: makeStreamRomfs(), log,
             progress: pass2Progress,
         });
-        return finalizeOutputNsP(adapter, { pfs0Header, pw, otherNcas, totalData, rebuilt, output, log, progress, phaseLabel: 'Writing output (2/2)', phaseBaseDone: programSize, phaseTotal });
+        log('info', `[timing] Pass 2 (Program NCA write): ${((performance.now() - t0) / 1000).toFixed(1)}s`);
+        t0 = performance.now();
+        const result = await finalizeOutputNsP(adapter, { pfs0Header, pw, otherNcas, totalData, rebuilt, output, log, progress, phaseLabel: 'Writing output (2/2)', phaseBaseDone: programSize, phaseTotal });
+        log('info', `[timing] Tail (other NCAs + CNMT): ${((performance.now() - t0) / 1000).toFixed(1)}s`);
+        return result;
     }
 
     // Seekable: the NCA is written first (the adapter zero-fills [0..offset)),
@@ -378,17 +385,24 @@ async function writeTwoPassProgramAndFinish({ adapter, base, update, keys, log, 
         [PROGRAM_NCA_NAME_LEN, ...otherNcas.map(m => m.name.length), CNMT_NAME_LEN],
         { fixPadding: true, headerAlign: 0x10 },
     );
+    let t0 = performance.now();
     const id = await writeProgramNcaTwoPass({
         meta, adapter, ncaOffset: programNcaPfs0Offset,
         streamExefs: makeStreamExefs(), streamRomfs: makeStreamRomfs(), log,
         progress: pass2Progress,
     });
     log('info', `ContentId: ${id} (${programSize} bytes)`);
+    log('info', `[timing] Pass 2 (Program NCA write): ${((performance.now() - t0) / 1000).toFixed(1)}s`);
+    t0 = performance.now();
     const rebuilt = await rebuildCnmtNca(base, update, keys, log, { hashHex: id, size: programSize });
     const { pw, pfs0Header, totalData } = buildFinalPfs0(`${id.slice(0, 32)}.nca`, programSize, otherNcas, rebuilt);
     await adapter.write(0, pfs0Header.buffer);
     log('info', `PFS0 header ${pfs0Header.headerSize} bytes, ${pw.files.length} members`);
-    return finalizeOutputNsP(adapter, { pfs0Header, pw, otherNcas, totalData, rebuilt, output, log, progress, phaseLabel: 'Writing output (2/2)', phaseBaseDone: programSize, phaseTotal });
+    log('info', `[timing] CNMT + PFS0 header: ${((performance.now() - t0) / 1000).toFixed(1)}s`);
+    t0 = performance.now();
+    const result = await finalizeOutputNsP(adapter, { pfs0Header, pw, otherNcas, totalData, rebuilt, output, log, progress, phaseLabel: 'Writing output (2/2)', phaseBaseDone: programSize, phaseTotal });
+    log('info', `[timing] Tail (other NCAs + CNMT): ${((performance.now() - t0) / 1000).toFixed(1)}s`);
+    return result;
 }
 
 // Factory for a streaming ExeFS extractor with NPDM ACID filtering applied.
@@ -664,6 +678,7 @@ export async function update(readers, output, options = {}) {
             // + the other-NCAs tail — one continuous bar, no reset between them.
             const streamWork = exefsSize + (romfsDataSize || 1) + programSize;
             const phaseTotal = streamWork + otherNcas.reduce((s, m) => s + m.outLen, 0);
+            let t0 = performance.now();
             const { hashHex: contentId } = await packProgramNcaStream({
                 adapter, ncaOffset: programNcaPfs0Offset,
                 exefsSize, romfsDataSize,
@@ -673,6 +688,7 @@ export async function update(readers, output, options = {}) {
                 log,
                 progress: (p) => progress(p * streamWork / phaseTotal, 'Writing output (1/1)', phaseTotal),
             });
+            log('info', `[timing] Program NCA (streaming write + contentId re-read): ${((performance.now() - t0) / 1000).toFixed(1)}s`);
 
             baseSource = null;
             updateSource = null;
@@ -683,7 +699,10 @@ export async function update(readers, output, options = {}) {
             await adapter.write(0, realPfs0.buffer);
             log('info', `PFS0 header ${realPfs0.headerSize} bytes, ${realPw.files.length} members`);
 
-            return finalizeOutputNsP(adapter, { pfs0Header: realPfs0, pw: realPw, otherNcas, totalData, rebuilt, output, log, progress, phaseLabel: 'Writing output (1/1)', phaseBaseDone: streamWork, phaseTotal });
+            t0 = performance.now();
+            const result = await finalizeOutputNsP(adapter, { pfs0Header: realPfs0, pw: realPw, otherNcas, totalData, rebuilt, output, log, progress, phaseLabel: 'Writing output (1/1)', phaseBaseDone: streamWork, phaseTotal });
+            log('info', `[timing] Tail (other NCAs + CNMT): ${((performance.now() - t0) / 1000).toFixed(1)}s`);
+            return result;
         }
 
         // ── Two-pass path (sequential output): no data buffer ───────────────
@@ -711,12 +730,14 @@ export async function update(readers, output, options = {}) {
             // romfs 1× (2× when contentId must be final after pass 1), mirroring
             // pass1Total in computeProgramNcaContentId.
             const pass1Bytes = 2 * exefsSize + (appendOnly ? 2 : 1) * (romfsDataSize || 1);
+            const t0 = performance.now();
             const { size: computedSize, contentId, meta } = await computeProgramNcaContentId({
                 exefsSize, romfsDataSize, titleId: base.cnmt.titleId, keys,
                 streamExefs: makeStreamExefs(), streamRomfs: makeStreamRomfs(), log,
                 progress: (p) => progress(p, 'Computing contentId (1/2)', pass1Bytes),
                 contentIdInPass1: appendOnly,
             });
+            log('info', `[timing] Pass 1 (contentId): ${((performance.now() - t0) / 1000).toFixed(1)}s`);
             log('info', contentId
                 ? `ContentId: ${contentId} (${computedSize} bytes)`
                 : `Program NCA: ${computedSize} bytes (contentId computed in Pass 2)`);

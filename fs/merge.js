@@ -113,8 +113,10 @@ export async function mergeNSP(readers, output, options = {}) {
         const m = members[i];
         const writePos = headerSize + writer.files[i].offset;
         const doneBefore = written;
+        const t0 = performance.now();
         await writeFromReader(adapter, writePos, m,
             (p) => progress((doneBefore + m.outLen * p) / totalDataSize, `${m.kind === 'ncz' ? 'Decompressing' : 'Copying'} ${m.name}...`));
+        log('info', `[timing] ${m.name}: ${((performance.now() - t0) / 1000).toFixed(1)}s`);
         written = doneBefore + m.outLen;
     }
 
