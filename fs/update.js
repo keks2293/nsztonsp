@@ -756,12 +756,20 @@ export async function update(readers, output, options = {}) {
         // ── BKTR buffered path (forced buffered mode) ────────────────────────
         // Merge RomFS into memory, extract ExeFS, pack NCA from buffers.
         // Only reached when updateMode === 'buffered' (skip streaming paths above).
+        // Two-phase progress (same protocol as two-pass): phase 1 = merge +
+        // exefs + hash precompute (each 1× — the buffer replaces the re-merges),
+        // phase 2 = NCA write + tail. Phase scale: merge(romfs) + exefs +
+        // hash(romfs + exefs) = 2×(romfs + exefs), mirroring two-pass pass 1.
+        const phase1Bytes = 2 * (romfsDataSize || 1) + 2 * exefsSize;
+        const phase1Label = 'Computing contentId (1/2)';
+        const phase1 = (p) => progress(p, phase1Label, phase1Bytes);
         log('info', `Merging RomFS (buffered, base streamed from ${baseKind === 'ncz' ? 'NCZ' : 'container'})...`);
         await new Promise(r => setTimeout(r, 0));
         const mergeResult = await mergeRomFS(baseInput, updateInput, {
             keys,
             baseTik: baseTikData,
             updateTik: updateTikData,
+            onProgress: (pos, total) => phase1((pos / total) * (romfsDataSize || 1) / phase1Bytes),
         });
         const mergedRomfs = mergeResult.mergedData;
         log('info', `Merged RomFS: ${mergedRomfs.length} bytes, ${mergeResult.relocEntries} reloc entries, ${mergeResult.subsectionEntries} subsection entries`);
@@ -775,6 +783,7 @@ export async function update(readers, output, options = {}) {
             keepSig: options.keepNpdmAcidSig === true,
             keepKey: options.keepNpdmAcidKey === true,
         }, log);
+        phase1((romfsDataSize + exefsSize) / phase1Bytes);
 
         baseSource = null;
         updateSource = null;
@@ -782,7 +791,8 @@ export async function update(readers, output, options = {}) {
 
         log('info', 'Preparing merged Program NCA (hash precompute)...');
         const preparedProgram = await preparePlaintextProgramNca(
-            exefsData, mergedRomfs, null, base.cnmt.titleId, keys, log
+            exefsData, mergedRomfs, null, base.cnmt.titleId, keys, log,
+            (f) => phase1((romfsDataSize + exefsSize) / phase1Bytes + f * (romfsDataSize + exefsSize) / phase1Bytes)
         );
         mergedProgram = { hashHex: preparedProgram.hashHex, size: preparedProgram.size, id: preparedProgram.hashHex.slice(0, 32) };
         log('info', `Merged Program NCA: ${mergedProgram.size} bytes sha256=${mergedProgram.hashHex} contentId=${mergedProgram.id}`);
@@ -799,14 +809,16 @@ export async function update(readers, output, options = {}) {
         await adapter.write(0, pfs0Header.buffer);
         log('info', `PFS0 header ${pfs0Header.headerSize} bytes, ${pw.files.length} members`);
 
+        // Phase 2: Program NCA write + tail form one continuous bar (same
+        // protocol as the two-pass paths).
+        const phase2Label = 'Writing output (2/2)';
+        const phaseTotal = mergedProgram.size + otherNcas.reduce((s, m) => s + m.outLen, 0);
         log('info', 'Packing merged Program NCA (streaming)...');
         await new Promise(r => setTimeout(r, 0));
-        await writePlaintextProgramNca(preparedProgram, adapter, log, programNcaPfs0Offset);
+        await writePlaintextProgramNca(preparedProgram, adapter, log, programNcaPfs0Offset,
+            (p) => progress(p * mergedProgram.size / phaseTotal, phase2Label, phaseTotal));
 
-        // Pre-tail phases (merge/extract/prep) are untracked — the tail is the
-        // whole visible write, so it runs the phase scale from 0.
-        const bufferedTailBytes = otherNcas.reduce((s, m) => s + m.outLen, 0) || 1;
-        return finalizeOutputNsP(adapter, { pfs0Header, pw, otherNcas, totalData, rebuilt, output, log, progress, phaseLabel: 'Writing output', phaseBaseDone: 0, phaseTotal: bufferedTailBytes });
+        return finalizeOutputNsP(adapter, { pfs0Header, pw, otherNcas, totalData, rebuilt, output, log, progress, phaseLabel: phase2Label, phaseBaseDone: mergedProgram.size, phaseTotal });
     }
 
     // ── Non-merge path (original, buffered) ─────────────────────────────────
