@@ -4,6 +4,7 @@ import { sha256, SHA256, digest32 } from '../crypto/sha256.js';
 import { PFS0, PFS0Writer } from './pfs0.js';
 import { hexToBytes, writeU64LE, writeU32LE, readLeU64 } from './bytes.js';
 import { fsHeaderAt, sectionMedia, NCA_HDR, FS_HDR, NCA_HEADER_SIZE, toKeyBytes, decryptNcaHeaderBytes, resolveTitlekey, reversedSectionCtr, findRomfsFsHeader, MAGIC_IVFC, IVFC_HEADER_SIZE, IVFC_ID, IVFC_MASTER_HASH_SIZE, IVFC_NUM_LEVELS, IVFC_BLOCK_SIZE_LOG2, IVFC_HASH_BLOCK_SIZE, IVFC_HASH_SIZE, IVFC_LEVELS_OFFSET, IVFC_MASTER_HASH_OFFSET, IVFC_MAX_LEVEL, IVFC_LEVEL_HDR, NCA_CONTENT_TYPE } from './nca-utils.js';
+import { yieldToEventLoop } from './event-loop.js';
 
 // Yanu update pipeline uses only:
 //   PROGRAM (--plaintext) → ExeFS + RomFS, CRYPT_NONE sections ✅
@@ -76,7 +77,7 @@ function buildIvfcHeader(dataSizes, masterHash) {
     return ivfcHeader;
 }
 
-export function buildIvfcHashTree(romfsData) {
+export async function buildIvfcHashTree(romfsData) {
     const numHashLevels = 5;
 
     // Build hash levels from bottom up (data → hash4 → ... → hash0)
@@ -109,6 +110,10 @@ export function buildIvfcHashTree(romfsData) {
             block.set(currentData.subarray(blockStart, blockEnd));
             const hash = digest32(block);
             hashFile.set(hash, b * IVFC_HASH_SIZE);
+            // Level 0 hashes ~size/0x4000 blocks (37k for 600 MB RomFS) — a long
+            // synchronous stretch; yield periodically so the browser can repaint
+            // the progress bar. Upper levels are tiny (≤1156 blocks), skip them.
+            if (lvl === 0 && (b & 1023) === 1023) await yieldToEventLoop();
         }
         const paddedSize = pad4000(hashFile.length);
         const paddedFile = new Uint8Array(paddedSize);
@@ -148,7 +153,7 @@ function finalizePfs0HashTable(rawHashTable) {
     return { hashTable: padded, rawHashSize: rawHashTable.length, masterHash };
 }
 
-export function buildPfs0HashTable(pfs0Data, hashBlock) {
+export async function buildPfs0HashTable(pfs0Data, hashBlock) {
     const hashSize = 0x20;
     const numBlocks = Math.ceil(pfs0Data.length / hashBlock);
     const hashTable = new Uint8Array(numBlocks * hashSize);
@@ -159,6 +164,7 @@ export function buildPfs0HashTable(pfs0Data, hashBlock) {
         const block = pfs0Data.subarray(blockStart, blockEnd);
         const hash = digest32(block);
         hashTable.set(hash, b * hashSize);
+        if ((b & 255) === 255) await yieldToEventLoop();
     }
 
     return finalizePfs0HashTable(hashTable);
@@ -507,7 +513,7 @@ export async function packMetaNca(cnmtData, pfs0FileName, titleId, keys, log) {
     newPfs0.set(cnmtData, pfs0Header.headerSize);
 
     // ── PFS0 hash table (PFS0_META_HASH_BLOCK_SIZE) ─────────────────────────
-    const pfs0Hash = buildPfs0HashTable(newPfs0, PFS0_META_HASH_BLOCK_SIZE);
+    const pfs0Hash = await buildPfs0HashTable(newPfs0, PFS0_META_HASH_BLOCK_SIZE);
     const htablePadded = pfs0Hash.hashTable;
     const pfs0Offset = htablePadded.length; // = 0x200
     const pfs0Size = newPfs0.length;
@@ -823,14 +829,14 @@ export async function preparePlaintextProgramNca(exefsData, romfsData, controlDa
 
     // ── Pass 1: Compute hashes (same as buffer version) ────────────────────
     _log('info', '  Computing ExeFS PFS0 hash table...');
-    const exeHash = buildPfs0HashTable(exefsData, PFS0_EXEFS_HASH_BLOCK_SIZE);
+    const exeHash = await buildPfs0HashTable(exefsData, PFS0_EXEFS_HASH_BLOCK_SIZE);
     rep(exefsData.length);
     const exeHtablePadded = exeHash.hashTable;
     const exePfs0Offset = exeHtablePadded.length;
     const exeSectionSize = pad200(exePfs0Offset + exefsData.length);
 
     _log('info', '  Computing IVFC hash tree (5 levels + data)...');
-    const romIvfc = buildIvfcHashTree(romfsData);
+    const romIvfc = await buildIvfcHashTree(romfsData);
     rep(romfsData.length);
     // Pad RomFS data level to 0x4000 (IVFC_HASH_BLOCK_SIZE) to match Nintendo's canonical
     // layout (base NCA data level is 0x4000-aligned) and hacpack (romfs_build pads to
@@ -858,18 +864,19 @@ export async function preparePlaintextProgramNca(exefsData, romfsData, controlDa
     // hash; unchunked it would be one silent synchronous stretch.
     _log('info', '  Calculating NCA hash...');
     const ncaHasher = new SHA256();
-    const updateChunked = (data) => {
+    const updateChunked = async (data) => {
         for (let off = 0; off < data.length; off += 0x1000000) {
             const n = Math.min(0x1000000, data.length - off);
             ncaHasher.update(data.subarray(off, off + n));
             rep(n);
+            await yieldToEventLoop();
         }
     };
     ncaHasher.update(encHeader);
     rep(NCA_HEADER_SIZE);
     ncaHasher.update(exeHtablePadded);
     rep(exeHtablePadded.length);
-    updateChunked(exefsData);
+    await updateChunked(exefsData);
 
     // Hash ExeFS section padding (zeros between ExeFS data end and RomFS start)
     const exePaddingSize = exeSectionSize - (exePfs0Offset + exefsData.length);
@@ -880,7 +887,7 @@ export async function preparePlaintextProgramNca(exefsData, romfsData, controlDa
 
     // Hash RomFS section: IVFC levels concatenated (last = the RomFS data)
     for (const levelData of romIvfc.levelFiles) {
-        updateChunked(levelData);
+        await updateChunked(levelData);
     }
 
     // Hash RomFS section trailing padding (zeros after RomFS data to align to 0x200)
