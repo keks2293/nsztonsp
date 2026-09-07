@@ -2,6 +2,7 @@ import { AesCtr } from '../crypto/aes-ops.mjs';
 import { decryptNcaHeader } from './nca.js';
 import { BufferRangeSource } from './range-source.js';
 import { readLeU64, readLeU32 } from './bytes.js';
+import { isNode } from '../crypto/platform.js';
 import { decryptNcaHeaderBytes, fsHeaderAt, reversedSectionCtr, extractTitlekeyFromTik, deriveTitlekeyFromKeyArea, IVFC_LEVEL_HDR, IVFC_LEVELS_OFFSET, IVFC_MAX_LEVEL, FS_HDR } from './nca-utils.js';
 import {
     parseBktrHeader,
@@ -25,6 +26,29 @@ function toNcaInput(nca) {
 }
 
 const BKTR_MAGIC = 0x52544B42; // "BKTR"
+
+// Event-loop yield (a real macrotask → browser paint boundary), faster than
+// setTimeout(0)'s 1 ms minimum delay: a port message is queued as a task with
+// no minimum. The BKTR patch path is synchronous JS end to end (buffered
+// subarray reads + AesEcb block loop + hash — microtask-only boundaries), so
+// without it the browser cannot repaint the progress bar mid-merge and the UI
+// looks frozen. Called after every emitted chunk in streaming mode; the merge
+// awaits it sequentially, so one shared channel is safe.
+//
+// Node: a used MessagePort is a ref'd handle that never releases (unref() is
+// ignored once onmessage is attached), so the process would hang after the
+// script's work is done. setImmediate is an equally fast macrotask there and
+// holds no ref — the port is only created for the browser path. (A CLI progress
+// bar also needs the yield: the merge is a synchronous JS stretch, and without
+// a macrotask boundary the buffered stdout writes only flush all at once.)
+const YIELD_CHANNEL = isNode ? null : new MessageChannel();
+function yieldToEventLoop() {
+    if (!YIELD_CHANNEL) return new Promise(resolve => setImmediate(resolve));
+    return new Promise(resolve => {
+        YIELD_CHANNEL.port1.onmessage = resolve;
+        YIELD_CHANNEL.port2.postMessage(null);
+    });
+}
 
 export async function mergeRomFS(baseNcaData, updateNcaData, options = {}) {
     const { keys, onChunk, baseTitlekey: providedBaseTitlekey, updateTitlekey: providedUpdateTitlekey, baseTik, updateTik, titlekeysFile } = options;
@@ -162,6 +186,24 @@ export async function mergeRomFS(baseNcaData, updateNcaData, options = {}) {
     let pos = 0;
     let entryIdx = 0;
 
+    // One place for "land a decrypted chunk at its virtual offset": streaming
+    // emits only the overlap with the level-5 data region (both loops share
+    // this clip) and yields to the event loop afterwards (the patch path is
+    // synchronous JS — without a real task boundary the browser cannot
+    // repaint the progress bar mid-merge); buffered stores into `merged`.
+    const emitChunk = async (chunk, virtOffset) => {
+        if (streaming) {
+            const a = Math.max(virtOffset, dataStart);
+            const b = Math.min(virtOffset + chunk.length, dataEnd);
+            if (b > a) {
+                await onChunk(chunk.subarray(a - virtOffset, b - virtOffset), a - dataStart);
+                await yieldToEventLoop();
+            }
+        } else {
+            merged.set(chunk, virtOffset);
+        }
+    };
+
     while (pos < totalSize && entryIdx < relocBlock.entries.length) {
         const entry = relocBlock.entries[entryIdx];
         const nextVirt = entryIdx + 1 < relocBlock.entries.length
@@ -198,15 +240,7 @@ export async function mergeRomFS(baseNcaData, updateNcaData, options = {}) {
                 const chunk = await decryptPatchRegionData(
                     patchRaw, updateTitlekey, secureValue, subEntry, fileOffset
                 );
-                if (streaming) {
-                    const a = Math.max(writePos, dataStart);
-                    const b = Math.min(writePos + readLen, dataEnd);
-                    if (b > a) {
-                        await onChunk(chunk.subarray(a - writePos, b - writePos), a - dataStart);
-                    }
-                } else {
-                    merged.set(chunk, writePos);
-                }
+                await emitChunk(chunk, writePos);
 
                 writePos += readLen;
                 currentPhys += readLen;
@@ -228,15 +262,7 @@ export async function mergeRomFS(baseNcaData, updateNcaData, options = {}) {
                 const cipher = await baseNcaData.source.read(baseRomfsSecMeta.offset + baseOffset + done, n);
                 baseCtr.seek(baseRomfsSecMeta.offset + baseOffset + done);
                 const dec = await baseCtr.decrypt(cipher);
-                if (streaming) {
-                    const a = Math.max(pos + done, dataStart);
-                    const b = Math.min(pos + done + n, dataEnd);
-                    if (b > a) {
-                        await onChunk(dec.subarray(a - (pos + done), b - (pos + done)), a - dataStart);
-                    }
-                } else {
-                    merged.set(dec, pos + done);
-                }
+                await emitChunk(dec, pos + done);
                 done += n;
             }
         }
