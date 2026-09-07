@@ -4,7 +4,8 @@
 // total), monotonic within a phase, each phase ends at exactly 1.0 — so the bar can
 // never regress across phases. Write phases are continuous (program + tail form one
 // bar: two-pass = 'Computing contentId (1/2)' + 'Writing output (2/2)',
-// streaming = 'Writing output (1/1)'). Also re-verifies streaming ≡ two-pass
+// streaming = 'Writing output (1/1)', buffered = 'Computing contentId (1/2)' +
+// 'Writing output (2/2)'). Also re-verifies streaming ≡ two-pass ≡ buffered
 // byte-identity. In-memory outputs only (no disk writes).
 import fs from 'fs';
 import crypto from 'node:crypto';
@@ -131,6 +132,26 @@ const sha = (b) => crypto.createHash('sha256').update(b).digest('hex');
   console.log(`\nstreaming sha256=${globalThis.__refSha} (${globalThis.__refLen})`);
   console.log(`two-pass  sha256=${sha(buf)} (${buf.length})`);
   assert(globalThis.__refSha === sha(buf) && globalThis.__refLen === buf.length, 'streaming ≡ two-pass byte-identical');
+}
+
+// Run 3: buffered (sequential writer + updateMode 'buffered' → 1 merge into
+// memory, 2 phases) — verifies the buffered path's phase protocol AND that
+// buffered output is byte-identical to the streaming reference (this is the
+// append-only combination the browser SW download uses with the Buffered pill).
+{
+  const events = [];
+  const base = { name: 'base.nsp', reader: new FileReader(basePath) };
+  const upd = { name: 'update.nsp', reader: new FileReader(updatePath) };
+  const sw = new SequentialWriter();
+  await update([base, upd], { writable: sw }, {
+    keys, log, bktrMerge: true, updateMode: 'buffered',
+    progress: (p, label, phaseBytes) => events.push({ p, label, phaseBytes }),
+  });
+  base.reader.close(); upd.reader.close();
+  const buf = sw.build();
+  checkProtocol('buffered (sw-sim, appendOnly)', events, ['Computing contentId (1/2)', 'Writing output (2/2)'], buf);
+  console.log(`buffered  sha256=${sha(buf)} (${buf.length})`);
+  assert(globalThis.__refSha === sha(buf) && globalThis.__refLen === buf.length, 'buffered ≡ streaming byte-identical');
 }
 
 console.log(failures === 0 ? '\nALL PASSED' : `\n${failures} FAILURES`);
