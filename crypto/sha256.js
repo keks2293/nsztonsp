@@ -255,3 +255,61 @@ export const digest32 = _nativeDigest || ((data) => {
     h.update(data);
     return h.digest();
 });
+
+// WebCrypto one-shot digest (browser + Node, hardware-accelerated).
+// crypto.subtle.digest is async and one-shot — no incremental update()/clone() —
+// so it only fits hashes over INDEPENDENT blocks (IVFC levels, PFS0 tables),
+// never a single big streamed hash. Null when crypto.subtle is unavailable
+// (non-secure context) — callers then fall back to digest32 (node:crypto in
+// Node, pure JS in browser). (The old sync sha256() WebCrypto path was dropped
+// in 3a560a7 over the ~2GB one-shot ArrayBuffer concern; this batch shape
+// digests 16/64 KB blocks, so that limit never applies.)
+export let webcryptoDigest = null;
+try {
+    if (typeof crypto !== 'undefined' && crypto.subtle && typeof crypto.subtle.digest === 'function') {
+        webcryptoDigest = (data) => crypto.subtle.digest('SHA-256', data);
+    }
+} catch {}
+
+// Bounded-concurrency batcher for one-shot SHA256 digests over independent
+// blocks. Each result is placed by slot, so WebCrypto completion order is
+// irrelevant. Without WebCrypto, submit() degrades to a synchronous digest32
+// (same behavior as the pre-WebCrypto code). drain() resolves once every
+// submitted block is placed and re-arms, so one instance serves sequential
+// batches (e.g. one per IVFC level).
+export class BatchDigestor {
+    constructor(concurrency = 32) {
+        this._concurrency = concurrency;
+        this._queue = [];
+        this._inflight = 0;
+        this._waiters = [];
+    }
+    submit(block, place) {
+        const start = () => {
+            this._inflight++;
+            if (webcryptoDigest) {
+                webcryptoDigest(block).then(
+                    (buf) => place(new Uint8Array(buf)),
+                    () => place(digest32(block)),
+                ).then(() => this._settled());
+            } else {
+                place(digest32(block));
+                this._settled();
+            }
+        };
+        if (this._inflight < this._concurrency) start();
+        else this._queue.push(start);
+    }
+    _settled() {
+        this._inflight--;
+        const next = this._queue.shift();
+        if (next) next();
+        if (this._inflight === 0 && this._queue.length === 0 && this._waiters.length > 0) {
+            for (const r of this._waiters.splice(0)) r();
+        }
+    }
+    drain() {
+        if (this._inflight === 0 && this._queue.length === 0) return Promise.resolve();
+        return new Promise((resolve) => this._waiters.push(resolve));
+    }
+}
