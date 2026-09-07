@@ -1,6 +1,6 @@
 import { AesXts, AesCtr } from '../crypto/aes-ops.mjs';
 import { AesEcb } from '../crypto/aes128.js';
-import { sha256, SHA256, digest32 } from '../crypto/sha256.js';
+import { sha256, SHA256, digest32, BatchDigestor } from '../crypto/sha256.js';
 import { PFS0, PFS0Writer } from './pfs0.js';
 import { hexToBytes, writeU64LE, writeU32LE, readLeU64 } from './bytes.js';
 import { fsHeaderAt, sectionMedia, NCA_HDR, FS_HDR, NCA_HEADER_SIZE, toKeyBytes, decryptNcaHeaderBytes, resolveTitlekey, reversedSectionCtr, findRomfsFsHeader, MAGIC_IVFC, IVFC_HEADER_SIZE, IVFC_ID, IVFC_MASTER_HASH_SIZE, IVFC_NUM_LEVELS, IVFC_BLOCK_SIZE_LOG2, IVFC_HASH_BLOCK_SIZE, IVFC_HASH_SIZE, IVFC_LEVELS_OFFSET, IVFC_MASTER_HASH_OFFSET, IVFC_MAX_LEVEL, IVFC_LEVEL_HDR, NCA_CONTENT_TYPE } from './nca-utils.js';
@@ -85,6 +85,10 @@ export async function buildIvfcHashTree(romfsData) {
     const allFiles = [romfsData];
     const allSizes = [romfsData.length];
 
+    // Every block of every level is an independent one-shot SHA256 — hash them
+    // through the WebCrypto batcher (hardware-accelerated; ~7–30× the pure-JS
+    // rate). drain() between levels: level N+1 only exists once level N is done.
+    const batcher = new BatchDigestor();
     for (let lvl = 0; lvl < numHashLevels; lvl++) {
         const numBlocks = Math.ceil(currentData.length / IVFC_HASH_BLOCK_SIZE);
         const hashFile = new Uint8Array(numBlocks * IVFC_HASH_SIZE);
@@ -106,15 +110,15 @@ export async function buildIvfcHashTree(romfsData) {
             // read bytes to sha_update (no padding); the packer must therefore
             // zero-pad each level to a 0x4000 multiple before hashing. We do the
             // padding inline here.
-            const block = new Uint8Array(IVFC_HASH_BLOCK_SIZE);
-            block.set(currentData.subarray(blockStart, blockEnd));
-            const hash = digest32(block);
-            hashFile.set(hash, b * IVFC_HASH_SIZE);
-            // Level 0 hashes ~size/0x4000 blocks (37k for 600 MB RomFS) — a long
-            // synchronous stretch; yield periodically so the browser can repaint
-            // the progress bar. Upper levels are tiny (≤1156 blocks), skip them.
-            if (lvl === 0 && (b & 1023) === 1023) await yieldToEventLoop();
+            let block = currentData.subarray(blockStart, blockEnd);
+            if (block.length < IVFC_HASH_BLOCK_SIZE) {
+                const padded = new Uint8Array(IVFC_HASH_BLOCK_SIZE);
+                padded.set(block);
+                block = padded;
+            }
+            batcher.submit(block, (d) => hashFile.set(d, b * IVFC_HASH_SIZE));
         }
+        await batcher.drain();
         const paddedSize = pad4000(hashFile.length);
         const paddedFile = new Uint8Array(paddedSize);
         paddedFile.set(hashFile);
@@ -154,18 +158,18 @@ function finalizePfs0HashTable(rawHashTable) {
 }
 
 export async function buildPfs0HashTable(pfs0Data, hashBlock) {
-    const hashSize = 0x20;
     const numBlocks = Math.ceil(pfs0Data.length / hashBlock);
-    const hashTable = new Uint8Array(numBlocks * hashSize);
+    const hashTable = new Uint8Array(numBlocks * IVFC_HASH_SIZE);
 
+    // Independent per-block SHA256 (the last partial block is hashed as-is, no
+    // padding) — WebCrypto batcher, same as buildIvfcHashTree.
+    const batcher = new BatchDigestor();
     for (let b = 0; b < numBlocks; b++) {
         const blockStart = b * hashBlock;
         const blockEnd = Math.min(blockStart + hashBlock, pfs0Data.length);
-        const block = pfs0Data.subarray(blockStart, blockEnd);
-        const hash = digest32(block);
-        hashTable.set(hash, b * hashSize);
-        if ((b & 255) === 255) await yieldToEventLoop();
+        batcher.submit(pfs0Data.subarray(blockStart, blockEnd), (d) => hashTable.set(d, b * IVFC_HASH_SIZE));
     }
+    await batcher.drain();
 
     return finalizePfs0HashTable(hashTable);
 }
@@ -183,6 +187,9 @@ export class StreamingIvfcHasher {
         this.buf = new Uint8Array(IVFC_HASH_BLOCK_SIZE);
         this.bufLen = 0;
         this.blockIdx = 0;
+        // Independent per-block SHA256 via the WebCrypto batcher — the digest
+        // of a completed block runs asynchronously while the stream continues.
+        this.batcher = new BatchDigestor();
     }
     update(chunk) {
         let off = 0;
@@ -193,17 +200,23 @@ export class StreamingIvfcHasher {
             this.bufLen += n;
             off += n;
             if (this.bufLen === IVFC_HASH_BLOCK_SIZE) {
-                this.h1.set(digest32(this.buf), this.blockIdx * IVFC_HASH_SIZE);
-                this.blockIdx++;
+                // this.buf is reused immediately — copy the block before the
+                // async digest reads it.
+                const block = this.buf.slice();
+                const idx = this.blockIdx++;
+                this.batcher.submit(block, (d) => this.h1.set(d, idx * IVFC_HASH_SIZE));
                 this.bufLen = 0;
             }
         }
     }
-    finalize() {
+    async finalize() {
+        await this.batcher.drain();
         if (this.bufLen > 0) {
             const padded = new Uint8Array(IVFC_HASH_BLOCK_SIZE);
             padded.set(this.buf.subarray(0, this.bufLen));
-            this.h1.set(digest32(padded), this.blockIdx * IVFC_HASH_SIZE);
+            const idx = this.blockIdx;
+            this.batcher.submit(padded, (d) => this.h1.set(d, idx * IVFC_HASH_SIZE));
+            await this.batcher.drain();
             this.blockIdx++;
         }
         // Build H1..H5 (each level = sha256 of 0x4000 blocks of the previous, padded level).
@@ -217,8 +230,9 @@ export class StreamingIvfcHasher {
             const numBlocks = Math.ceil(padded.length / IVFC_HASH_BLOCK_SIZE);
             const next = new Uint8Array(numBlocks * IVFC_HASH_SIZE);
             for (let b = 0; b < numBlocks; b++) {
-                next.set(digest32(padded.subarray(b * IVFC_HASH_BLOCK_SIZE, (b + 1) * IVFC_HASH_BLOCK_SIZE)), b * IVFC_HASH_SIZE);
+                this.batcher.submit(padded.subarray(b * IVFC_HASH_BLOCK_SIZE, (b + 1) * IVFC_HASH_BLOCK_SIZE), (d) => next.set(d, b * IVFC_HASH_SIZE));
             }
+            await this.batcher.drain();
             current = next;
         }
         // levels = [H1, H2, H3, H4, H5]; write order = [H5, H4, H3, H2, H1]
@@ -238,11 +252,13 @@ export class StreamingIvfcHasher {
 export class StreamingPfs0Hasher {
     constructor(hashBlock = PFS0_EXEFS_HASH_BLOCK_SIZE) {
         this.hashBlock = hashBlock;
-        this.hashSize = 0x20;
         this.buf = new Uint8Array(hashBlock);
         this.bufLen = 0;
         this._hashBuf = new Uint8Array(4096);
         this._hashCount = 0;
+        // Independent per-block SHA256 via the WebCrypto batcher, same as
+        // StreamingIvfcHasher.
+        this.batcher = new BatchDigestor();
     }
     update(chunk) {
         let off = 0;
@@ -253,26 +269,34 @@ export class StreamingPfs0Hasher {
             this.bufLen += n;
             off += n;
             if (this.bufLen === this.hashBlock) {
-                this._writeHash(digest32(this.buf));
+                // this.buf is reused immediately — copy the block before the
+                // async digest reads it. Slot-addressed: WebCrypto digests
+                // finish out of order, and entry i must stay at slot i.
+                const block = this.buf.slice();
+                const idx = this._hashCount++;
+                this._ensureCapacity((idx + 1) * IVFC_HASH_SIZE);
+                this.batcher.submit(block, (d) => this._hashBuf.set(d, idx * IVFC_HASH_SIZE));
                 this.bufLen = 0;
             }
         }
     }
-    _writeHash(h) {
-        const need = (this._hashCount + 1) * this.hashSize;
-        if (need > this._hashBuf.length) {
-            const grown = new Uint8Array(this._hashBuf.length * 2);
-            grown.set(this._hashBuf.subarray(0, this._hashCount * this.hashSize));
-            this._hashBuf = grown;
+    _ensureCapacity(bytes) {
+        let buf = this._hashBuf;
+        while (buf.length < bytes) {
+            const grown = new Uint8Array(buf.length * 2);
+            grown.set(buf);
+            buf = grown;
         }
-        this._hashBuf.set(h, this._hashCount * this.hashSize);
-        this._hashCount++;
+        this._hashBuf = buf;
     }
-    finalize() {
+    async finalize() {
         if (this.bufLen > 0) {
-            this._writeHash(digest32(this.buf.subarray(0, this.bufLen)));
+            const idx = this._hashCount++;
+            this._ensureCapacity((idx + 1) * IVFC_HASH_SIZE);
+            this.batcher.submit(this.buf.slice(0, this.bufLen), (d) => this._hashBuf.set(d, idx * IVFC_HASH_SIZE));
         }
-        const hashTable = this._hashBuf.subarray(0, this._hashCount * this.hashSize);
+        await this.batcher.drain();
+        const hashTable = this._hashBuf.subarray(0, this._hashCount * IVFC_HASH_SIZE);
         return finalizePfs0HashTable(hashTable);
     }
 }
@@ -1009,7 +1033,7 @@ export async function packProgramNcaStream({ adapter, ncaOffset, exefsSize, romf
         pfs0.update(chunk);
         rep(n);
     });
-    const exeHash = pfs0.finalize();
+    const exeHash = await pfs0.finalize();
 
     // ── Stream RomFS data → output + IVFC hasher ───────────────────────────
     _log('info', '  Streaming RomFS (BKTR data) → output...');
@@ -1019,7 +1043,7 @@ export async function packProgramNcaStream({ adapter, ncaOffset, exefsSize, romf
         ivfc.update(chunk);
         rep(n);
     });
-    const romIvfc = ivfc.finalize();
+    const romIvfc = await ivfc.finalize();
 
     // ── Section paddings (zeros) ───────────────────────────────────────────
     if (exePaddingSize > 0) await adapter.write(ncaOffset + sec0DataOff + exefsSize, new Uint8Array(exePaddingSize));
@@ -1113,13 +1137,13 @@ export async function computeProgramNcaContentId({ exefsSize, romfsDataSize, tit
     const pfs0 = new StreamingPfs0Hasher(PFS0_EXEFS_HASH_BLOCK_SIZE);
     await streamExefs(async (chunk, off) => { pfs0.update(chunk); rep(chunk.length); });
     _log('info', `[timing] Pass 1 ExeFS (PFS0 hash): ${((performance.now() - t0) / 1000).toFixed(1)}s (${(exefsSize / 1048576).toFixed(0)} MB)`);
-    const exeHash = pfs0.finalize();
+    const exeHash = await pfs0.finalize();
 
     const ivfc = new StreamingIvfcHasher(romfsDataSize);
     t0 = performance.now();
     await streamRomfs(async (chunk, off) => { ivfc.update(chunk); rep(chunk.length); });
     _log('info', `[timing] Pass 1 RomFS (IVFC merge): ${((performance.now() - t0) / 1000).toFixed(1)}s (${(romfsDataSize / 1048576).toFixed(0)} MB)`);
-    const romIvfc = ivfc.finalize();
+    const romIvfc = await ivfc.finalize();
 
     const encHeader = buildEncryptedProgramNcaHeader({
         titleId, keys, exeHash, exePfs0Offset: L.exeHtableSize, exefsSize, romIvfc,
