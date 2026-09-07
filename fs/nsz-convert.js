@@ -27,10 +27,12 @@ async function convertNSZStreaming(pfs0, adapter, options, cnmtHashes = new Map(
         const writePos = pfs0Header.headerSize + writer.files[idx].offset;
 
         options.log('info', `[EXISTS]     ${f.name}`);
+        const t0 = performance.now();
         await writeFromReader(adapter, writePos,
             { ...meta, reader: adapter, outLen: meta.size },
             (p) => options.progress(pct(dataWritten + meta.size * p), `${meta.kind === 'ncz' ? 'Decompressing' : 'Copying'} ${meta.inputName}...`),
             { verify, createHash: options.createHash, cnmtHashMap: cnmtHashes, log: options.log });
+        options.log('info', `[timing] ${f.name}: ${((performance.now() - t0) / 1000).toFixed(1)}s`);
 
         dataWritten += meta.size;
         options.progress(pct(dataWritten), `File ${idx + 1}/${files.length} done`);
@@ -42,10 +44,13 @@ async function convertNSZStreaming(pfs0, adapter, options, cnmtHashes = new Map(
 export async function convertNSZ(reader, output, options = {}) {
     const { verify = false, fixPadding = false, log = () => {}, progress = () => {}, createHash, extractCnmtHashMap } = options;
 
+    let t0 = performance.now();
     const pfs0 = await PFS0.open(reader);
+    log('info', `[timing] Container parse: ${((performance.now() - t0) / 1000).toFixed(2)}s`);
 
     const cnmtHashMap = new Map();
     if (extractCnmtHashMap) {
+        t0 = performance.now();
         for (const f of pfs0.getFiles()) {
             if (f.name.toLowerCase().endsWith('.cnmt.nca')) {
                 const data = await reader.read(f.offset, f.size);
@@ -53,6 +58,7 @@ export async function convertNSZ(reader, output, options = {}) {
                 for (const [ncaId, hash] of m) cnmtHashMap.set(ncaId, hash);
             }
         }
+        log('info', `[timing] CNMT extraction: ${((performance.now() - t0) / 1000).toFixed(2)}s`);
     }
 
     const read = (offset, size) => reader.read(offset, size);
