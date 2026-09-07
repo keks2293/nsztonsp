@@ -1057,12 +1057,16 @@ export async function computeProgramNcaContentId({ exefsSize, romfsDataSize, tit
     const rep = (n) => { done += n; _prog(done / pass1Total); };
 
     _log('info', '  Pass 1: Computing hash metadata (1 romfs pass)...');
+    let t0 = performance.now();
     const pfs0 = new StreamingPfs0Hasher(PFS0_EXEFS_HASH_BLOCK_SIZE);
     await streamExefs(async (chunk, off) => { pfs0.update(chunk); rep(chunk.length); });
+    _log('info', `[timing] Pass 1 ExeFS (PFS0 hash): ${((performance.now() - t0) / 1000).toFixed(1)}s (${(exefsSize / 1048576).toFixed(0)} MB)`);
     const exeHash = pfs0.finalize();
 
     const ivfc = new StreamingIvfcHasher(romfsDataSize);
+    t0 = performance.now();
     await streamRomfs(async (chunk, off) => { ivfc.update(chunk); rep(chunk.length); });
+    _log('info', `[timing] Pass 1 RomFS (IVFC merge): ${((performance.now() - t0) / 1000).toFixed(1)}s (${(romfsDataSize / 1048576).toFixed(0)} MB)`);
     const romIvfc = ivfc.finalize();
 
     const encHeader = buildEncryptedProgramNcaHeader({
@@ -1079,7 +1083,9 @@ export async function computeProgramNcaContentId({ exefsSize, romfsDataSize, tit
     const sha = new SHA256();
     sha.update(encHeader);
     sha.update(exeHash.hashTable);
+    t0 = performance.now();
     await streamExefs(async (chunk) => { sha.update(chunk); rep(chunk.length); });
+    _log('info', `[timing] Pass 1 ExeFS (SHA256): ${((performance.now() - t0) / 1000).toFixed(1)}s (${(exefsSize / 1048576).toFixed(0)} MB)`);
     if (L.exePaddingSize > 0) sha.update(new Uint8Array(L.exePaddingSize));
     for (const lvl of romIvfc.hashLevels) sha.update(lvl);
 
@@ -1087,7 +1093,9 @@ export async function computeProgramNcaContentId({ exefsSize, romfsDataSize, tit
     let sha256Mid = null;
     if (contentIdInPass1) {
         _log('info', '  Pass 1: Computing contentId (re-stream)...');
+        t0 = performance.now();
         await streamRomfs(async (chunk) => { sha.update(chunk); rep(chunk.length); });
+        _log('info', `[timing] Pass 1 RomFS (SHA256 re-stream): ${((performance.now() - t0) / 1000).toFixed(1)}s (${(romfsDataSize / 1048576).toFixed(0)} MB)`);
         if (L.romPaddingSize > 0) sha.update(new Uint8Array(L.romPaddingSize));
         contentId = sha.hex();
         _log('info', `  ----> Program NCA (two-pass): ${L.ncaSize} bytes sha256=${contentId}`);
@@ -1130,6 +1138,7 @@ export async function writeProgramNcaTwoPass({ meta, adapter, ncaOffset, streamE
         return await adapter.write(pos, data);
     };
 
+    let t0 = performance.now();
     await w(ncaOffset, encHeader);
     await w(ncaOffset + L.sec0Start, exeHash.hashTable);
     await streamExefs(async (chunk, off) => {
@@ -1148,12 +1157,14 @@ export async function writeProgramNcaTwoPass({ meta, adapter, ncaOffset, streamE
         await w(ncaOffset + L.sec1Start + lvOff, lvl);
         lvOff += lvlLen;
     }
+    _log('info', `[timing] Pass 2 ExeFS+levels: ${((performance.now() - t0) / 1000).toFixed(1)}s (${(L.exefsSize / 1048576).toFixed(0)} MB)`);
     _log('info', `  RomFS streaming: ${(L.romfsDataSize / 1048576).toFixed(0)} MB to merge/write...`);
     // Seekable output: restore the SHA256 mid-state (has header + exefs +
     // hashLevels) and let romChunks + romPadding be hashed alongside the
     // write → contentId for free. Append-only output: contentId was
     // precomputed in Pass 1 — write only.
     const sha = contentId === null ? sha256Mid.clone() : null;
+    t0 = performance.now();
     await streamRomfs(async (chunk, off) => {
         if (sha) sha.update(chunk);
         await w(ncaOffset + L.sec1DataOff + off, chunk);
@@ -1163,6 +1174,7 @@ export async function writeProgramNcaTwoPass({ meta, adapter, ncaOffset, streamE
         if (sha) sha.update(pad);
         await w(ncaOffset + L.sec1DataOff + L.romfsDataSize, pad);
     }
+    _log('info', `[timing] Pass 2 RomFS: ${((performance.now() - t0) / 1000).toFixed(1)}s (${(L.romfsDataSize / 1048576).toFixed(0)} MB)`);
     if (sha) contentId = sha.hex();
     _prog(1);
     return contentId;

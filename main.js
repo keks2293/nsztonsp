@@ -516,6 +516,7 @@ async function main() {
 
             let outputName;
             let writable = null;
+            const fileT0 = performance.now();
             try {
                 const fileType = detectFileType(file.name);
                 outputName = fileType === 'xcz'
@@ -590,6 +591,7 @@ async function main() {
                 fileStatus[i] = 'ok';
                 updateFileList();
                 accumulatedBytes += file.size;
+                addLog('info', `[timing] ${file.name}: ${((performance.now() - fileT0) / 1000).toFixed(1)}s (incl. SW/FSA setup + close)`);
             } catch (error) {
                 addLog('error', `Failed: ${error.message}`);
                 if (writable) {
