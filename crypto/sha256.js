@@ -286,45 +286,41 @@ try {
     }
 } catch {}
 
-// Bounded-concurrency batcher for one-shot SHA256 digests over independent
-// blocks. Each result is placed by slot, so WebCrypto completion order is
-// irrelevant. Without WebCrypto, submit() degrades to a synchronous digest32
-// (same behavior as the pre-WebCrypto code). drain() resolves once every
-// submitted block is placed and re-arms, so one instance serves sequential
-// batches (e.g. one per IVFC level).
+// Fire-all batcher for one-shot SHA256 digests over independent blocks. Every
+// submit() dispatches immediately — all blocks are in flight at once; results
+// are placed by slot, so WebCrypto completion order is irrelevant. Without
+// WebCrypto, submit() does a synchronous digest32 (same behavior as the
+// pre-WebCrypto code). drain() resolves once every submitted block is placed
+// and re-arms, so one instance serves sequential batches (one per IVFC level).
+// Windowing was dropped (2026-09-08): throttling to 32 in flight serialized
+// every block behind the settle microtask, starving the Node thread pool
+// (729-1035 ms for 37012x16KB here) vs ~120 ms fire-all; Chromium measured all
+// three shapes identical (~90 ms, hardware SHA), so there is nothing to bound.
 export class BatchDigestor {
-    constructor(concurrency = 32) {
-        this._concurrency = concurrency;
-        this._queue = [];
-        this._inflight = 0;
+    constructor() {
+        this._pending = 0;
         this._waiters = [];
     }
     submit(block, place) {
-        const start = () => {
-            this._inflight++;
-            if (webcryptoDigest) {
-                webcryptoDigest(block).then(
-                    (buf) => place(new Uint8Array(buf)),
-                    () => place(digest32(block)),
-                ).then(() => this._settled());
-            } else {
-                place(digest32(block));
-                this._settled();
-            }
-        };
-        if (this._inflight < this._concurrency) start();
-        else this._queue.push(start);
+        this._pending++;
+        if (webcryptoDigest) {
+            webcryptoDigest(block).then(
+                (buf) => place(new Uint8Array(buf)),
+                () => place(digest32(block)),
+            ).then(() => this._settled());
+        } else {
+            place(digest32(block));
+            this._settled();
+        }
     }
     _settled() {
-        this._inflight--;
-        const next = this._queue.shift();
-        if (next) next();
-        if (this._inflight === 0 && this._queue.length === 0 && this._waiters.length > 0) {
+        this._pending--;
+        if (this._pending === 0 && this._waiters.length > 0) {
             for (const r of this._waiters.splice(0)) r();
         }
     }
     drain() {
-        if (this._inflight === 0 && this._queue.length === 0) return Promise.resolve();
+        if (this._pending === 0) return Promise.resolve();
         return new Promise((resolve) => this._waiters.push(resolve));
     }
 }
