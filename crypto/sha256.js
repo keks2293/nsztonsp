@@ -1,3 +1,9 @@
+// The pure-JS class below is the streaming hasher: it is the only SHA-256 with
+// an incremental update() AND a sync clone() (the two-pass contentId hash), so
+// it stays the streaming backend everywhere — browser, Node fallback, and the
+// no-WASM/no-`crypto.subtle` environments (crypto.subtle is one-shot async and
+// cannot be cloned).
+
 const HEXES = new Array(256).fill().map((_, i) => i.toString(16).padStart(2, '0'));
 
 const K = [
@@ -19,8 +25,9 @@ const K = [
     0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2
 ];
 
-const EXTRA = [-2147483648, 8388608, 32768, 128];
-const SHIFT = [24, 16, 8, 0];
+function swap32(v) {
+    return ((v & 0xff) << 24) | ((v & 0xff00) << 8) | ((v >>> 8) & 0xff00) | ((v >>> 24) & 0xff);
+}
 
 export class SHA256 {
     constructor() {
@@ -32,92 +39,89 @@ export class SHA256 {
         this.h5 = 0x9b05688c;
         this.h6 = 0x1f83d9ab;
         this.h7 = 0x5be0cd19;
-        this.blocks = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-        this.block = 0;
-        this.start = 0;
+        this._W = new Int32Array(64);
+        this._buf = new ArrayBuffer(80);
+        this._byte = new Uint8Array(this._buf);
+        this._word = new Int32Array(this._buf, 0, 16);
+        this._blen = 0;
         this.bytes = 0;
         this.hBytes = 0;
-        this.lastByteIndex = 0;
         this.finalized = false;
-        this.hashed = false;
-    }
-
-    _compress() {
-        const blocks = this.blocks;
-        let a = this.h0, b = this.h1, c = this.h2, d = this.h3;
-        let e = this.h4, f = this.h5, g = this.h6, h = this.h7;
-        let j, s0, s1, maj, t1, t2, ch, ab, da, cd, bc;
-
-        for (j = 16; j < 64; ++j) {
-            t1 = blocks[j - 15];
-            s0 = ((t1 >>> 7) | (t1 << 25)) ^ ((t1 >>> 18) | (t1 << 14)) ^ (t1 >>> 3);
-            t1 = blocks[j - 2];
-            s1 = ((t1 >>> 17) | (t1 << 15)) ^ ((t1 >>> 19) | (t1 << 13)) ^ (t1 >>> 10);
-            blocks[j] = blocks[j - 16] + s0 + blocks[j - 7] + s1 | 0;
-        }
-
-        bc = b & c;
-        for (j = 0; j < 64; j += 4) {
-            s0 = ((a >>> 2) | (a << 30)) ^ ((a >>> 13) | (a << 19)) ^ ((a >>> 22) | (a << 10));
-            s1 = ((e >>> 6) | (e << 26)) ^ ((e >>> 11) | (e << 21)) ^ ((e >>> 25) | (e << 7));
-            ab = a & b;
-            maj = ab ^ (a & c) ^ bc;
-            ch = (e & f) ^ (~e & g);
-            t1 = h + s1 + ch + K[j] + blocks[j];
-            t2 = s0 + maj;
-            h = d + t1 | 0;
-            d = t1 + t2 | 0;
-            s0 = ((d >>> 2) | (d << 30)) ^ ((d >>> 13) | (d << 19)) ^ ((d >>> 22) | (d << 10));
-            s1 = ((h >>> 6) | (h << 26)) ^ ((h >>> 11) | (h << 21)) ^ ((h >>> 25) | (h << 7));
-            da = d & a;
-            maj = da ^ (d & b) ^ ab;
-            ch = (h & e) ^ (~h & f);
-            t1 = g + s1 + ch + K[j + 1] + blocks[j + 1];
-            t2 = s0 + maj;
-            g = c + t1 | 0;
-            c = t1 + t2 | 0;
-
-            s0 = ((c >>> 2) | (c << 30)) ^ ((c >>> 13) | (c << 19)) ^ ((c >>> 22) | (c << 10));
-            s1 = ((g >>> 6) | (g << 26)) ^ ((g >>> 11) | (g << 21)) ^ ((g >>> 25) | (g << 7));
-            cd = c & d;
-            maj = cd ^ (c & a) ^ da;
-            ch = (g & h) ^ (~g & e);
-            t1 = f + s1 + ch + K[j + 2] + blocks[j + 2];
-            t2 = s0 + maj;
-            f = b + t1 | 0;
-            b = t1 + t2 | 0;
-
-            s0 = ((b >>> 2) | (b << 30)) ^ ((b >>> 13) | (b << 19)) ^ ((b >>> 22) | (b << 10));
-            s1 = ((f >>> 6) | (f << 26)) ^ ((f >>> 11) | (f << 21)) ^ ((f >>> 25) | (f << 7));
-            bc = b & c;
-            maj = bc ^ (b & d) ^ cd;
-            ch = (f & g) ^ (~f & h);
-            t1 = e + s1 + ch + K[j + 3] + blocks[j + 3];
-            t2 = s0 + maj;
-            e = a + t1 | 0;
-            a = t1 + t2 | 0;
-        }
-
-        this.h0 = this.h0 + a | 0;
-        this.h1 = this.h1 + b | 0;
-        this.h2 = this.h2 + c | 0;
-        this.h3 = this.h3 + d | 0;
-        this.h4 = this.h4 + e | 0;
-        this.h5 = this.h5 + f | 0;
-        this.h6 = this.h6 + g | 0;
-        this.h7 = this.h7 + h | 0;
     }
 
     clone() {
         const c = new SHA256();
         c.h0 = this.h0; c.h1 = this.h1; c.h2 = this.h2; c.h3 = this.h3;
         c.h4 = this.h4; c.h5 = this.h5; c.h6 = this.h6; c.h7 = this.h7;
-        c.blocks = this.blocks.slice();
-        c.block = this.block; c.start = this.start;
+        c._byte.set(this._byte.subarray(0, this._blen));
+        c._blen = this._blen;
         c.bytes = this.bytes; c.hBytes = this.hBytes;
-        c.lastByteIndex = this.lastByteIndex;
-        c.hashed = this.hashed;
+        c.finalized = this.finalized;
         return c;
+    }
+
+    _compressWords() {
+        const W = this._W;
+        let a = this.h0, b = this.h1, c = this.h2, d = this.h3;
+        let e = this.h4, f = this.h5, g = this.h6, h = this.h7;
+        let t1, t2, s0, s1, ch, maj;
+
+        for (let j = 16; j < 64; ++j) {
+            t1 = W[j - 15];
+            s0 = ((t1 >>> 7) | (t1 << 25)) ^ ((t1 >>> 18) | (t1 << 14)) ^ (t1 >>> 3);
+            t1 = W[j - 2];
+            s1 = ((t1 >>> 17) | (t1 << 15)) ^ ((t1 >>> 19) | (t1 << 13)) ^ (t1 >>> 10);
+            W[j] = (W[j - 16] + s0 + W[j - 7] + s1) | 0;
+        }
+
+        let bc = b & c;
+        for (let j = 0; j < 64; j += 4) {
+            s0 = ((a >>> 2) | (a << 30)) ^ ((a >>> 13) | (a << 19)) ^ ((a >>> 22) | (a << 10));
+            s1 = ((e >>> 6) | (e << 26)) ^ ((e >>> 11) | (e << 21)) ^ ((e >>> 25) | (e << 7));
+            const ab = a & b;
+            maj = ab ^ (a & c) ^ bc;
+            ch = (e & f) ^ (~e & g);
+            t1 = h + s1 + ch + K[j] + W[j];
+            t2 = s0 + maj;
+            h = d + t1 | 0;
+            d = t1 + t2 | 0;
+            s0 = ((d >>> 2) | (d << 30)) ^ ((d >>> 13) | (d << 19)) ^ ((d >>> 22) | (d << 10));
+            s1 = ((h >>> 6) | (h << 26)) ^ ((h >>> 11) | (h << 21)) ^ ((h >>> 25) | (h << 7));
+            const da = d & a;
+            maj = da ^ (d & b) ^ ab;
+            ch = (h & e) ^ (~h & f);
+            t1 = g + s1 + ch + K[j + 1] + W[j + 1];
+            t2 = s0 + maj;
+            g = c + t1 | 0;
+            c = t1 + t2 | 0;
+            s0 = ((c >>> 2) | (c << 30)) ^ ((c >>> 13) | (c << 19)) ^ ((c >>> 22) | (c << 10));
+            s1 = ((g >>> 6) | (g << 26)) ^ ((g >>> 11) | (g << 21)) ^ ((g >>> 25) | (g << 7));
+            const cd = c & d;
+            maj = cd ^ (c & a) ^ da;
+            ch = (g & h) ^ (~g & e);
+            t1 = f + s1 + ch + K[j + 2] + W[j + 2];
+            t2 = s0 + maj;
+            f = b + t1 | 0;
+            b = t1 + t2 | 0;
+            s0 = ((b >>> 2) | (b << 30)) ^ ((b >>> 13) | (b << 19)) ^ ((b >>> 22) | (b << 10));
+            s1 = ((f >>> 6) | (f << 26)) ^ ((f >>> 11) | (f << 21)) ^ ((f >>> 25) | (f << 7));
+            bc = b & c;
+            maj = bc ^ (b & d) ^ cd;
+            ch = (f & g) ^ (~f & h);
+            t1 = e + s1 + ch + K[j + 3] + W[j + 3];
+            t2 = s0 + maj;
+            e = a + t1 | 0;
+            a = t1 + t2 | 0;
+        }
+
+        this.h0 = (this.h0 + a) | 0;
+        this.h1 = (this.h1 + b) | 0;
+        this.h2 = (this.h2 + c) | 0;
+        this.h3 = (this.h3 + d) | 0;
+        this.h4 = (this.h4 + e) | 0;
+        this.h5 = (this.h5 + f) | 0;
+        this.h6 = (this.h6 + g) | 0;
+        this.h7 = (this.h7 + h) | 0;
     }
 
     update(data) {
@@ -125,72 +129,84 @@ export class SHA256 {
         if (typeof data === 'string') data = new TextEncoder().encode(data);
         else if (data instanceof ArrayBuffer) data = new Uint8Array(data);
 
-        const blocks = this.blocks;
-        let index = 0;
         const length = data.length;
+        let offset = 0;
 
-        while (index < length) {
-            if (this.hashed) {
-                this.hashed = false;
-                blocks[0] = this.block;
-                this.block = blocks[16] = blocks[1] = blocks[2] = blocks[3] =
-                    blocks[4] = blocks[5] = blocks[6] = blocks[7] =
-                    blocks[8] = blocks[9] = blocks[10] = blocks[11] =
-                    blocks[12] = blocks[13] = blocks[14] = blocks[15] = 0;
-            }
-
-            let i = this.start;
-            while (index < length && i < 64) {
-                blocks[i >>> 2] |= data[index] << SHIFT[i++ & 3];
-                index++;
-            }
-
-            this.lastByteIndex = i;
-            this.bytes += i - this.start;
-            if (i >= 64) {
-                this.block = blocks[16];
-                this.start = i - 64;
-                this._compress();
-                this.hashed = true;
-            } else {
-                this.start = i;
+        if (this._blen > 0) {
+            const take = Math.min(64 - this._blen, length);
+            this._byte.set(data.subarray(0, take), this._blen);
+            this._blen += take;
+            offset = take;
+            if (this._blen === 64) {
+                const W = this._W;
+                for (let i = 0; i < 16; i++) W[i] = swap32(this._word[i]);
+                this._compressWords();
+                this._blen = 0;
             }
         }
 
+        if (this._blen === 0 && offset < length && length - offset >= 64 && !((data.byteOffset + offset) & 3)) {
+            const full = ((length - offset) >> 6) << 6;
+            const view = new Int32Array(data.buffer, data.byteOffset + offset, full >> 2);
+            let wi = 0;
+            const wEnd = full >> 2;
+            const W = this._W;
+            while (wi < wEnd) {
+                for (let i = 0; i < 16; i += 4) {
+                    W[i] = swap32(view[wi + i]);
+                    W[i + 1] = swap32(view[wi + i + 1]);
+                    W[i + 2] = swap32(view[wi + i + 2]);
+                    W[i + 3] = swap32(view[wi + i + 3]);
+                }
+                this._compressWords();
+                wi += 16;
+            }
+            offset += full;
+        }
+
+        while (offset < length) {
+            this._byte[this._blen++] = data[offset++];
+            if (this._blen === 64) {
+                const W = this._W;
+                for (let i = 0; i < 16; i++) W[i] = swap32(this._word[i]);
+                this._compressWords();
+                this._blen = 0;
+            }
+        }
+
+        this.bytes += length;
         if (this.bytes > 4294967295) {
             this.hBytes += this.bytes / 4294967296 | 0;
             this.bytes = this.bytes % 4294967296;
         }
-
         return this;
     }
 
     _finalize() {
         if (this.finalized) return;
         this.finalized = true;
-        const blocks = this.blocks;
-        const i = this.lastByteIndex;
-        blocks[16] = this.block;
-        blocks[i >>> 2] |= EXTRA[i & 3];
-        this.block = blocks[16];
-        if (i >= 56) {
-            if (!this.hashed) this._compress();
-            blocks[0] = this.block;
-            blocks[16] = blocks[1] = blocks[2] = blocks[3] =
-                blocks[4] = blocks[5] = blocks[6] = blocks[7] =
-                blocks[8] = blocks[9] = blocks[10] = blocks[11] =
-                blocks[12] = blocks[13] = blocks[14] = blocks[15] = 0;
+        const { _byte, _word, _W: W } = this;
+        let i = this._blen;
+        _byte[i++] = 0x80;
+        while (i & 3) _byte[i++] = 0;
+        let wi = i >> 2;
+        if (wi > 14) {
+            while (wi < 16) _word[wi++] = 0;
+            for (let j = 0; j < 16; j++) W[j] = swap32(_word[j]);
+            this._compressWords();
+            wi = 0;
         }
-        blocks[14] = this.hBytes << 3 | this.bytes >>> 29;
-        blocks[15] = this.bytes << 3;
-        this._compress();
+        while (wi < 16) _word[wi++] = 0;
+        for (let j = 0; j < 16; j++) W[j] = swap32(_word[j]);
+        W[14] = ((this.hBytes << 3) | (this.bytes >>> 29)) | 0;
+        W[15] = (this.bytes << 3) | 0;
+        this._compressWords();
     }
 
     hex() {
         this._finalize();
         const h0 = this.h0, h1 = this.h1, h2 = this.h2, h3 = this.h3;
         const h4 = this.h4, h5 = this.h5, h6 = this.h6, h7 = this.h7;
-
         return HEXES[(h0 >>> 24) & 0xff] + HEXES[(h0 >>> 16) & 0xff] +
             HEXES[(h0 >>> 8) & 0xff] + HEXES[h0 & 0xff] +
             HEXES[(h1 >>> 24) & 0xff] + HEXES[(h1 >>> 16) & 0xff] +
@@ -224,7 +240,6 @@ export class SHA256 {
             (h7 >>> 24) & 0xff, (h7 >>> 16) & 0xff, (h7 >>> 8) & 0xff, h7 & 0xff
         ]);
     }
-
 }
 
 export function sha256(data) {
