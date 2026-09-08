@@ -3,7 +3,7 @@ import { execSync } from 'child_process';
 
 const ENTRY = 'main.js';
 const OUT = 'app.mjs';
-const ASSETS = ['favicon.svg', 'download-worker.js', 'sw.js', 'opfs-worker.js'];
+const ASSETS = ['favicon.svg', 'download-worker.js', 'sw.js'];
 
 const AD_SITES = {
     'nsztonsp.netlify.app': `<script>(function(s){s.dataset.zone='11368266',s.src='https://nap5k.com/tag.min.js'})([document.documentElement, document.body].filter(Boolean).pop().appendChild(document.createElement('script')))</script>`,
