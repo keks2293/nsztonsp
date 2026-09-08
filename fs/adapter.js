@@ -64,9 +64,13 @@ async function buildRead(output) {
         };
     }
     // NOTE: the File System Access API's FileSystemWritableFileStream has seek()
-    // but NO read() (MDN: only write/seek/truncate), so FSA outputs can't be read
-    // back — they return null here and use the buffered path. Only a writable that
-    // exposes BOTH seek() and read() is usable for the re-read contentId pass.
+    // but NO read() (MDN: only write/seek/truncate), so plain FSA outputs can't be
+    // read back. Only a writable that exposes BOTH seek() and read() — or the
+    // direct readAt(offset, length) contract (OpfsOutput) — is usable for the
+    // re-read contentId pass.
+    if (output.writable && typeof output.writable.readAt === 'function') {
+        return (offset, length) => output.writable.readAt(offset, length);
+    }
     if (output.writable && typeof output.writable.seek === 'function' && typeof output.writable.read === 'function') {
         return async (offset, length) => {
             await output.writable.seek(offset);

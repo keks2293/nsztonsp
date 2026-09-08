@@ -1029,8 +1029,12 @@ export async function packProgramNcaStream({ adapter, ncaOffset, exefsSize, romf
     _log('info', '  Streaming ExeFS (PFS0 data) → output...');
     await streamExefs(async (chunk, off) => {
         const n = chunk.length;
-        await adapter.write(ncaOffset + sec0DataOff + off, chunk);
+        // Hash BEFORE the write: a transferring writer (OpfsOutput / SW adapter)
+        // detaches fully-owned chunk buffers during adapter.write(), and after
+        // that the chunk must never be touched again on this thread. The two-pass
+        // writer already hashes before writing (see writeProgramNcaTwoPass).
         pfs0.update(chunk);
+        await adapter.write(ncaOffset + sec0DataOff + off, chunk);
         rep(n);
     });
     const exeHash = await pfs0.finalize();
@@ -1039,8 +1043,8 @@ export async function packProgramNcaStream({ adapter, ncaOffset, exefsSize, romf
     _log('info', '  Streaming RomFS (BKTR data) → output...');
     await streamRomfs(async (chunk, off) => {
         const n = chunk.length;
-        await adapter.write(ncaOffset + sec1DataOff + off, chunk);
         ivfc.update(chunk);
+        await adapter.write(ncaOffset + sec1DataOff + off, chunk);
         rep(n);
     });
     const romIvfc = await ivfc.finalize();
