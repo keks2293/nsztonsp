@@ -39,6 +39,14 @@ const keys = KeysParser.parse(fs.readFileSync('../static/prod.keys', 'utf8'));
 const log = () => {};
 const progress = () => {};
 
+// FORCE_JS=1 runs the exact browser SHA-256 path (pure-JS streaming class);
+// default runs the native node:crypto streaming backend. Both must MATCH.
+if (process.env.FORCE_JS) {
+  const { setForceJsSha256 } = await import('../crypto/sha256.js');
+  setForceJsSha256(true);
+  console.log('forcing pure-JS streaming SHA256 (browser path)');
+}
+
 const baseReader = { name: 'base.nsp', reader: new FileReader(basePath) };
 const updateReader = { name: 'update.nsz', reader: new FileReader(updatePath) };
 

@@ -107,4 +107,11 @@ Browser HTML files load dependencies:
 Current versions (update this when upgrading):
 - `zstddec`: 0.2.0 (use streaming ESM version: `zstddec/dist/zstddec-stream.modern.js`)
 
+## Streaming SHA256 backends
+
+There is no third-party SHA-256 dependency. The streaming hash (`createStreamingSHA256()` in `crypto/sha256.js`) is:
+- **Node**: native `node:crypto` streaming (`NodeSHA256` wrapping `createHash`; mid-state clone via `hash.copy()`).
+- **Browser / forced**: the pure-JS `SHA256` class (flat `Int32Array(64)` schedule + word-wise aligned input load, ~260 MB/s; `crypto.subtle` is one-shot async and cannot be cloned). `FORCE_JS=1` runs it in Node via the `setForceJsSha256` hook — scripts A/B both backends.
+- Do not reintroduce hash-wasm: at big chunks it was only ~1.36× the port and memcpys every chunk into the WASM heap (zero-copy in the ported aligned path).
+
 
