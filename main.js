@@ -1,6 +1,5 @@
 import { NSZConverter } from './converter.js';
 import { SWDownloader } from './sw-downloader.js';
-import { OpfsOutput } from './opfs-output.js';
 import { formatBytes } from './fs/format.js';
 
 // The SW stream is sequential and the main thread never observes the actual
@@ -13,41 +12,6 @@ function checkSwDelivered(writable, expectedSize) {
         return false;
     }
     return true;
-}
-
-// Sequential copy from an OpfsOutput staging file to a final destination while
-// it is still open in the worker (readAt is fast here; delivery is the only
-// place the bytes cross to the destination at all).
-const OPFS_COPY_CHUNK = 8 * 1024 * 1024;
-async function copyOpfs(opfs, write, size) {
-    for (let pos = 0; pos < size; pos += OPFS_COPY_CHUNK) {
-        const n = Math.min(OPFS_COPY_CHUNK, size - pos);
-        const data = await opfs.readAt(pos, n);
-        await write(pos, data);
-    }
-}
-
-// Lazy service-worker download writer: starts the stream only on the first
-// write() so Firefox doesn't kill the idle SW during a long prep phase.
-function swWritable(outputName, iframe) {
-    let real = null;
-    const dl = new SWDownloader(outputName, iframe);
-    return {
-        async write(position, data) {
-            if (!real) {
-                addLog('info', 'Connecting to SW...');
-                await dl.start();
-                dl.triggerDownload();
-                addLog('info', 'Stream ready');
-                real = dl;
-            }
-            return real.write(position, data);
-        },
-        async close() {
-            if (real) await real.close();
-        },
-        get bytesWritten() { return real ? real.bytesWritten : 0; },
-    };
 }
 
 window.addEventListener('error', (e) => {
@@ -749,33 +713,23 @@ async function main() {
 
         const outputName = files[0].name.replace(/\.(nsp|nsz|xci|xcz)$/i, '') + '_updated.nsp';
         let writable = null;
-        let opfsOutput = null;
         if (downloadMode !== 'blob' && directoryHandle) {
-            // Exists-check / skip stays up-front; the actual file is created at
-            // delivery time (OPFS staging keeps it read-back-capable meanwhile).
-            if (!overwrite) {
-                try {
-                    await directoryHandle.getFileHandle(outputName);
-                    addLog('warn', `Exists, skipping: ${outputName}`);
-                    converting = false;
-                    updateButtonLabel();
-                    return;
-                } catch (_) {}
-            }
-        }
-        // OPFS staging unlocks the streaming single-decompression path (write at
-        // offset + read back for the contentId) instead of the 2×/3× two-pass for
-        // FSA/SW outputs. Skipped for the explicit in-memory buffered mode and blob.
-        if (downloadMode !== 'blob' && !buffered) {
             try {
-                writable = opfsOutput = await OpfsOutput.create(outputName + '.opfs');
-            } catch (e) {
-                addLog('info', 'OPFS staging not available: ' + e.message);
-            }
-        }
-        if (!writable && downloadMode !== 'blob' && directoryHandle) {
-            try {
-                writable = await (await directoryHandle.getFileHandle(outputName, { create: true })).createWritable();
+                let fileHandle;
+                if (overwrite) {
+                    fileHandle = await directoryHandle.getFileHandle(outputName, { create: true });
+                } else {
+                    try {
+                        fileHandle = await directoryHandle.getFileHandle(outputName);
+                        addLog('warn', `Exists, skipping: ${outputName}`);
+                        converting = false;
+                        updateButtonLabel();
+                        return;
+                    } catch {
+                        fileHandle = await directoryHandle.getFileHandle(outputName, { create: true });
+                    }
+                }
+                writable = await fileHandle.createWritable();
             } catch (e) {
                 addLog('warn', 'Failed to create file: ' + e.message);
             }
@@ -783,7 +737,24 @@ async function main() {
         if (!writable && (downloadMode === 'sw' || downloadMode === 'fsa') && await ensureSW()) {
             // Lazy SW: start the stream only on first write() so Firefox
             // doesn't kill the idle SW during the long prep phase.
-            writable = swWritable(outputName, iframe);
+            let real = null;
+            const dl = new SWDownloader(outputName, iframe);
+            writable = {
+                async write(position, data) {
+                    if (!real) {
+                        addLog('info', 'Connecting to SW...');
+                        await dl.start();
+                        dl.triggerDownload();
+                        addLog('info', 'Stream ready');
+                        real = dl;
+                    }
+                    return real.write(position, data);
+                },
+                async close() {
+                    if (real) await real.close();
+                },
+                get bytesWritten() { return real ? real.bytesWritten : 0; },
+            };
         }
 
         const onProgress = (p, label, phaseBytes) => {
@@ -791,28 +762,6 @@ async function main() {
             if (label) progressTitle.textContent = label;
             updateStats(p, label, phaseBytes);
         };
-
-        async function deliverOpfsUpdate(size) {
-            await opfsOutput.flush();
-            if (downloadMode !== 'blob' && directoryHandle) {
-                const fileHandle = await directoryHandle.getFileHandle(outputName, { create: true });
-                const w = await fileHandle.createWritable();
-                try {
-                    await copyOpfs(opfsOutput, (pos, data) => w.write({ type: 'write', position: pos, data }), size);
-                } finally {
-                    await w.close();
-                }
-            } else if (downloadMode === 'sw' || downloadMode === 'fsa') {
-                if (!await ensureSW()) throw new Error('Service worker not available for download');
-                const dl = swWritable(outputName, iframe);
-                await copyOpfs(opfsOutput, (pos, data) => dl.write(pos, data), size);
-                await dl.close();
-            } else {
-                throw new Error('OPFS staging requires a download destination (blob mode is in-memory)');
-            }
-            await opfsOutput.unlink();
-            opfsOutput = null;
-        }
 
         try {
             const result = await converter.updateNSPs(files, {
@@ -824,9 +773,7 @@ async function main() {
                 updateMode: (buffered && downloadMode !== 'blob') ? 'buffered' : 'two-pass',
             });
             checkSwDelivered(writable, result.size);
-            if (opfsOutput) {
-                await deliverOpfsUpdate(result.size);
-            } else if (writable) {
+            if (writable) {
                 await writable.close();
             } else {
                 downloadBlob(result.blob, result.name);
@@ -836,14 +783,11 @@ async function main() {
             updateFileList();
         } catch (error) {
             addLog('error', `Update failed: ${error.message}`);
-            if (opfsOutput) {
-                try { await opfsOutput.unlink(); } catch (_) {}
-                opfsOutput = null;
-            } else if (writable) {
+            if (writable) {
                 try { await writable.close(); } catch (_) {}
-            }
-            if (directoryHandle) {
-                try { await directoryHandle.removeEntry(outputName); } catch (_) {}
+                if (directoryHandle) {
+                    try { await directoryHandle.removeEntry(outputName); } catch (_) {}
+                }
             }
             fileStatus[0] = 'err';
             updateFileList();
