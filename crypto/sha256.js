@@ -1,8 +1,6 @@
-// The pure-JS class below is the streaming hasher: it is the only SHA-256 with
-// an incremental update() AND a sync clone() (the two-pass contentId hash), so
-// it stays the streaming backend everywhere — browser, Node fallback, and the
-// no-WASM/no-`crypto.subtle` environments (crypto.subtle is one-shot async and
-// cannot be cloned).
+// The pure-JS class below is the streaming hasher in the browser, where
+// crypto.subtle is one-shot async (no incremental update()/clone()); Node uses
+// native node:crypto streaming instead (see createStreamingSHA256 at the bottom).
 
 const HEXES = new Array(256).fill().map((_, i) => i.toString(16).padStart(2, '0'));
 
@@ -254,9 +252,11 @@ import { isNode } from './platform.js';
 // node:crypto — sync, ~17× faster than pure JS.
 // browser crypto.subtle — async, not used here (see browser fallback).
 let _nativeDigest = null;
+let _nativeCreateHash = null;
 if (isNode) {
     try {
         const { createHash } = await import('node:crypto');
+        _nativeCreateHash = createHash;
         _nativeDigest = (data) => {
             if (data instanceof Uint8Array || data instanceof ArrayBuffer) {
                 return new Uint8Array(createHash('sha256').update(Buffer.from(data)).digest());
@@ -327,4 +327,48 @@ export class BatchDigestor {
         if (this._inflight === 0 && this._queue.length === 0) return Promise.resolve();
         return new Promise((resolve) => this._waiters.push(resolve));
     }
+}
+
+// ── Node native streaming SHA256 (node:crypto) ─────────────────────────────
+// Same update()/digest()/hex() API as the pure-JS SHA256, but the hash runs
+// natively (~10× the pure-JS class): node:crypto createHash supports sync
+// incremental update() AND hash.copy() — the two-pass mid-state clone. The
+// browser has no synchronous incremental hash (crypto.subtle is one-shot async,
+// it cannot be cloned) — there the factory returns the pure-JS class.
+export class NodeSHA256 {
+    constructor(h) {
+        this._h = h;
+    }
+    update(data) {
+        if (data instanceof ArrayBuffer) data = new Uint8Array(data);
+        this._h.update(data);
+        return this;
+    }
+    digest() {
+        return new Uint8Array(this._h.digest());
+    }
+    hex() {
+        return this._h.digest('hex');
+    }
+    clone() {
+        return new NodeSHA256(this._h.copy());
+    }
+}
+
+// Test hook: force the pure-JS streaming hash even when the native backend is
+// present — scripts run BOTH paths (default = native in Node; FORCE_JS=1 = the
+// exact browser path). No-op unless called.
+let _forceJsSha = false;
+export function setForceJsSha256(value) { _forceJsSha = !!value; }
+
+// Streaming SHA256 factory (SYNC): node:crypto when available (Node), the
+// pure-JS SHA256 otherwise (browser — identical API; all update()/digest()/hex()
+// and clone() are sync on both backends).
+export function createStreamingSHA256() {
+    if (!_forceJsSha) {
+        try {
+            if (_nativeCreateHash) return new NodeSHA256(_nativeCreateHash('sha256'));
+        } catch {}
+    }
+    return new SHA256();
 }
