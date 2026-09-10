@@ -760,7 +760,8 @@
                                        <button class="pill" id="noDeltaBtn" title="Merge: exclude delta-fragment NCAs (needs keys to detect them).">No Deltas</button>
                                        <button class="pill" id="keepAcidSigBtn" title="Update: keep the original ACID signature in main.npdm (hacpack --nozeronpdmsig). Zeroed by default.">Keep ACID Sig</button>
                                         <button class="pill" id="keepAcidKeyBtn" title="Update: keep the original ACID key in main.npdm (hacpack --nozeroacidkey). Zeroed by default.">Keep ACID Key</button>
-                                        <button class="pill" id="bufferedBtn" title="Update: buffer the merged RomFS in memory (much more RAM, single pass). Off = two-pass streaming (~200 KB RAM, re-reads the sources).">Buffer</button>
+                                        <button class="pill" id="bufferedBtn" title="Update: buffer the merged RomFS in memory (much more RAM, single pass). Off = streaming (~200 KB RAM, re-reads the sources).">Buffer</button>
+                                        <button class="pill" id="scatterBtn" title="Update: no update buffer (~0 RAM) — merged RomFS produced by re-streaming the update NCZ per-pass in physical order. On FSA (write+seek, no read-back) also enable Buffer so hashes come from the merged buffer; blob works alone.">Scatter</button>
                                     </div>
                             </div>
                         </div>
