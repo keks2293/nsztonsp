@@ -1,6 +1,6 @@
 import { AesCtr } from '../crypto/aes-ops.mjs';
 import { decryptNcaHeader } from './nca.js';
-import { BufferRangeSource } from './range-source.js';
+import { BufferRangeSource, NczStreamSource } from './range-source.js';
 import { readLeU64, readLeU32 } from './bytes.js';
 import { yieldToEventLoop } from './event-loop.js';
 import { decryptNcaHeaderBytes, fsHeaderAt, reversedSectionCtr, extractTitlekeyFromTik, deriveTitlekeyFromKeyArea, IVFC_LEVEL_HDR, IVFC_LEVELS_OFFSET, IVFC_MAX_LEVEL, FS_HDR } from './nca-utils.js';
@@ -27,8 +27,12 @@ function toNcaInput(nca) {
 
 const BKTR_MAGIC = 0x52544B42; // "BKTR"
 
-export async function mergeRomFS(baseNcaData, updateNcaData, options = {}) {
-    const { keys, onChunk, onProgress, baseTitlekey: providedBaseTitlekey, updateTitlekey: providedUpdateTitlekey, baseTik, updateTik, titlekeysFile } = options;
+// Shared BKTR preamble, step 1: decrypt headers, find sections, resolve titlekeys.
+// Purely header-based — does NOT read the update source. Returns the crypto
+// parameters plus the absolute table offsets, so the caller can pre-register the
+// table ranges on a streaming source BEFORE reading them (step 2).
+async function resolveBktrMeta(baseNcaData, updateNcaData, options) {
+    const { keys, baseTitlekey: providedBaseTitlekey, updateTitlekey: providedUpdateTitlekey, baseTik, updateTik, titlekeysFile } = options;
 
     if (!keys) throw new Error('BKTR: keys required');
 
@@ -58,11 +62,8 @@ export async function mergeRomFS(baseNcaData, updateNcaData, options = {}) {
     // Update FsHeader
     const updateFsHdr = fsHeaderAt(updateDecHeader, updateRomfsSecIdx);
 
-    // Parse IVFC header from the BKTR superblock (bktr_superblock_t = ivfc_header @ superblock+0x0, see nca.h).
-    // The BKTR superblock starts at FsHeader+0x8; ivfc_hdr_t/ivfc_level_hdr_t layout:
-    // see the IVFC constants in nca-pack.js (single source, shared with the builder).
-    // Level IVFC_MAX_LEVEL-1 is the DATA level: the actual RomFS image. hactool uses it as the RomFS base
-    // (nca.c:1240 "ctx->bktr_ctx.romfs_offset = ctx->bktr_ctx.ivfc_levels[IVFC_MAX_LEVEL-1].data_offset").
+    // Parse IVFC header from the BKTR superblock. Level IVFC_MAX_LEVEL-1 is the
+    // DATA level: the actual RomFS image (see hactool nca.c:1240).
     const ivfcBase = IVFC_LEVELS_OFFSET + FS_HDR.HASH_DATA;
     const readLevelU64 = (levelIdx, fieldOff) => readLeU64(updateFsHdr, ivfcBase + levelIdx * IVFC_LEVEL_HDR.SIZE + fieldOff);
     const dataLevelOffset = readLevelU64(IVFC_MAX_LEVEL - 1, IVFC_LEVEL_HDR.LOGICAL_OFFSET); // where RomFS data starts
@@ -75,7 +76,6 @@ export async function mergeRomFS(baseNcaData, updateNcaData, options = {}) {
     if (subHeader.magic !== BKTR_MAGIC) throw new Error(`BKTR: sub magic 0x${subHeader.magic.toString(16).padStart(8, '0')}`);
 
     // AesCtrUpperIv: FsHeader[0x140:0x148] = {generation(u32 LE), secure_value(u32 LE)}
-    // Stratosphere uses secure_value as ctr[0:4] BE in AesCtrEx counter
     const secureValue = readLeU32(updateFsHdr, FS_HDR.SECURE_VALUE);
     // section_ctr for BKTR table decryption (regular AES-CTR, reversed)
     const updateNonce = reversedSectionCtr(updateFsHdr);
@@ -100,22 +100,55 @@ export async function mergeRomFS(baseNcaData, updateNcaData, options = {}) {
         || deriveTitlekeyFromKeyArea(baseDecHeader, keys);
     if (!baseTitlekey) throw new Error('BKTR: cannot get base titlekey (provide titlekeysFile or valid baseTik)');
 
-    // Decrypt BKTR tables (read only the table ranges from the update source)
-    const relocAbsOffset = updateRomfsSec.offset + relocHeader.offset;
-    const subAbsOffset = updateRomfsSec.offset + subHeader.offset;
+    // Base romfs AesCtr (counter = absolute section byte / 16)
+    const baseFsHdr = fsHeaderAt(baseDecHeader, baseRomfsSecMeta.secIdx);
+    const baseNonce = reversedSectionCtr(baseFsHdr);
+
+    return {
+        baseRomfsSecMeta, updateRomfsSec,
+        dataLevelOffset, dataLevelSize,
+        relocAbsOffset: updateRomfsSec.offset + relocHeader.offset,
+        subAbsOffset: updateRomfsSec.offset + subHeader.offset,
+        relocHeader, subHeader,
+        updateTitlekey, updateNonce, secureValue,
+        baseTitlekey, baseNonce,
+    };
+}
+
+// Shared BKTR preamble, step 2: decrypt + parse the relocation and subsection
+// tables from a given update source (read reloc + sub ranges by absolute offset).
+// For a streaming source the caller must already have registered those ranges.
+async function readBktrTables(updateSource, meta) {
     const relocTableBuf = await decryptBktrTableData(
-        await updateNcaData.source.read(relocAbsOffset, relocHeader.size),
-        updateTitlekey, updateNonce, relocAbsOffset
+        await updateSource.read(meta.relocAbsOffset, meta.relocHeader.size),
+        meta.updateTitlekey, meta.updateNonce, meta.relocAbsOffset
     );
     const subTableBuf = await decryptBktrTableData(
-        await updateNcaData.source.read(subAbsOffset, subHeader.size),
-        updateTitlekey, updateNonce, subAbsOffset
+        await updateSource.read(meta.subAbsOffset, meta.subHeader.size),
+        meta.updateTitlekey, meta.updateNonce, meta.subAbsOffset
     );
 
     const relocBlock = parseRelocationBlock(relocTableBuf);
     const subBlock = parseSubsectionBlock(subTableBuf);
     if (relocBlock.entries.length === 0) throw new Error('BKTR: no relocation entries');
     if (subBlock.entries.length === 0) throw new Error('BKTR: no subsection entries');
+
+    return { relocBlock, subBlock };
+}
+
+const SCRATCH_CHUNK = 0x1000000; // 16 MB
+
+// ── Virtual-order merge (default) ─────────────────────────────────────────────
+export async function mergeRomFS(baseNcaData, updateNcaData, options = {}) {
+    const { keys, onChunk, onProgress } = options;
+    baseNcaData = toNcaInput(baseNcaData);
+    updateNcaData = toNcaInput(updateNcaData);
+
+    const meta = await resolveBktrMeta(baseNcaData, updateNcaData, options);
+    const { baseRomfsSecMeta, dataLevelOffset, dataLevelSize, relocBlock, subBlock,
+            updateRomfsSec, updateTitlekey, updateNonce, secureValue, baseTitlekey, baseNonce }
+        = { ...meta, ...await readBktrTables(updateNcaData.source, meta) };
+    const totalSize = relocBlock.totalSize;
 
     // Pre-register the base romfs ranges (in strictly increasing order) so an
     // NCZ stream source can serve them in ONE sequential decompression pass
@@ -129,46 +162,16 @@ export async function mergeRomFS(baseNcaData, updateNcaData, options = {}) {
         baseNcaData.source.registerRange(baseRomfsSecMeta.offset + e.physOffset, nextVirt - e.virtOffset);
     }
 
-    // Base romfs is decrypted IN PLACE, per relocation entry, directly into
-    // `merged` (chunked, transient 16 MB) from the source's ciphertext — no
-    // full-image buffer (the old approach decrypted the whole ~850 MB section
-    // up front and it lived alongside `merged` for the entire merge).
-    // Counter base = section offset (AesCtr counter = absolute section byte / 16).
-    const baseFsHdr = fsHeaderAt(baseDecHeader, baseRomfsSecMeta.secIdx);
-    const baseNonce = reversedSectionCtr(baseFsHdr);
     const baseCtr = new AesCtr(baseTitlekey, baseNonce);
-    const BASE_DECRYPT_CHUNK = 0x1000000; // 16 MB
 
-    // Build merged RomFS.
-    //
-    // The relocation table maps the WHOLE virtual section (IVFC header + hash levels 0..4 +
-    // level-5 data) and extends to relocBlock.totalSize (a bit past the end of level-5 data:
-    // level 4 hashes the data in 0x4000 blocks, and the last block covers that trailing part
-    // of the virtual image). So `merged` must be built at full virtual size (totalSize).
-    // The actual RomFS image that gets re-packed is ONLY the level-5 DATA region:
-    // yanu extracts it via hac2l ("--basenca base update --romfsdir ..." → NcaReader/BKTR
-    // reader returns the merged romfs starting at ivfc level-5 offset) and repacks with
-    // hacPack (romfs_build()), which expects just the data blob — see hactool nca.c:1240
-    // ("romfs_offset = ivfc_levels[IVFC_MAX_LEVEL-1].data_offset").
-    // So mergedData = merged.subarray(dataLevelOffset, dataLevelOffset + dataLevelSize).
-    // Streaming mode: when an onChunk(chunk, romfsDataOffset) callback is given, only the
-    // level-5 DATA region [dataLevelOffset, dataLevelOffset+dataLevelSize) is emitted through
-    // the callback and the full virtual-image buffer is NOT allocated. Buffered mode (no
-    // onChunk) builds `merged` as before (used by verification scripts).
+    // Build merged RomFS (streaming or buffered) — see comments in the loop.
     const streaming = typeof onChunk === 'function';
-    const totalSize = relocBlock.totalSize;
     const merged = streaming ? null : new Uint8Array(totalSize);
     const dataStart = dataLevelOffset;
     const dataEnd = dataLevelOffset + dataLevelSize;
     let pos = 0;
     let entryIdx = 0;
 
-    // One place for "land a decrypted chunk at its virtual offset": streaming
-    // emits only the overlap with the level-5 data region (both loops share
-    // this clip); buffered stores into `merged`. Both modes then report the
-    // merge position (onProgress — the buffered path has no onChunk) and yield
-    // to the event loop: the merge is synchronous JS end to end, so without a
-    // real task boundary the browser cannot repaint the progress bar mid-merge.
     const emitChunk = async (chunk, virtOffset) => {
         if (streaming) {
             const a = Math.max(virtOffset, dataStart);
@@ -193,26 +196,20 @@ export async function mergeRomFS(baseNcaData, updateNcaData, options = {}) {
 
         if (entry.isPatch) {
             // Decrypt patch from update NCA using AesCtrEx
-            // Must handle subsection entry boundaries within the patch range
             let writePos = pos;
             let currentPhys = entry.physOffset + (pos - entry.virtOffset);
 
             while (writePos < chunkEnd) {
-                // Find subsection entry covering current physOffset
                 const subEntry = findSubsectionEntry(subBlock.entries, currentPhys);
                 if (!subEntry) {
                     throw new Error(`BKTR: no subsection entry for physOffset 0x${currentPhys.toString(16)}`);
                 }
-
-                // Calculate how much we can read with this subsection entry
                 const nextSubOff = subEntryIdx(subBlock.entries, currentPhys) + 1 < subBlock.entries.length
                     ? subBlock.entries[subEntryIdx(subBlock.entries, currentPhys) + 1].offset
                     : Infinity;
                 const remainingInSub = nextSubOff - currentPhys;
                 const remainingToWrite = chunkEnd - writePos;
-                // Cap at 16 MB so the decrypted `chunk` buffer stays small even for
-                // large patch entries (the counter is absolute, so chunking is safe).
-                const readLen = Math.min(remainingInSub, remainingToWrite, BASE_DECRYPT_CHUNK);
+                const readLen = Math.min(remainingInSub, remainingToWrite, SCRATCH_CHUNK);
 
                 const fileOffset = updateRomfsSec.offset + currentPhys;
                 const patchRaw = await updateNcaData.source.read(fileOffset, readLen);
@@ -225,19 +222,14 @@ export async function mergeRomFS(baseNcaData, updateNcaData, options = {}) {
                 currentPhys += readLen;
             }
         } else {
-            // Copy from base romfs: read the ciphertext range from the source
-            // and decrypt it straight into merged (no full-image buffer).
+            // Copy from base romfs
             const baseOffset = entry.physOffset + (pos - entry.virtOffset);
             if (baseOffset + readSize > baseRomfsSecMeta.size) {
                 throw new Error(`BKTR: base read OOB at 0x${baseOffset.toString(16)}`);
             }
-            // Read the base ciphertext in 16 MB chunks (not the whole entry) so the
-            // transient `cipher` buffer stays small even for large unpatched entries.
-            // FileRangeSource reads from the container; NczStreamSource serves a view
-            // of its (already-buffered) registered range.
             let done = 0;
             while (done < readSize) {
-                const n = Math.min(BASE_DECRYPT_CHUNK, readSize - done);
+                const n = Math.min(SCRATCH_CHUNK, readSize - done);
                 const cipher = await baseNcaData.source.read(baseRomfsSecMeta.offset + baseOffset + done, n);
                 baseCtr.seek(baseRomfsSecMeta.offset + baseOffset + done);
                 const dec = await baseCtr.decrypt(cipher);
@@ -257,4 +249,133 @@ export async function mergeRomFS(baseNcaData, updateNcaData, options = {}) {
         relocEntries: relocBlock.entries.length,
         subsectionEntries: subBlock.entries.length,
     };
+}
+
+// ── Physical-order scatter merge ─────────────────────────────────────────────
+// The virtual-order merge (mergeRomFS) reads update patch regions in VIRTUAL
+// order, which — for an update .nsz with non-monotonic patch physical offsets —
+// forces the update to be buffered in full (SparseNcaView, ~668 MB). The scatter
+// merge instead walks each source in PHYSICAL order and SCATTER-writes the
+// decrypted merged RomFS straight to its virtual offset in the (seekable) output,
+// so the update is decompressed once per use with ~0 extra memory.
+//
+// Cost: one extra full decompression of the update beyond the buffered path —
+// U1 captures the BKTR tables (reloc + sub, ~64 KB), U2 re-streams the patch
+// data in physical order. The merged RomFS is NOT consumed in virtual order, so
+// the IVFC hash + contentId come from an ORDERED re-read of the written NCA
+// (see packProgramNcaStream's scatter mode). Only valid for seekable outputs.
+//
+//   baseInput  : { headerRaw, source } for the base NCA.
+//   updateCtx  : { headerRaw, reader, parsed, streamable:true } for an NCZ update,
+//                or { headerRaw, source, streamable:false } for a raw container.
+//                The table ranges (U1) are served via a registered stream source;
+//                patch ranges (U2) via a second one.
+//   writeFn    : async (offInRomfsData, chunk) -> scatter write. offInRomfsData is
+//                the offset within the RomFS DATA region.
+//   onProgress : (virtPosition, totalSize) optional.
+export async function scatterRomFS({ baseInput, updateCtx, options, writeFn, log, onProgress }) {
+    const _log = typeof log === 'function' ? log : () => {};
+    const keys = options?.keys;
+
+    // U1: capture the BKTR tables. For an NCZ update, a fresh stream source
+    // registered with just the reloc + sub ranges (in strictly increasing order).
+    const meta = await resolveBktrMeta(baseInput, updateCtx, options);
+    let tableSource;
+    if (updateCtx.streamable) {
+        tableSource = new NczStreamSource(updateCtx.reader, updateCtx.parsed, _log);
+        const tableRanges = [
+            { off: meta.relocAbsOffset, len: meta.relocHeader.size },
+            { off: meta.subAbsOffset, len: meta.subHeader.size },
+        ].sort((a, b) => a.off - b.off);
+        for (const r of tableRanges) tableSource.registerRange(r.off, r.len);
+    } else {
+        tableSource = updateCtx.source;
+    }
+    const { relocBlock, subBlock } = await readBktrTables(tableSource, meta);
+    const { dataLevelOffset, dataLevelSize, updateRomfsSec, baseRomfsSecMeta, updateTitlekey, updateNonce, secureValue, baseTitlekey, baseNonce } = meta;
+    const totalSize = relocBlock.totalSize;
+    const dataStart = dataLevelOffset;
+    const dataEnd = dataLevelOffset + dataLevelSize;
+    const entries = relocBlock.entries.map((e, i) => ({
+        ...e,
+        nextVirt: i + 1 < relocBlock.entries.length ? relocBlock.entries[i + 1].virtOffset : totalSize,
+    }));
+
+    const scatterWrite = async (chunk, virtOffset) => {
+        const a = Math.max(virtOffset, dataStart);
+        const b = Math.min(virtOffset + chunk.length, dataEnd);
+        if (b > a) {
+            await writeFn(a - dataStart, chunk.subarray(a - virtOffset, b - virtOffset));
+        }
+        onProgress?.(virtOffset + chunk.length, totalSize);
+        await yieldToEventLoop();
+    };
+
+    // ── Pass B: base regions (virtual order == physical order for base) ─────
+    // Pre-register the base non-patch ranges (strictly increasing physical
+    // offsets — base sectors are sequential) so an NCZ base streams in ONE pass.
+    let baseSource;
+    if (baseInput.source instanceof NczStreamSource) {
+        baseSource = baseInput.source;
+        for (const e of entries) {
+            if (e.isPatch) continue;
+            baseSource.registerRange(baseRomfsSecMeta.offset + e.physOffset, e.nextVirt - e.virtOffset);
+        }
+    } else {
+        baseSource = baseInput.source;
+    }
+
+    const baseCtr = new AesCtr(baseTitlekey, baseNonce);
+    for (const e of entries) {
+        if (e.isPatch) continue;
+        const runLen = e.nextVirt - e.virtOffset;
+        let done = 0;
+        while (done < runLen) {
+            const n = Math.min(SCRATCH_CHUNK, runLen - done);
+            const phys = baseRomfsSecMeta.offset + (e.physOffset + done);
+            const cipher = await baseSource.read(phys, n);
+            baseCtr.seek(phys);
+            const dec = await baseCtr.decrypt(cipher);
+            await scatterWrite(dec, e.virtOffset + done);
+            done += n;
+        }
+    }
+
+    // ── Pass U: patch regions, physical order ──────────────────────────────
+    const patchEntries = entries
+        .filter(e => e.isPatch)
+        .map(e => ({ e, runLen: e.nextVirt - e.virtOffset, abs: updateRomfsSec.offset + e.physOffset }))
+        .sort((a, b) => a.abs - b.abs);
+
+    let updReader;
+    if (updateCtx.streamable) {
+        updReader = new NczStreamSource(updateCtx.reader, updateCtx.parsed, _log);
+        for (const r of patchEntries) {
+            updReader.registerRange(r.abs, r.runLen);
+        }
+    } else {
+        updReader = updateCtx.source;
+    }
+
+    for (const r of patchEntries) {
+        const e = r.e;
+        let writePos = 0;
+        while (writePos < r.runLen) {
+            const phys = e.physOffset + writePos;
+            const absPhys = updateRomfsSec.offset + phys;
+            const subEntry = findSubsectionEntry(subBlock.entries, phys);
+            if (!subEntry) throw new Error(`BKTR scatter: no subsection entry for physOffset 0x${phys.toString(16)}`);
+            const nxt = subEntryIdx(subBlock.entries, phys) + 1 < subBlock.entries.length
+                ? subBlock.entries[subEntryIdx(subBlock.entries, phys) + 1].offset : Infinity;
+            const remainingInSub = nxt - phys;
+            const remainingToWrite = r.runLen - writePos;
+            const readLen = Math.min(remainingInSub, remainingToWrite, SCRATCH_CHUNK);
+            const patchRaw = await updReader.read(absPhys, readLen);
+            const chunk = await decryptPatchRegionData(patchRaw, updateTitlekey, secureValue, subEntry, absPhys);
+            await scatterWrite(chunk, e.virtOffset + writePos);
+            writePos += readLen;
+        }
+    }
+
+    return { dataLevelOffset, dataLevelSize, relocEntries: entries.length, subsectionEntries: subBlock.entries.length };
 }

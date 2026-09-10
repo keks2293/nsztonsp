@@ -293,9 +293,10 @@ Prioritized areas for improvement identified 2026-05-30.
 - After: RomFS (~1.1GB) + ExeFS (~91MB) + streaming output (0MB buffered) = ~1.2GB
 - Reduction: ~40% for BKTR merge path
 
-**Remaining** (Phase 3, low priority):
-- BKTR merge streaming: NCZ-aware BKTR merge to avoid buffering base RomFS (~1.1GB)
-- Requires two-pass or seek-back on base NCZ (complex, uncertain benefit vs implementation cost)
+**✅ Done** (Phase 3, 2026-08-27 → this commit):
+- BKTR merge streaming: NCZ-aware BKTR merge avoids buffering base RomFS (~1.1GB). Base is served on demand from the container (`FileRangeSource` for .nsp) or streamed in ONE sequential NCZ pass via `NczStreamSource` with pre-registered ranges — fresh source per pass, nothing buffered beyond transient 16 MB chunks.
+- Commits: `5b0c7ce` (two-pass BKTR update), `b880dc0` (unified two-pass flows), streaming-pipeline commit #49 (streaming NCA write), `86bd25f` + `2c1f78b` (selective NCZ), this commit (scatter — base streamed in physical order even on a non-readable output; merged-buffer stays opt-in).
+- Note: base RomFS is never materialized in full in any update mode; only the ~1.1 GB **merged** RomFS is kept in RAM when explicitly requested (`updateMode: 'buffered'`, SW sequential output).
 
 ### Hashes Problem
 
@@ -352,7 +353,7 @@ The real memory optimization is **not** in IVFC/PFS0 streaming — it's in **sel
 Now (`fs/update.js`):
 - Headers (0xC00): partial decompression only — `readPlaintextNcaHeader()` (`2c1f78b`)
 - Base RomFS: streamed (never materialized) — fresh `NczStreamSource` per merge pass (`10eed6c`)
-- Update BKTR + ExeFS: ONE decompression pass `extractNcaSections()` keeping only the requested sections (early-stop `SECTIONS_COMPLETE`, `86bd25f`), served from a zero-copy sparse view
+- Update BKTR + ExeFS: ONE decompression pass `extractNcaSections()` keeping only the requested sections (early-stop `SECTIONS_COMPLETE`, `86bd25f`), served from a zero-copy sparse view or streamed in physical order (scatter, this commit)
 - NCA pack: fully streaming write (`packProgramNcaStream`), buffered and streaming builders de-duplicated (`ee7cb61`, this commit)
 
 State at the time this analysis was written (`fs/update.js:332-407`):
@@ -367,21 +368,20 @@ State at the time this analysis was written (`fs/update.js:332-407`):
 
 This is a **different optimization** than "stream NCA pack output", but achieves the goal (reduce memory usage) more directly.
 
-### Plan — Phases 1-2 ✅ done, Phase 3 open (see "Remaining")
+### Plan — all phases ✅ done
 
 1. **✅ Phase 1: Selective NCZ decompression for update pipeline** — commits `86bd25f` (extractNcaSections, 1.82× faster), `2c1f78b` (single readPlaintextNcaHeader), `b6b6c41` (parseNczSections cached), `10eed6c` (pre-registered ranges only). Sections are decompressed only up to the requested ranges (early-stop `SECTIONS_COMPLETE`).
    - ~~Modify `fs/update.js` to NOT fully decompress Program NCAs~~
    - ~~Instead: read NCA header → identify needed sections → decompress only those sections~~
    - Expected: 8.8GB → 4.4GB memory reduction.
 
-2. **✅ Phase 2: Streaming NCA pack** — commits `ee7cb61` (buffered ≡ streaming builders deduped) and this commit (streaming pipeline #49). One write phase, sequential-only SW-compatible: PFS0 header written once up front, no seek-back, fully streaming NCA write (`packProgramNcaStream`).
+2. **✅ Phase 2: Streaming NCA pack** — commits `ee7cb61` (buffered ≡ streaming builders deduped) and the streaming-pipeline commit #49. One write phase, sequential-only SW-compatible: PFS0 header written once up front, no seek-back, fully streaming NCA write (`packProgramNcaStream`).
    - ~~Implement two-pass IVFC tree build for RomFS~~ — kept current one-pass IVFC (1.1GB RomFS + ~100KB hash levels, manageable).
-   - **seekable** / **sequential-only** strategy split — two-pass on seekable outputs in place (`5b0c7ce`, `b880dc0`); sequential-only see Phase 3.
+   - **seekable** / **sequential-only** strategy split — two-pass on seekable outputs in place (`5b0c7ce`, `b880dc0`); sequential-only via scatter/merged-buffer (this commit).
 
-3. **Phase 3: BKTR merge streaming** (complex, uncertain benefit)
-   - Two-pass BKTR merge: pass 1 reads base RomFS to index patch locations, pass 2 applies patches
-   - Requires base RomFS to be seekable or re-readable
-   - Complexity vs benefit unclear: base RomFS (~1.1GB) still needs to be accessed
+3. **✅ Phase 3: BKTR merge streaming** — two-pass (`5b0c7ce`, `b880dc0`) then full streaming + scatter (this commit). Base RomFS is never fully buffered: streamed via `NczStreamSource` per pass (pre-registered ranges) or read on demand via `FileRangeSource`.
+   - ~~Two-pass BKTR merge: pass 1 reads base RomFS to index patch locations, pass 2 applies patches~~
+   - ~~Requires base RomFS to be seekable or re-readable~~
 
 ### Implementation Notes
 

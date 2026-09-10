@@ -123,7 +123,7 @@ class NSZConverter {
     }
 
     async updateNSPs(files, options = {}) {
-        const { onProgress = () => {}, onLog = () => {}, writable = null, keepNpdmAcidSig = false, keepNpdmAcidKey = false, updateMode = 'two-pass' } = options;
+        const { onProgress = () => {}, onLog = () => {}, writable = null, keepNpdmAcidSig = false, keepNpdmAcidKey = false, updateMode = 'two-pass', mergeBuffer = false } = options;
         onLog('info', `Updating ${files.length} NSPs...`);
         await this.init();
         if (!this.keys || !this.keys.header_key) {
@@ -145,6 +145,7 @@ class NSZConverter {
             keepNpdmAcidSig,
             keepNpdmAcidKey,
             updateMode,
+            mergeBuffer,
         });
 
         onProgress(1.0, 'Done!');
