@@ -1150,7 +1150,8 @@ export async function packProgramNcaStream({ adapter, ncaOffset, exefsSize, romf
 // For outputs that cannot read back (SW download, FSA without read()).
 //
 // Phase 1 — computeProgramNcaContentId:
-//   seekable output:  exefs 2× + romfs 1× → meta + sha256Mid (contentId in Pass 2)
+//   seekable output:  exefs 1× + romfs 1× → meta (contentId hashed in Pass 2
+//                     alongside the write — no ExeFS re-stream)
 //   append-only SW:   exefs 2× + romfs 2× → meta + contentId (PFS0 header must
 //                     precede the NCA, so it must be final after Pass 1)
 // Phase 2 — writeProgramNcaTwoPass: write NCA sequentially (exefs 1× + romfs 1×).
@@ -1189,10 +1190,11 @@ export async function computeProgramNcaContentId({ exefsSize, romfsDataSize, tit
     const L = computeProgramNcaLayout(exefsSize, romfsDataSize);
     _log('info', `  Two-pass NCA layout: ExeFS=0x${L.exeSectionSize.toString(16)} (htable 0x${L.exeHtableSize.toString(16)}), RomFS=0x${L.romSectionSize.toString(16)} (levels 0x${L.hashLevelsSize.toString(16)}), total=0x${L.ncaSize.toString(16)}`);
 
-    // Phase progress over ALL pass-1 work: exefs is streamed twice (PFS0 hash +
-    // SHA256), romfs once (IVFC) or twice (+SHA256 when contentIdInPass1).
+    // Phase progress over ALL pass-1 work: exefs streamed once (PFS0 hash) + romfs
+    // once (IVFC); when contentIdInPass1 both are re-streamed once more for the
+    // full-NCA hash (seekable contentId is hashed in Pass 2 instead).
     const _prog = typeof progress === 'function' ? progress : () => {};
-    const pass1Total = 2 * exefsSize + (contentIdInPass1 ? 2 : 1) * (romfsDataSize || 1);
+    const pass1Total = (contentIdInPass1 ? 2 : 1) * (exefsSize + (romfsDataSize || 1));
     let done = 0;
     const rep = (n) => { done += n; _prog(done / pass1Total); };
 
@@ -1220,18 +1222,21 @@ export async function computeProgramNcaContentId({ exefsSize, romfsDataSize, tit
     // to Pass 2, which is only possible when the PFS0 header can be written
     // after the NCA (seekable output). For append-only outputs the header must
     // precede the NCA, so contentId must be final here (re-stream RomFS).
-    const sha = createStreamingSHA256();
-    sha.update(encHeader);
-    sha.update(exeHash.hashTable);
-    t0 = performance.now();
-    await streamExefs(async (chunk) => { sha.update(chunk); rep(chunk.length); });
-    _log('info', `[timing] Pass 1 ExeFS (SHA256): ${((performance.now() - t0) / 1000).toFixed(1)}s (${(exefsSize / 1048576).toFixed(0)} MB)`);
-    if (L.exePaddingSize > 0) sha.update(new Uint8Array(L.exePaddingSize));
-    for (const lvl of romIvfc.hashLevels) sha.update(lvl);
-
+    // contentId = sha256(encHeader | exeHash.hashTable | exefs | exePad | levels | romfs | romPad).
+    // Append-only: every byte must be hashed here (the PFS0 header precedes the
+    // NCA) — parts in hand (header, htable, exePad, levels) + ExeFS/RomFS
+    // re-streamed. Seekable: Pass 2 writes the NCA in file order, so the whole
+    // hash piggybacks there from a fresh state — no ExeFS re-stream in Pass 1.
     let contentId = null;
-    let sha256Mid = null;
     if (contentIdInPass1) {
+        const sha = createStreamingSHA256();
+        sha.update(encHeader);
+        sha.update(exeHash.hashTable);
+        t0 = performance.now();
+        await streamExefs(async (chunk) => { sha.update(chunk); rep(chunk.length); });
+        _log('info', `[timing] Pass 1 ExeFS (SHA256): ${((performance.now() - t0) / 1000).toFixed(1)}s (${(exefsSize / 1048576).toFixed(0)} MB)`);
+        if (L.exePaddingSize > 0) sha.update(new Uint8Array(L.exePaddingSize));
+        for (const lvl of romIvfc.hashLevels) sha.update(lvl);
         _log('info', '  Pass 1: Computing contentId (re-stream)...');
         t0 = performance.now();
         await streamRomfs(async (chunk) => { sha.update(chunk); rep(chunk.length); });
@@ -1240,21 +1245,20 @@ export async function computeProgramNcaContentId({ exefsSize, romfsDataSize, tit
         contentId = sha.hex();
         _log('info', `  ----> Program NCA (two-pass): ${L.ncaSize} bytes sha256=${contentId}`);
     } else {
-        sha256Mid = sha.clone();
         _log('info', `  ----> Program NCA (two-pass): ${L.ncaSize} bytes (contentId computed in Pass 2)`);
     }
 
-    return { size: L.ncaSize, contentId, meta: { encHeader, exeHash, romIvfc, L, sha256Mid } };
+    return { size: L.ncaSize, contentId, meta: { encHeader, exeHash, romIvfc, L } };
 }
 
 // Phase 2: write NCA sequentially (no seek-back). Uses meta from Phase 1.
 // Returns contentId — either the one passed in (precomputed in Pass 1, append-only
-// outputs) or the SHA256 finalized here from the sha256Mid state (seekable outputs,
-// where hashing piggybacks on the write and saves a romfs stream).
+// outputs) or the SHA256 finalized here over the NCA bytes as they are written in
+// file order (seekable outputs — no per-byte readback, no ExeFS re-stream).
 export async function writeProgramNcaTwoPass({ meta, adapter, ncaOffset, streamExefs, streamRomfs, log, progress, contentId = null }) {
     const _log = typeof log === 'function' ? log : () => {};
     const _prog = typeof progress === 'function' ? progress : () => {};
-    const { encHeader, exeHash, romIvfc, L, sha256Mid } = meta;
+    const { encHeader, exeHash, romIvfc, L } = meta;
     _log('info', '  Pass 2: Writing NCA to output...');
 
     // The two-pass path is for sequential outputs: every write must land exactly
@@ -1278,14 +1282,26 @@ export async function writeProgramNcaTwoPass({ meta, adapter, ncaOffset, streamE
         return await adapter.write(pos, data);
     };
 
+    // Seekable output: the contentId is hashed here from a fresh state — every
+    // NCA byte flows through the sequential write in file order. Append-only:
+    // contentId was precomputed in Pass 1 — write only. Each part is hashed
+    // BEFORE the write (the SW adapter transfers the buffer, detaching it).
+    const sha = contentId === null ? createStreamingSHA256() : null;
+    const feed = async (data) => { if (sha) sha.update(data); };
+
     let t0 = performance.now();
+    await feed(encHeader);
     await w(ncaOffset, encHeader);
+    await feed(exeHash.hashTable);
     await w(ncaOffset + L.sec0Start, exeHash.hashTable);
     await streamExefs(async (chunk, off) => {
+        await feed(chunk);
         await w(ncaOffset + L.sec0DataOff + off, chunk);
     });
     if (L.exePaddingSize > 0) {
-        await w(ncaOffset + L.sec0DataOff + L.exefsSize, new Uint8Array(L.exePaddingSize));
+        const pad = new Uint8Array(L.exePaddingSize);
+        await feed(pad);
+        await w(ncaOffset + L.sec0DataOff + L.exefsSize, pad);
     }
     let lvOff = 0;
     for (let i = 0; i < romIvfc.hashLevels.length; i++) {
@@ -1294,24 +1310,20 @@ export async function writeProgramNcaTwoPass({ meta, adapter, ncaOffset, streamE
         // buffer (detaches it), which zeroes .length on the caller's view —
         // `lvOff += lvl.length` after the write would add 0.
         const lvlLen = lvl.length;
+        await feed(lvl);
         await w(ncaOffset + L.sec1Start + lvOff, lvl);
         lvOff += lvlLen;
     }
     _log('info', `[timing] Pass 2 ExeFS+levels: ${((performance.now() - t0) / 1000).toFixed(1)}s (${(L.exefsSize / 1048576).toFixed(0)} MB)`);
     _log('info', `  RomFS streaming: ${(L.romfsDataSize / 1048576).toFixed(0)} MB to merge/write...`);
-    // Seekable output: restore the SHA256 mid-state (has header + exefs +
-    // hashLevels) and let romChunks + romPadding be hashed alongside the
-    // write → contentId for free. Append-only output: contentId was
-    // precomputed in Pass 1 — write only.
-    const sha = contentId === null ? sha256Mid.clone() : null;
     t0 = performance.now();
     await streamRomfs(async (chunk, off) => {
-        if (sha) sha.update(chunk);
+        await feed(chunk);
         await w(ncaOffset + L.sec1DataOff + off, chunk);
     });
     if (L.romPaddingSize > 0) {
         const pad = new Uint8Array(L.romPaddingSize);
-        if (sha) sha.update(pad);
+        await feed(pad);
         await w(ncaOffset + L.sec1DataOff + L.romfsDataSize, pad);
     }
     _log('info', `[timing] Pass 2 RomFS: ${((performance.now() - t0) / 1000).toFixed(1)}s (${(L.romfsDataSize / 1048576).toFixed(0)} MB)`);
