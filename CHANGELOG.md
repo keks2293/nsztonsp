@@ -1,6 +1,10 @@
   # NSZ to NSP Converter - Status Report
 
-           ## ✅ Recent Changes (2026-09-09)
+   ## ✅ Recent Changes (2026-09-10)
+
+    84. **Perf (two-pass, seekable): ExeFS decompressions 3×→2× — contentId hashed in Pass 2 alongside the write** — `fs/nca-pack.js`, `fs/update.js`. The seekable two-pass branch re-streamed ExeFS in Pass 1 purely to seed the SHA mid-state (`sha256Mid`); now the whole contentId hash starts from a fresh state in Pass 2, where every NCA byte already flows through the sequential write in file order (header/htable/exePad/levels in hand, ExeFS/RomFS chunks hashed **before** each write — matching the SW adapter's buffer-detach guard). `sha256Mid` machinery dropped; `pass1Total`/`pass1Bytes` progress denominators updated (seekable pass 1 = exefs 1× + romfs 1×). Append-only SW unchanged (contentId still final after Pass 1). Byte-identity holds across all 6 modes (`deec91cf…`); two-pass sims PASS (seekable FSA contentId `6e41adaff9…` == buffered reference, SW append-only same), native + FORCE_JS, build 199.7 kb.
+
+## ✅ Recent Changes (2026-09-09)
 
              82. **New: `updateMode: 'scatter'` + merged-buffer (`mergeBuffer`) + independent `Buffer`/`Scatter` pills — update with ~0 RAM update source across every output (SW/FSA/blob/fd); `packProgramNcaStream` contentId from ordered parts (PartBuilder)** — `fs/bktr-merge.js`, `fs/update.js`, `fs/nca-pack.js`, `converter.js`, `main.js`, `index.html`, `scripts/test_update_sw_sim.mjs`.
 
