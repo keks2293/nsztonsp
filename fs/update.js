@@ -635,10 +635,11 @@ export async function update(readers, output, options = {}) {
         const baseInput = { headerRaw: baseHeaderRaw, source: baseSource };
 
         // ── Streaming path (seekable output + BKTR): no RomFS buffer ──────────
-        // ExeFS is buffered (small; needed for ACID zeroing); the large RomFS is
-        // streamed through the BKTR merge straight to the output. The NCA header,
-        // PFS0 htable, IVFC levels and the PFS0 Program/CNMT names are written with
-        // seek-back; the contentId comes from re-reading the written NCA.
+        // ExeFS is streamed straight to the output (ACID-filtered on the fly, no
+        // buffer); the large RomFS is streamed through the BKTR merge straight to
+        // the output. The NCA header, PFS0 htable, IVFC levels and the PFS0
+        // Program/CNMT names are written with seek-back; the contentId comes from
+        // re-reading the written NCA.
         // (outRead / appendOnly computed above, near the scatter gating)
 
         // Split the update kind (BKTR merge vs base RomFS as-is) once, into two
