@@ -422,7 +422,7 @@ function makeExefsStream(updateInput, keys, updateTikData, options, log) {
 }
 
 export async function update(readers, output, options = {}) {
-    const { log = () => {}, progress = () => {}, keys = null, updateMode = 'auto', mergeBuffer = false } = options;
+    const { log = () => {}, progress = () => {}, keys = null, updateMode = 'auto' } = options;
 
     if (!Array.isArray(readers) || readers.length !== 2) {
         throw new Error('update: exactly two inputs required (base + update)');
@@ -580,21 +580,17 @@ export async function update(readers, output, options = {}) {
 
         let updateSource;
         // Determine seekability early: the scatter path needs a readable (re-seekable)
-        // output for its hashes UNLESS the merged RomFS is buffered instead
-        // (mergeBuffer option, scatter + Buffer) — then hashes come from the buffer
-        // and only seek is required, so real FSA outputs (write+seek, no read) work.
-        // A sequential-only (SW) output is still excluded by the seek-back header.
+        // output for its hashes (IVFC + contentId by re-reading the written NCA), and a
+        // sequential-only (SW) output is excluded by the seek-back header anyway.
         const outRead = await buildRead(output);
         const appendOnly = !!(output.writable && typeof output.writable.seek !== 'function');
-        const mergeBufferOn = updateMode === 'scatter' && hasBktrRomfs && mergeBuffer === true;
         // Scatter seek-writes the NCA header + hash tables back over the data region,
-        // so a sequential (append-only, SW) output is excluded here NO MATTER what —
-        // updateMode alone is not enough (even with mergeBuffer there is no seek-back).
-        const scatterActive = updateMode === 'scatter' && hasBktrRomfs && !appendOnly && (outRead !== null || mergeBufferOn);
+        // so a sequential (append-only, SW) output is excluded here NO MATTER what.
+        const scatterActive = updateMode === 'scatter' && hasBktrRomfs && !appendOnly && outRead !== null;
         if (updateMode === 'scatter' && hasBktrRomfs && !scatterActive) {
             log('warn', appendOnly
                 ? 'Scatter not possible on a sequential (SW) output — falling back to two-pass'
-                : 'Scatter needs a readable output or the merged buffer (Buffer pill) — falling back to two-pass');
+                : 'Scatter needs a readable (in-memory/fd) output — falling back to two-pass');
         }
         if (updateKind === 'ncz') {
             if (scatterActive || (updateMode === 'buffered' && hasBktrRomfs)) {
@@ -689,8 +685,8 @@ export async function update(readers, output, options = {}) {
             programSize = programNcaSize(exefsSize, romfsDataSize);
         }
 
-        if ((outRead !== null || scatterActive) && updateMode !== 'buffered') {
-            log('info', `Streaming update (${scatterActive ? (mergeBufferOn ? 'scatter + merged-buffer, ' : 'scatter, ') : ''}seekable output): ExeFS streamed, RomFS via ${hasBktrRomfs ? 'BKTR merge' : 'base as-is'} (no data buffer)...`);
+        if (outRead !== null && updateMode !== 'buffered') {
+            log('info', `Streaming update (${scatterActive ? 'scatter, ' : ''}seekable output): ExeFS streamed, RomFS via ${hasBktrRomfs ? 'BKTR merge' : 'base as-is'} (no data buffer)...`);
             await new Promise(r => setTimeout(r, 0));
             log('info', `Program NCA (streaming): exefs=${exefsSize} romfs=${romfsDataSize} total=${programSize}`);
 
@@ -728,10 +724,6 @@ export async function update(readers, output, options = {}) {
                         // covers the scatter chunk writes — reporting from both double-counts.
                     });
                 },
-                // scatter + Buffer: the merged RomFS (and ExeFS data) accumulate in
-                // memory, so packProgramNcaStream hashes from buffers — no output
-                // re-read, works on FSA (write+seek, no read).
-                mergeBuffer: mergeBufferOn ? new Uint8Array(romfsDataSize) : null,
             } : undefined;
             const { hashHex: contentId } = await packProgramNcaStream({
                 adapter, ncaOffset: programNcaPfs0Offset,
@@ -827,9 +819,9 @@ export async function update(readers, output, options = {}) {
         const mergeResult = await scatterRomFS({
             baseInput: freshBase, updateCtx,
             options: { keys, baseTik: baseTikData, updateTik: updateTikData },
-            // The merged RomFS accumulates in RAM at its virtual offsets — the
-            // same buffer scatter+mergeBuffer uses, only here it is written to
-            // the output forward (buffered tail) instead of via seek-back.
+            // The merged RomFS accumulates in RAM at its virtual offsets — the same
+            // scatter-style buffer, only here it is written to the output forward
+            // (buffered tail) instead of via seek-back.
             writeFn: (off, chunk) => mergedRomfs.set(chunk, off),
             log,
             onProgress: (pos, total) => phase1((Math.min(pos, total) / total) * (romfsDataSize || 1) / phase1Bytes),

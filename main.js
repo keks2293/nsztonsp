@@ -45,15 +45,14 @@ async function main() {
     const bufferedBtn = document.getElementById('bufferedBtn');
     const scatterBtn = document.getElementById('scatterBtn');
 
-    // Independent toggles over two DIFFERENT buffers; the old modes stay as-is:
-    //   Buffer  — hold the MERGED RomFS in memory ('buffered'), toggleable in any
-    //             mode (pre-existing single-pass option).
-    //   Scatter — drop the UPDATE-source buffer (~668 MB) by re-streaming the update
-    //             NCZ per-pass in physical order ('scatter'; works on outputs that
-    //             can seek). Needs to hash the merged RomFS: from a readable output
-    //             (blob/memory, fd) or — with Buffer ALSO on — from the merged
-    //             buffer (fsa: FileSystemWritableFileStream can write+seek but not
-    //             read, so scatter on FSA requires Buffer).
+    // Two pills over ONE merged-buffer path ('buffered' since fe3353f already
+    // streams the update in physical order — no separate update buffer):
+    //   Buffer  — hold the MERGED RomFS in memory (single output pass).
+    //   Scatter — same merged-buffer path; kept as its own pill for clarity.
+    //             IMPLIES Buffer: hashes come from the merged RomFS buffer, so it
+    //             works on any output incl. FSA (write+seek, no read-back). The old
+    //             no-buffer scatter (re-read the output) is gone from the UI — an
+    //             FSA output can't be re-read and a SW one can't seek at all.
     let buffered = false;
     let scatter = false;
 
@@ -90,13 +89,13 @@ async function main() {
         noDeltaBtn.classList.toggle('hidden', !noDeltaVisible);
         keepAcidSigBtn.classList.toggle('hidden', !keepAcidVisible);
         keepAcidKeyBtn.classList.toggle('hidden', !keepAcidVisible);
-        // Buffer is meaningless for in-memory (blob) output — both buffer modes do a
-        // single RomFS decompression there, so only SW/FSA need the choice.
-        // Scatter needs a seek-capable output: blob (memory adapter, readable) works
-        // alone; FSA (write+seek but NO read) needs Buffer too, to hash from the
-        // merged buffer instead of re-reading the output; SW has no seek at all.
+        // Buffer is meaningless for in-memory (blob) output — the output is already
+        // in RAM there, so only SW/FSA need the merged-buffer choice.
+        // Scatter works on any output: on SW/FSA it implies the merged buffer
+        // (hashes come from it, no readable output needed — routes to 'buffered');
+        // on blob it re-streams standalone (re-reads the in-memory output).
         bufferedBtn.classList.toggle('hidden', !(keepAcidVisible && downloadMode !== 'blob'));
-        scatterBtn.classList.toggle('hidden', !(keepAcidVisible && (downloadMode === 'fsa' || downloadMode === 'blob')));
+        scatterBtn.classList.toggle('hidden', !keepAcidVisible);
     }
 
     updateOptionsVisibility();
@@ -790,12 +789,15 @@ async function main() {
                 writable,
                 keepNpdmAcidSig: keepAcidSig,
                 keepNpdmAcidKey: keepAcidKey,
-                updateMode: (scatter && (downloadMode === 'fsa' || downloadMode === 'blob')) ? 'scatter'
-                    : (buffered && downloadMode !== 'blob') ? 'buffered'
+                // Scatter implies the merged buffer on SW/FSA: hashes come from the merged
+                // RomFS buffer (forward write, works even on append-only outputs),
+                // so no readable output is needed. On blob it still re-streams
+                // standalone (re-reads the in-memory output). Both pills select the
+                // same merged-buffer path since fe3353f ('buffered' streams the
+                // update in physical order — there is no separate update buffer).
+                updateMode: (scatter && downloadMode === 'blob') ? 'scatter'
+                    : ((buffered || scatter) && downloadMode !== 'blob') ? 'buffered'
                     : 'two-pass',
-                // scatter + Buffer on FSA: hash from the merged buffer instead of
-                // re-reading the output (FileSystemWritableFileStream can't read).
-                mergeBuffer: !!(scatter && buffered && downloadMode === 'fsa'),
             });
             checkSwDelivered(writable, result.size);
             if (writable) {

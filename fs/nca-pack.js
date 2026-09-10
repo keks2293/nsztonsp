@@ -1025,24 +1025,15 @@ export async function packProgramNcaStream({ adapter, ncaOffset, exefsSize, romf
 
     const pfs0 = new StreamingPfs0Hasher(PFS0_EXEFS_HASH_BLOCK_SIZE);
 
-    // mergeBuffer (scatter + Buffer): stream the merged RomFS INTO `scatter.mergeBuffer`
-    // and keep the ExeFS data, so IVFC/contentId come from the buffers instead of
-    // re-reading the output — scatter then works on outputs that can write+seek but
-    // NOT read back (real FSA: FileSystemWritableFileStream has no read(), MDN).
-    const mergeBuffer = scatter ? scatter.mergeBuffer : null;
-    const exefsBuf = mergeBuffer ? new Uint8Array(exefsSize) : null;
-
     // ── Phase progress ──────────────────────────────────────────────────────
     // Covers exefs write + romfs write + the contentId (the parts in hand vs re-read
-    // ranges, see the tail). Beyond that base each mode performs extra real passes
+    // ranges, see the tail). Beyond that base scatter performs one extra real pass
     // whose bytes must be in the denominator or the bar overshoots 100%:
     //   scatter        → the ordered RomFS re-read feeding the IVFC hash (repRomfs)
-    //   mergeBuffer    → the merged RomFS forward write from the buffer (repRomfs)
     const _prog = typeof progress === 'function' ? progress : () => {};
     const repRomfs = romfsDataSize || 1;
     let streamTotal = exefsSize + repRomfs + ncaSize;
     if (scatter) streamTotal += repRomfs;
-    if (mergeBuffer) streamTotal += repRomfs;
     let done = 0;
     const rep = (n) => { done += n; _prog(done / streamTotal); };
 
@@ -1052,41 +1043,29 @@ export async function packProgramNcaStream({ adapter, ncaOffset, exefsSize, romf
         const n = chunk.length;
         await adapter.write(ncaOffset + sec0DataOff + off, chunk);
         pfs0.update(chunk);
-        if (exefsBuf) exefsBuf.set(chunk, off);
         rep(n);
     });
     const exeHash = await pfs0.finalize();
 
     // ── RomFS data → output + IVFC hasher ─────────────────────────────────
     // Scatter: writes land OUT of virtual order, so the IVFC levels can only be
-    // hashed from the mergeBuffer (buffered sub-mode) or by re-reading the written
-    // region in order. Streaming: the hasher is fed during the write.
+    // hashed by re-reading the written region in order. Streaming: the hasher is
+    // fed during the write.
     let romIvfc;
     if (scatter) {
-        _log('info', mergeBuffer
-            ? '  RomFS (BKTR) merged into buffer (scatter, no output re-read)...'
-            : '  RomFS (BKTR) via scatter write (out of virtual order)...');
+        _log('info', '  RomFS (BKTR) via scatter write (out of virtual order)...');
         await scatter.romfs(async (offInRomfsData, chunk) => {
             const n = chunk.length;
-            if (mergeBuffer) {
-                mergeBuffer.set(chunk, offInRomfsData);
-            } else {
-                await adapter.write(ncaOffset + sec1DataOff + offInRomfsData, chunk);
-            }
+            await adapter.write(ncaOffset + sec1DataOff + offInRomfsData, chunk);
             rep(n);
         });
-        _log('info', mergeBuffer
-            ? '  Merged RomFS buffer → IVFC hash...'
-            : '  Re-reading RomFS from output → IVFC hash...');
+        _log('info', '  Re-reading RomFS from output → IVFC hash...');
         const ivfc = new StreamingIvfcHasher(romfsDataSize);
         {
             let roff = 0;
             while (roff < romfsDataSize) {
                 const n = Math.min(0x1000000, romfsDataSize - roff);
-                const part = mergeBuffer
-                    ? mergeBuffer.subarray(roff, roff + n)
-                    : await adapter.read(ncaOffset + sec1DataOff + roff, n);
-                ivfc.update(part);
+                ivfc.update(await adapter.read(ncaOffset + sec1DataOff + roff, n));
                 roff += n;
                 rep(n);
             }
@@ -1128,24 +1107,11 @@ export async function packProgramNcaStream({ adapter, ncaOffset, exefsSize, romf
         }
     }
 
-    // ── Merged RomFS data write (mergeBuffer: streamed into RAM, not written) ─
-    if (mergeBuffer) {
-        _log('info', '  Writing merged RomFS data from buffer (forward)...');
-        let roff = 0;
-        while (roff < romfsDataSize) {
-            const n = Math.min(0x1000000, romfsDataSize - roff);
-            await adapter.write(ncaOffset + sec1DataOff + roff, mergeBuffer.subarray(roff, roff + n));
-            roff += n;
-            rep(n);
-        }
-    }
-
     // ── ContentId (sha256 over the NCA in file order) ──────────────────────
     // The NCA is an ordered list of parts; each part is either in hand (header,
-    // PFS0 htable, IVFC levels — plus ExeFS data + merged RomFS under mergeBuffer)
-    // or only on the output at a known offset. One feed loop covers both: range
-    // parts are re-read in 16 MB slices, buffered parts fed directly — so the
-    // re-read never covers what's already in memory (under mergeBuffer: zero).
+    // PFS0 htable, IVFC levels) or only on the output at a known offset. One feed
+    // loop covers both: range parts are re-read in 16 MB slices, buffered parts
+    // fed directly.
     _log('info', '  ContentId (sha256 over NCA parts)...');
     const h = createStreamingSHA256();
     const feedBuf = (buf) => {
@@ -1169,13 +1135,13 @@ export async function packProgramNcaStream({ adapter, ncaOffset, exefsSize, romf
     const feedZeros = (size) => { if (size > 0) h.update(new Uint8Array(size)); };
     feedBuf(encHeader);
     feedBuf(exeHash.hashTable);
-    if (exefsBuf) feedBuf(exefsBuf); else await feedRange(sec0DataOff, exefsSize);
+    await feedRange(sec0DataOff, exefsSize);
     feedZeros(exePaddingSize);
     for (const lvl of hashLevels) feedBuf(lvl);
-    if (mergeBuffer) feedBuf(mergeBuffer); else await feedRange(sec1DataOff, romfsDataSize);
+    await feedRange(sec1DataOff, romfsDataSize);
     feedZeros(romPaddingSize);
     const hashHex = h.hex();
-    const modeLabel = scatter ? (mergeBuffer ? 'scatter+buffer' : 'scatter') : 'streaming';
+    const modeLabel = scatter ? 'scatter' : 'streaming';
     _log('info', `  ----> Program NCA (${modeLabel}): ${ncaSize} bytes sha256=${hashHex}`);
     return { hashHex, size: ncaSize };
 }
