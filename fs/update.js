@@ -5,9 +5,9 @@ import { NCZDecompressor, AdapterNCZReader, parseNczSections } from './ncz.js';
 import { decryptNcaHeader, decryptNcaSection, parseCnmtFromDecryptedSection } from './nca.js';
 import { Cnmt, CNMT_ENTRY_TYPE } from './cnmt.js';
 import { sha256 } from '../crypto/sha256.js';
-import { mergeRomFS } from './bktr-merge.js';
+import { mergeRomFS, scatterRomFS } from './bktr-merge.js';
 import { FileRangeSource, NczStreamSource, ViewRangeSource, SparseNcaView } from './range-source.js';
-import { preparePlaintextProgramNca, writePlaintextProgramNca, packProgramNcaStream, computeProgramNcaContentId, writeProgramNcaTwoPass, extractExefsStream, extractRomfsStream, createExefsAcidFilter, packMetaNca, extractExefs, extractRomfs, processNpdmAcid, computeProgramNcaLayout } from './nca-pack.js';
+import { preparePlaintextProgramNca, writePlaintextProgramNca, packProgramNcaStream, computeProgramNcaContentId, writeProgramNcaTwoPass, extractExefsStream, extractRomfsStream, createExefsAcidFilter, packMetaNca, computeProgramNcaLayout } from './nca-pack.js';
 import { hexToBytes, writeU64LE, writeU32LE, readLeU64 } from './bytes.js';
 import { fsHeaderAt, FS_HDR, NCA_HEADER_SIZE, decryptNcaHeaderBytes, findRomfsFsHeader, isMetaNca } from './nca-utils.js';
 import { writeFromReader } from './convert-common.js';
@@ -422,7 +422,7 @@ function makeExefsStream(updateInput, keys, updateTikData, options, log) {
 }
 
 export async function update(readers, output, options = {}) {
-    const { log = () => {}, progress = () => {}, keys = null, updateMode = 'auto' } = options;
+    const { log = () => {}, progress = () => {}, keys = null, updateMode = 'auto', mergeBuffer = false } = options;
 
     if (!Array.isArray(readers) || readers.length !== 2) {
         throw new Error('update: exactly two inputs required (base + update)');
@@ -481,10 +481,12 @@ export async function update(readers, output, options = {}) {
     // reused by the merge block below — no second decompression of the update NCZ.
     let updateHeaderRaw = null;
     let updateHeaderDec = null;
+    let updateParsed = null;
     if (updateProgramEntry && bktrMerge) {
         log('info', 'Reading update Program NCA header for BKTR check...');
-        const { raw } = await readPlaintextNcaHeader(update.reader, updateProgramEntry.src);
+        const { raw, parsed } = await readPlaintextNcaHeader(update.reader, updateProgramEntry.src);
         updateHeaderRaw = raw;
+        updateParsed = parsed;
         const uHeader = decryptNcaHeader(raw, keys);
         updateHeaderDec = uHeader;
         if (uHeader) {
@@ -547,6 +549,7 @@ export async function update(readers, output, options = {}) {
         if (!updateHeaderDec) {
             const uHdr = await readPlaintextNcaHeader(update.reader, updateProgramEntry.src);
             updateHeaderRaw = uHdr.raw;
+            updateParsed = uHdr.parsed ?? updateParsed;
             updateHeaderDec = decryptNcaHeader(updateHeaderRaw, keys);
         }
         if (!updateHeaderDec) throw new Error('update: cannot decrypt update Program NCA header');
@@ -576,40 +579,71 @@ export async function update(readers, output, options = {}) {
         }
 
         let updateSource;
+        // Determine seekability early: the scatter path needs a readable (re-seekable)
+        // output for its hashes UNLESS the merged RomFS is buffered instead
+        // (mergeBuffer option, scatter + Buffer) — then hashes come from the buffer
+        // and only seek is required, so real FSA outputs (write+seek, no read) work.
+        // A sequential-only (SW) output is still excluded by the seek-back header.
+        const outRead = await buildRead(output);
+        const appendOnly = !!(output.writable && typeof output.writable.seek !== 'function');
+        const mergeBufferOn = updateMode === 'scatter' && hasBktrRomfs && mergeBuffer === true;
+        // Scatter seek-writes the NCA header + hash tables back over the data region,
+        // so a sequential (append-only, SW) output is excluded here NO MATTER what —
+        // updateMode alone is not enough (even with mergeBuffer there is no seek-back).
+        const scatterActive = updateMode === 'scatter' && hasBktrRomfs && !appendOnly && (outRead !== null || mergeBufferOn);
+        if (updateMode === 'scatter' && hasBktrRomfs && !scatterActive) {
+            log('warn', appendOnly
+                ? 'Scatter not possible on a sequential (SW) output — falling back to two-pass'
+                : 'Scatter needs a readable output or the merged buffer (Buffer pill) — falling back to two-pass');
+        }
         if (updateKind === 'ncz') {
-            const updRanges = [];
-            if (hasBktrRomfs && updateRomfsSec) {
-                updRanges.push({ offset: updateRomfsSec.offset, size: updateRomfsSec.endOffset - updateRomfsSec.offset });
+            if (scatterActive || (updateMode === 'buffered' && hasBktrRomfs)) {
+                const srcLabel = scatterActive ? 'scatter' : 'buffered (scatter-style source streaming)';
+                log('info', `Update .nsz + ${srcLabel}: no update buffer — ExeFS streamed, BKTR tables (U1) and patch data (U2) captured on demand...`);
+                // ExeFS is streamed from a dedicated one-shot NczStreamSource over
+                // the ExeFS section; BKTR tables + patch data get their own sources
+                // inside resolveBktrMergeTables (U1) and scatterRomFS Pass U (U2).
+                updateSource = new NczStreamSource(updateReader, updateParsed, log);
+                updateSource.registerRange(updateExefsSec.offset, updateExefsSec.endOffset - updateExefsSec.offset);
+            } else {
+                const updRanges = [];
+                if (hasBktrRomfs && updateRomfsSec) {
+                    updRanges.push({ offset: updateRomfsSec.offset, size: updateRomfsSec.endOffset - updateRomfsSec.offset });
+                }
+                updRanges.push({ offset: updateExefsSec.offset, size: updateExefsSec.endOffset - updateExefsSec.offset });
+                log('info', `Extracting update NCZ sections in one pass: ${updRanges.map(r => `[0x${r.offset.toString(16)}..0x${(r.offset + r.size).toString(16)})`).join(', ')}...`);
+                await new Promise(r => setTimeout(r, 0));
+                const updData = await extractNcaSections(updateReader, updRanges, updateKind, keys, log);
+                const updateSections = [];
+                let u = 0;
+                if (hasBktrRomfs && updateRomfsSec) updateSections.push({ offset: updateRomfsSec.offset, data: updData[u++] });
+                updateSections.push({ offset: updateExefsSec.offset, data: updData[u++] });
+                const updateView = new SparseNcaView(updateHeaderRaw, updateSections);
+                updateSource = new ViewRangeSource(updateView);
+                log('info', `Update .nsz: ${updateSections.length} section(s) served from zero-copy sparse view (${updateView.length} bytes) — patch access is non-monotonic, so these stay buffered`);
             }
-            updRanges.push({ offset: updateExefsSec.offset, size: updateExefsSec.endOffset - updateExefsSec.offset });
-            log('info', `Extracting update NCZ sections in one pass: ${updRanges.map(r => `[0x${r.offset.toString(16)}..0x${(r.offset + r.size).toString(16)})`).join(', ')}...`);
-            await new Promise(r => setTimeout(r, 0));
-            const updData = await extractNcaSections(updateReader, updRanges, updateKind, keys, log);
-            const updateSections = [];
-            let u = 0;
-            if (hasBktrRomfs && updateRomfsSec) updateSections.push({ offset: updateRomfsSec.offset, data: updData[u++] });
-            updateSections.push({ offset: updateExefsSec.offset, data: updData[u++] });
-            const updateView = new SparseNcaView(updateHeaderRaw, updateSections);
-            updateSource = new ViewRangeSource(updateView);
-            log('info', `Update .nsz: ${updateSections.length} section(s) served from zero-copy sparse view (${updateView.length} bytes) — patch access is non-monotonic, so these stay buffered`);
         } else {
             log('info', 'Update .nsp: BKTR/ExeFS sections read on demand from container...');
             updateSource = new FileRangeSource(update.reader, updateProgramEntry.src.offset, updateProgramEntry.src.size);
         }
 
-        const baseInput = { headerRaw: baseHeaderRaw, source: baseSource };
+        // Update context for the streaming merge consumers:
+        //  - makeExefsStream reads the ExeFS section from `source` (random access).
+        //  - resolveBktrMergeTables (U1) + scatterRomFS Pass U (U2) stream the NCZ.
         const updateInput = { headerRaw: updateHeaderRaw, source: updateSource };
+        const updateCtx = (updateKind === 'ncz')
+            ? { headerRaw: updateHeaderRaw, reader: updateReader, parsed: updateParsed, streamable: true }
+            : { headerRaw: updateHeaderRaw, source: updateSource, streamable: false };
+
+        // Base input for streaming merge:
+        const baseInput = { headerRaw: baseHeaderRaw, source: baseSource };
 
         // ── Streaming path (seekable output + BKTR): no RomFS buffer ──────────
         // ExeFS is buffered (small; needed for ACID zeroing); the large RomFS is
         // streamed through the BKTR merge straight to the output. The NCA header,
         // PFS0 htable, IVFC levels and the PFS0 Program/CNMT names are written with
         // seek-back; the contentId comes from re-reading the written NCA.
-        const outRead = await buildRead(output);
-        // Append-only output (SW download): the PFS0 header must be written
-        // before the NCA (no seek-back), so the contentId must be final after
-        // Pass 1. Seekable outputs (FSA / memory) can write the header last.
-        const appendOnly = !!(output.writable && typeof output.writable.seek !== 'function');
+        // (outRead / appendOnly computed above, near the scatter gating)
 
         // Split the update kind (BKTR merge vs base RomFS as-is) once, into two
         // stream factories shared by the streaming and two-pass paths. Each call
@@ -655,8 +689,8 @@ export async function update(readers, output, options = {}) {
             programSize = programNcaSize(exefsSize, romfsDataSize);
         }
 
-        if (outRead !== null && updateMode !== 'buffered') {
-            log('info', `Streaming update (seekable output): ExeFS streamed, RomFS via ${hasBktrRomfs ? 'BKTR merge' : 'base as-is'} (no data buffer)...`);
+        if ((outRead !== null || scatterActive) && updateMode !== 'buffered') {
+            log('info', `Streaming update (${scatterActive ? (mergeBufferOn ? 'scatter + merged-buffer, ' : 'scatter, ') : ''}seekable output): ExeFS streamed, RomFS via ${hasBktrRomfs ? 'BKTR merge' : 'base as-is'} (no data buffer)...`);
             await new Promise(r => setTimeout(r, 0));
             log('info', `Program NCA (streaming): exefs=${exefsSize} romfs=${romfsDataSize} total=${programSize}`);
 
@@ -679,12 +713,33 @@ export async function update(readers, output, options = {}) {
             const streamWork = exefsSize + (romfsDataSize || 1) + programSize;
             const phaseTotal = streamWork + otherNcas.reduce((s, m) => s + m.outLen, 0);
             let t0 = performance.now();
+            const scatterObj = scatterActive ? {
+                romfs: async (writeFn) => {
+                    log('info', '[scatter] capturing BKTR tables (U1)...');
+                    const freshBase = baseKind === 'ncz'
+                        ? { headerRaw: baseHeaderRaw, source: new NczStreamSource(_baseReaderRef, _baseParsedRef, log) }
+                        : baseInput;
+                    await scatterRomFS({
+                        baseInput: freshBase, updateCtx,
+                        options: { keys, baseTik: baseTikData, updateTik: updateTikData },
+                        writeFn,
+                        log,
+                        // No onProgress here: packProgramNcaStream's writeFn rep() already
+                        // covers the scatter chunk writes — reporting from both double-counts.
+                    });
+                },
+                // scatter + Buffer: the merged RomFS (and ExeFS data) accumulate in
+                // memory, so packProgramNcaStream hashes from buffers — no output
+                // re-read, works on FSA (write+seek, no read).
+                mergeBuffer: mergeBufferOn ? new Uint8Array(romfsDataSize) : null,
+            } : undefined;
             const { hashHex: contentId } = await packProgramNcaStream({
                 adapter, ncaOffset: programNcaPfs0Offset,
                 exefsSize, romfsDataSize,
                 titleId: base.cnmt.titleId, keys,
                 streamExefs: makeStreamExefs(),
                 streamRomfs: makeStreamRomfs(),
+                scatter: scatterObj,
                 log,
                 progress: (p) => progress(p * streamWork / phaseTotal, 'Writing output (1/1)', phaseTotal),
             });
@@ -763,26 +818,33 @@ export async function update(readers, output, options = {}) {
         const phase1Bytes = 2 * (romfsDataSize || 1) + 2 * exefsSize;
         const phase1Label = 'Computing contentId (1/2)';
         const phase1 = (p) => progress(p, phase1Label, phase1Bytes);
-        log('info', `Merging RomFS (buffered, base streamed from ${baseKind === 'ncz' ? 'NCZ' : 'container'})...`);
+        log('info', `Merging RomFS into RAM (buffered; base + update streamed in physical order, no SparseNcaView)...`);
         await new Promise(r => setTimeout(r, 0));
-        const mergeResult = await mergeRomFS(baseInput, updateInput, {
-            keys,
-            baseTik: baseTikData,
-            updateTik: updateTikData,
-            onProgress: (pos, total) => phase1((pos / total) * (romfsDataSize || 1) / phase1Bytes),
+        const mergedRomfs = new Uint8Array(romfsDataSize);
+        const freshBase = baseKind === 'ncz'
+            ? { headerRaw: baseHeaderRaw, source: new NczStreamSource(_baseReaderRef, _baseParsedRef, log) }
+            : baseInput;
+        const mergeResult = await scatterRomFS({
+            baseInput: freshBase, updateCtx,
+            options: { keys, baseTik: baseTikData, updateTik: updateTikData },
+            // The merged RomFS accumulates in RAM at its virtual offsets — the
+            // same buffer scatter+mergeBuffer uses, only here it is written to
+            // the output forward (buffered tail) instead of via seek-back.
+            writeFn: (off, chunk) => mergedRomfs.set(chunk, off),
+            log,
+            onProgress: (pos, total) => phase1((Math.min(pos, total) / total) * (romfsDataSize || 1) / phase1Bytes),
         });
-        const mergedRomfs = mergeResult.mergedData;
         log('info', `Merged RomFS: ${mergedRomfs.length} bytes, ${mergeResult.relocEntries} reloc entries, ${mergeResult.subsectionEntries} subsection entries`);
 
-        log('info', 'Extracting ExeFS from update Program NCA...');
+        log('info', 'Streaming ExeFS from update Program NCA (ACID-filtered)...');
         await new Promise(r => setTimeout(r, 0));
-        const exefsData = await extractExefs(updateInput, keys, updateTikData);
+        const exefsData = new Uint8Array(exefsSize);
+        await makeExefsStream(updateInput, keys, updateTikData, options, log)(async (chunk, off) => {
+            exefsData.set(chunk, off);
+            phase1((romfsDataSize + Math.min(off + chunk.length, exefsSize)) / phase1Bytes);
+        });
         log('info', `ExeFS: ${exefsData.length} bytes`);
 
-        processNpdmAcid(exefsData, {
-            keepSig: options.keepNpdmAcidSig === true,
-            keepKey: options.keepNpdmAcidKey === true,
-        }, log);
         phase1((romfsDataSize + exefsSize) / phase1Bytes);
 
         baseSource = null;

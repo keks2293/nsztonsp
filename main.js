@@ -43,6 +43,19 @@ async function main() {
     const keepAcidSigBtn = document.getElementById('keepAcidSigBtn');
     const keepAcidKeyBtn = document.getElementById('keepAcidKeyBtn');
     const bufferedBtn = document.getElementById('bufferedBtn');
+    const scatterBtn = document.getElementById('scatterBtn');
+
+    // Independent toggles over two DIFFERENT buffers; the old modes stay as-is:
+    //   Buffer  — hold the MERGED RomFS in memory ('buffered'), toggleable in any
+    //             mode (pre-existing single-pass option).
+    //   Scatter — drop the UPDATE-source buffer (~668 MB) by re-streaming the update
+    //             NCZ per-pass in physical order ('scatter'; works on outputs that
+    //             can seek). Needs to hash the merged RomFS: from a readable output
+    //             (blob/memory, fd) or — with Buffer ALSO on — from the merged
+    //             buffer (fsa: FileSystemWritableFileStream can write+seek but not
+    //             read, so scatter on FSA requires Buffer).
+    let buffered = false;
+    let scatter = false;
 
     let fixPadding = false;
     let overwrite = false;
@@ -50,7 +63,6 @@ async function main() {
     let noDeltas = false;
     let keepAcidSig = false;
     let keepAcidKey = false;
-    let buffered = false;
     let mode = 'convert';
     const isMobile = /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent);
     let downloadMode = isMobile ? 'sw' : 'fsa';
@@ -78,10 +90,13 @@ async function main() {
         noDeltaBtn.classList.toggle('hidden', !noDeltaVisible);
         keepAcidSigBtn.classList.toggle('hidden', !keepAcidVisible);
         keepAcidKeyBtn.classList.toggle('hidden', !keepAcidVisible);
-        // Buffering is pointless for in-memory (blob) output — both buffer modes
-        // do a single RomFS decompression there, and 'buffered' just holds the
-        // whole NCA in memory. Only SW/FSA outputs need the choice.
+        // Buffer is meaningless for in-memory (blob) output — both buffer modes do a
+        // single RomFS decompression there, so only SW/FSA need the choice.
+        // Scatter needs a seek-capable output: blob (memory adapter, readable) works
+        // alone; FSA (write+seek but NO read) needs Buffer too, to hash from the
+        // merged buffer instead of re-reading the output; SW has no seek at all.
         bufferedBtn.classList.toggle('hidden', !(keepAcidVisible && downloadMode !== 'blob'));
+        scatterBtn.classList.toggle('hidden', !(keepAcidVisible && (downloadMode === 'fsa' || downloadMode === 'blob')));
     }
 
     updateOptionsVisibility();
@@ -328,6 +343,11 @@ async function main() {
     bufferedBtn.addEventListener('click', () => {
         buffered = !buffered;
         bufferedBtn.classList.toggle('on', buffered);
+    });
+
+    scatterBtn.addEventListener('click', () => {
+        scatter = !scatter;
+        scatterBtn.classList.toggle('on', scatter);
     });
 
     document.querySelectorAll('.pill[data-mode]').forEach(btn => {
@@ -770,7 +790,12 @@ async function main() {
                 writable,
                 keepNpdmAcidSig: keepAcidSig,
                 keepNpdmAcidKey: keepAcidKey,
-                updateMode: (buffered && downloadMode !== 'blob') ? 'buffered' : 'two-pass',
+                updateMode: (scatter && (downloadMode === 'fsa' || downloadMode === 'blob')) ? 'scatter'
+                    : (buffered && downloadMode !== 'blob') ? 'buffered'
+                    : 'two-pass',
+                // scatter + Buffer on FSA: hash from the merged buffer instead of
+                // re-reading the output (FileSystemWritableFileStream can't read).
+                mergeBuffer: !!(scatter && buffered && downloadMode === 'fsa'),
             });
             checkSwDelivered(writable, result.size);
             if (writable) {
