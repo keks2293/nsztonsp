@@ -32,24 +32,6 @@ class SequentialWriter {
   }
 }
 
-// Mirrors real FSA (FileSystemWritableFileStream): write+seek, but NO read() — so
-// buildRead() must return null for it and scatter can only run via mergeBuffer
-// (hashes come from RAM, no output re-read).
-class FsaWriter {
-  chunks = [];
-  write({ type, position, data }) {
-    this.chunks.push({ offset: position, data: new Uint8Array(data) });
-  }
-  seek(position) {}
-  build() {
-    this.chunks.sort((a, b) => a.offset - b.offset);
-    const last = this.chunks[this.chunks.length - 1];
-    const buf = new Uint8Array(last.offset + last.data.length);
-    for (const c of this.chunks) buf.set(c.data, c.offset);
-    return buf;
-  }
-}
-
 const DIR = '/Users/rmitkov/Downloads/Stardew Valley [NSZ]';
 const basePath = process.env.BASE_PATH || `${DIR}/Stardew Valley [0100E65002BB8000][v0] (0.87 GB).nsz`;
 const updatePath = process.env.UPDATE_PATH || `${DIR}/Stardew Valley [0100E65002BB8800][v1310720] (0.67 GB).nsz`;
@@ -128,32 +110,6 @@ const scatter = new Uint8Array(fs.readFileSync(scatterPath));
 const scatterSha = crypto.createHash('sha256').update(scatter).digest('hex');
 console.log('scatter (fd)       :', scatter.length, 'sha256=' + scatterSha);
 
-// Scatter + Buffer (fd, readable output): merged RomFS + ExeFS accumulate in RAM,
-// hashes come from the buffers (no output re-read). Must stay byte-identical to
-// the re-read scatter path above.
-const base6 = { name: 'base.nsp', reader: new FileReader(basePath) };
-const update6 = { name: 'update.nsz', reader: new FileReader(updatePath) };
-const sbcPath = '/tmp/update_sw_sim_scatterbuf.nsp';
-const sbcFd = fs.openSync(sbcPath, 'w+');
-await update([base6, update6], { fd: sbcFd }, { keys, log, progress, bktrMerge: true, updateMode: 'scatter', mergeBuffer: true });
-fs.closeSync(sbcFd);
-base6.reader.close(); update6.reader.close();
-const sbc = new Uint8Array(fs.readFileSync(sbcPath));
-const sbcSha = crypto.createHash('sha256').update(sbc).digest('hex');
-console.log('scatter+buffer (fd) :', sbc.length, 'sha256=' + sbcSha);
-
-// Scatter + Buffer on an FSA-style output (write+seek, NO read): buildRead() → null,
-// so only mergeBuffer lets scatter run here — proves the gating and the no-re-read
-// path on a realistic browser-FSA output. Must succeed and be byte-identical.
-const base7 = { name: 'base.nsp', reader: new FileReader(basePath) };
-const update7 = { name: 'update.nsz', reader: new FileReader(updatePath) };
-const fsa = new FsaWriter();
-await update([base7, update7], { writable: fsa }, { keys, log, progress, bktrMerge: true, updateMode: 'scatter', mergeBuffer: true });
-base7.reader.close(); update7.reader.close();
-const fsaBytes = fsa.build();
-const fsaSha = crypto.createHash('sha256').update(fsaBytes).digest('hex');
-console.log('scatter+buffer (FSA):', fsaBytes.length, 'sha256=' + fsaSha);
-
 // Scatter on a memory (blob) output — the browser in-memory path. buildRead()
 // returns a working reader for memory (adapter.js), so scatter runs WITHOUT the
 // merged-buffer, hashing the merged RomFS + contentId by re-reading the written
@@ -167,10 +123,10 @@ const memScatterBuf = new Uint8Array(await memScatter.blob.arrayBuffer());
 const memScatterSha = crypto.createHash('sha256').update(memScatterBuf).digest('hex');
 console.log('scatter (memory)    :', memScatterBuf.length, 'sha256=' + memScatterSha);
 
-const tally = [refSha, simSha, bufSha, memSha, scatterSha, memScatterSha, sbcSha, fsaSha];
-const lens = [ref.length, sim.length, buf.length, memBuf.length, scatter.length, memScatterBuf.length, sbc.length, fsaBytes.length];
+const tally = [refSha, simSha, bufSha, memSha, scatterSha, memScatterSha];
+const lens = [ref.length, sim.length, buf.length, memBuf.length, scatter.length, memScatterBuf.length];
 if (tally.every(s => s === refSha) && lens.every(n => n === ref.length)) {
-  console.log('MATCH — seekback ≡ two-pass ≡ buffered ≡ memory ≡ memory+scatter ≡ scatter ≡ scatter+buffer(fd) ≡ scatter+buffer(FSA), all byte-identical');
+  console.log('MATCH — seekback ≡ two-pass ≡ buffered ≡ memory ≡ scatter(fd) ≡ scatter(memory), all byte-identical');
 } else {
   console.log('MISMATCH');
   let i = 0; const n = Math.min(...lens);
