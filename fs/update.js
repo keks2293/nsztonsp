@@ -757,8 +757,9 @@ export async function update(readers, output, options = {}) {
         //   append-only output, where the PFS0 header must precede the NCA).
         // Pass 2: stream again → write NCA sequentially to output.
         // Memory: ~200 KB + streaming buffers (vs ~700 MB for buffered path).
-        // Seekable: 2× romfs reads (contentId piggybacks on the write).
-        // Append-only (SW): 3× romfs reads (contentId must be final in Pass 1).
+        // Seekable: 2× exefs + 2× romfs (contentId hashed in Pass 2 alongside the
+        // write — no ExeFS re-stream). Append-only (SW): 3× exefs + 3× romfs
+        // (contentId must be final in Pass 1).
         //
         // One flow for both update kinds; hasBktrRomfs branches only in two
         // spots — the RomFS size source and the RomFS stream factory:
@@ -773,10 +774,10 @@ export async function update(readers, output, options = {}) {
 
             const adapter = await buildAdapter(output, null, { log, progress });
 
-            // Phase 1: pass-1 work is read-only (no output bytes) — exefs 2× +
-            // romfs 1× (2× when contentId must be final after pass 1), mirroring
-            // pass1Total in computeProgramNcaContentId.
-            const pass1Bytes = 2 * exefsSize + (appendOnly ? 2 : 1) * (romfsDataSize || 1);
+            // Phase 1: pass-1 work is read-only (no output bytes) — exefs 1× +
+            // romfs 1× (each 2× when contentId must be final after pass 1),
+            // mirroring pass1Total in computeProgramNcaContentId.
+            const pass1Bytes = (appendOnly ? 2 : 1) * (exefsSize + (romfsDataSize || 1));
             const t0 = performance.now();
             const { size: computedSize, contentId, meta } = await computeProgramNcaContentId({
                 exefsSize, romfsDataSize, titleId: base.cnmt.titleId, keys,
