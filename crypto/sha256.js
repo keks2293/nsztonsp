@@ -23,9 +23,7 @@ const K = [
     0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2
 ];
 
-function swap32(v) {
-    return ((v & 0xff) << 24) | ((v & 0xff00) << 8) | ((v >>> 8) & 0xff00) | ((v >>> 24) & 0xff);
-}
+const K32 = new Uint32Array(K);
 
 export class SHA256 {
     constructor() {
@@ -58,68 +56,46 @@ export class SHA256 {
         return c;
     }
 
-    _compressWords() {
+    _compressAligned(view) {
         const W = this._W;
-        let a = this.h0, b = this.h1, c = this.h2, d = this.h3;
-        let e = this.h4, f = this.h5, g = this.h6, h = this.h7;
-        let t1, t2, s0, s1, ch, maj;
+        let h0 = this.h0, h1 = this.h1, h2 = this.h2, h3 = this.h3;
+        let h4 = this.h4, h5 = this.h5, h6 = this.h6, h7 = this.h7;
+        const wEnd = view.length;
+        for (let wi = 0; wi < wEnd; wi += 16) {
+            for (let i = 0; i < 16; i += 4) {
+                let v;
+                v = view[wi + i];     W[i]     = ((v & 0xff) << 24) | ((v & 0xff00) << 8) | ((v >>> 8) & 0xff00) | ((v >>> 24) & 0xff);
+                v = view[wi + i + 1]; W[i + 1] = ((v & 0xff) << 24) | ((v & 0xff00) << 8) | ((v >>> 8) & 0xff00) | ((v >>> 24) & 0xff);
+                v = view[wi + i + 2]; W[i + 2] = ((v & 0xff) << 24) | ((v & 0xff00) << 8) | ((v >>> 8) & 0xff00) | ((v >>> 24) & 0xff);
+                v = view[wi + i + 3]; W[i + 3] = ((v & 0xff) << 24) | ((v & 0xff00) << 8) | ((v >>> 8) & 0xff00) | ((v >>> 24) & 0xff);
+            }
 
-        for (let j = 16; j < 64; ++j) {
-            t1 = W[j - 15];
-            s0 = ((t1 >>> 7) | (t1 << 25)) ^ ((t1 >>> 18) | (t1 << 14)) ^ (t1 >>> 3);
-            t1 = W[j - 2];
-            s1 = ((t1 >>> 17) | (t1 << 15)) ^ ((t1 >>> 19) | (t1 << 13)) ^ (t1 >>> 10);
-            W[j] = (W[j - 16] + s0 + W[j - 7] + s1) | 0;
+            for (let j = 16; j < 64; ++j) {
+                let u = W[j - 2];
+                const t1 = (u >>> 17 | u << 15) ^ (u >>> 19 | u << 13) ^ (u >>> 10);
+                u = W[j - 15];
+                const t2 = (u >>> 7 | u << 25) ^ (u >>> 18 | u << 14) ^ (u >>> 3);
+                W[j] = (t1 + W[j - 7] | 0) + (t2 + W[j - 16] | 0);
+            }
+
+            let a = h0, b = h1, c = h2, d = h3, e = h4, f = h5, g = h6, h = h7;
+            for (let j = 0; j < 64; ++j) {
+                const t1 = (((((e >>> 6 | e << 26) ^ (e >>> 11 | e << 21) ^ (e >>> 25 | e << 7)) + ((e & f) ^ (~e & g))) | 0) + ((h + ((K32[j] + W[j]) | 0)) | 0)) | 0;
+                const t2 = ((((a >>> 2 | a << 30) ^ (a >>> 13 | a << 19) ^ (a >>> 22 | a << 10)) + ((a & b) ^ (a & c) ^ (b & c))) | 0);
+                h = g; g = f; f = e; e = (d + t1) | 0; d = c; c = b; b = a; a = (t1 + t2) | 0;
+            }
+
+            h0 = (h0 + a) | 0;
+            h1 = (h1 + b) | 0;
+            h2 = (h2 + c) | 0;
+            h3 = (h3 + d) | 0;
+            h4 = (h4 + e) | 0;
+            h5 = (h5 + f) | 0;
+            h6 = (h6 + g) | 0;
+            h7 = (h7 + h) | 0;
         }
-
-        let bc = b & c;
-        for (let j = 0; j < 64; j += 4) {
-            s0 = ((a >>> 2) | (a << 30)) ^ ((a >>> 13) | (a << 19)) ^ ((a >>> 22) | (a << 10));
-            s1 = ((e >>> 6) | (e << 26)) ^ ((e >>> 11) | (e << 21)) ^ ((e >>> 25) | (e << 7));
-            const ab = a & b;
-            maj = ab ^ (a & c) ^ bc;
-            ch = (e & f) ^ (~e & g);
-            t1 = h + s1 + ch + K[j] + W[j];
-            t2 = s0 + maj;
-            h = d + t1 | 0;
-            d = t1 + t2 | 0;
-            s0 = ((d >>> 2) | (d << 30)) ^ ((d >>> 13) | (d << 19)) ^ ((d >>> 22) | (d << 10));
-            s1 = ((h >>> 6) | (h << 26)) ^ ((h >>> 11) | (h << 21)) ^ ((h >>> 25) | (h << 7));
-            const da = d & a;
-            maj = da ^ (d & b) ^ ab;
-            ch = (h & e) ^ (~h & f);
-            t1 = g + s1 + ch + K[j + 1] + W[j + 1];
-            t2 = s0 + maj;
-            g = c + t1 | 0;
-            c = t1 + t2 | 0;
-            s0 = ((c >>> 2) | (c << 30)) ^ ((c >>> 13) | (c << 19)) ^ ((c >>> 22) | (c << 10));
-            s1 = ((g >>> 6) | (g << 26)) ^ ((g >>> 11) | (g << 21)) ^ ((g >>> 25) | (g << 7));
-            const cd = c & d;
-            maj = cd ^ (c & a) ^ da;
-            ch = (g & h) ^ (~g & e);
-            t1 = f + s1 + ch + K[j + 2] + W[j + 2];
-            t2 = s0 + maj;
-            f = b + t1 | 0;
-            b = t1 + t2 | 0;
-            s0 = ((b >>> 2) | (b << 30)) ^ ((b >>> 13) | (b << 19)) ^ ((b >>> 22) | (b << 10));
-            s1 = ((f >>> 6) | (f << 26)) ^ ((f >>> 11) | (f << 21)) ^ ((f >>> 25) | (f << 7));
-            bc = b & c;
-            maj = bc ^ (b & d) ^ cd;
-            ch = (f & g) ^ (~f & h);
-            t1 = e + s1 + ch + K[j + 3] + W[j + 3];
-            t2 = s0 + maj;
-            e = a + t1 | 0;
-            a = t1 + t2 | 0;
-        }
-
-        this.h0 = (this.h0 + a) | 0;
-        this.h1 = (this.h1 + b) | 0;
-        this.h2 = (this.h2 + c) | 0;
-        this.h3 = (this.h3 + d) | 0;
-        this.h4 = (this.h4 + e) | 0;
-        this.h5 = (this.h5 + f) | 0;
-        this.h6 = (this.h6 + g) | 0;
-        this.h7 = (this.h7 + h) | 0;
+        this.h0 = h0; this.h1 = h1; this.h2 = h2; this.h3 = h3;
+        this.h4 = h4; this.h5 = h5; this.h6 = h6; this.h7 = h7;
     }
 
     update(data) {
@@ -136,9 +112,7 @@ export class SHA256 {
             this._blen += take;
             offset = take;
             if (this._blen === 64) {
-                const W = this._W;
-                for (let i = 0; i < 16; i++) W[i] = swap32(this._word[i]);
-                this._compressWords();
+                this._compressAligned(this._word);
                 this._blen = 0;
             }
         }
@@ -146,28 +120,14 @@ export class SHA256 {
         if (this._blen === 0 && offset < length && length - offset >= 64 && !((data.byteOffset + offset) & 3)) {
             const full = ((length - offset) >> 6) << 6;
             const view = new Int32Array(data.buffer, data.byteOffset + offset, full >> 2);
-            let wi = 0;
-            const wEnd = full >> 2;
-            const W = this._W;
-            while (wi < wEnd) {
-                for (let i = 0; i < 16; i += 4) {
-                    W[i] = swap32(view[wi + i]);
-                    W[i + 1] = swap32(view[wi + i + 1]);
-                    W[i + 2] = swap32(view[wi + i + 2]);
-                    W[i + 3] = swap32(view[wi + i + 3]);
-                }
-                this._compressWords();
-                wi += 16;
-            }
+            this._compressAligned(view);
             offset += full;
         }
 
         while (offset < length) {
             this._byte[this._blen++] = data[offset++];
             if (this._blen === 64) {
-                const W = this._W;
-                for (let i = 0; i < 16; i++) W[i] = swap32(this._word[i]);
-                this._compressWords();
+                this._compressAligned(this._word);
                 this._blen = 0;
             }
         }
@@ -183,22 +143,28 @@ export class SHA256 {
     _finalize() {
         if (this.finalized) return;
         this.finalized = true;
-        const { _byte, _word, _W: W } = this;
+        const { _byte, _word } = this;
         let i = this._blen;
         _byte[i++] = 0x80;
         while (i & 3) _byte[i++] = 0;
+        const hi = ((this.hBytes << 3) | (this.bytes >>> 29)) | 0;
+        const lo = (this.bytes << 3) | 0;
         let wi = i >> 2;
         if (wi > 14) {
             while (wi < 16) _word[wi++] = 0;
-            for (let j = 0; j < 16; j++) W[j] = swap32(_word[j]);
-            this._compressWords();
+            this._compressAligned(_word);
             wi = 0;
         }
         while (wi < 16) _word[wi++] = 0;
-        for (let j = 0; j < 16; j++) W[j] = swap32(_word[j]);
-        W[14] = ((this.hBytes << 3) | (this.bytes >>> 29)) | 0;
-        W[15] = (this.bytes << 3) | 0;
-        this._compressWords();
+        _byte[56] = (hi >>> 24) & 0xff;
+        _byte[57] = (hi >>> 16) & 0xff;
+        _byte[58] = (hi >>> 8) & 0xff;
+        _byte[59] = hi & 0xff;
+        _byte[60] = (lo >>> 24) & 0xff;
+        _byte[61] = (lo >>> 16) & 0xff;
+        _byte[62] = (lo >>> 8) & 0xff;
+        _byte[63] = lo & 0xff;
+        this._compressAligned(_word);
     }
 
     hex() {
