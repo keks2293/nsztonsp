@@ -301,13 +301,18 @@ export async function scatterRomFS({ baseInput, updateCtx, options, writeFn, log
         nextVirt: i + 1 < relocBlock.entries.length ? relocBlock.entries[i + 1].virtOffset : totalSize,
     }));
 
+    // Progress reports BYTES WRITTEN (monotonic), not virtual offsets: Pass U walks
+    // patch entries in physical order, so virtual positions jump up and down and
+    // would make any progress bar rewind.
+    let reportBytes = 0;
     const scatterWrite = async (chunk, virtOffset) => {
         const a = Math.max(virtOffset, dataStart);
         const b = Math.min(virtOffset + chunk.length, dataEnd);
         if (b > a) {
             await writeFn(a - dataStart, chunk.subarray(a - virtOffset, b - virtOffset));
+            reportBytes += b - a;
         }
-        onProgress?.(virtOffset + chunk.length, totalSize);
+        onProgress?.(Math.min(reportBytes, totalSize), totalSize);
         await yieldToEventLoop();
     };
 
