@@ -1,9 +1,11 @@
 // Real-pipeline A/B: the exact browser SW two-pass update (append-only writable,
-// no seek/read-back) on the real base+update NSZ pair, output DISCARED (no disk
-// writes — AGENTS.md rule). Verifies both SHA-256 backends produce byte-identical
-// output (fed into a node:crypto hash as writes arrive) and reports best-of-N.
+// no seek/read-back) vs the seekable streaming path (memory output with read-back,
+// mergeRomFS streams straight out, contentId re-read from the written blob) on the
+// real base+update NSZ pair. Output is DISCARED / hashed only (no disk writes —
+// AGENTS.md rule). Verifies both SHA-256 backends and both paths produce
+// byte-identical output and reports best-of-N.
 // Native node:crypto streaming is the default; --js forces the pure-JS class.
-// Usage (from repo root):  node scripts/bench_real_update.mjs [--js] [--n 3]
+// Usage (from repo root):  node scripts/bench_real_update.mjs [--js] [--n 3] [--streaming]
 import fs from 'fs';
 import crypto from 'node:crypto';
 import { KeysParser } from '../keys.js';
@@ -13,6 +15,9 @@ const DIR = '/Users/rmitkov/Downloads/Stardew Valley [NSZ]';
 const basePath = process.env.BASE_PATH || `${DIR}/Stardew Valley [0100E65002BB8000][v0] (0.87 GB).nsz`;
 const updatePath = process.env.UPDATE_PATH || `${DIR}/Stardew Valley [0100E65002BB8800][v1310720] (0.67 GB).nsz`;
 const N = parseInt(process.argv[process.argv.indexOf('--n') + 1] || '3', 10);
+const STREAMING = process.argv.includes('--streaming');
+const BUFFERED = process.argv.includes('--buffered');
+console.log(`path: ${BUFFERED ? 'buffered merge-to-RAM (1x romfs decompress)' : STREAMING ? 'seekable streaming (memory + read-back, 1 romfs decompress)' : 'SW two-pass append-only (3x romfs decompress)'}`);
 
 if (process.argv.includes('--js')) {
   const { setForceJsSha256 } = await import('../crypto/sha256.js');
@@ -57,14 +62,29 @@ const log = (level, msg) => {
 const runs = [];
 for (let i = 0; i < N; i++) {
   const [b, u] = makeInputs();
-  const out = new HashWriter();
   const t0 = performance.now();
-  await update([b, u], { writable: out }, { keys, log, progress: silence, bktrMerge: true });
-  const dt = (performance.now() - t0) / 1000;
+  let rec;
+  if (STREAMING) {
+    // Seekable streaming path: memory output + read-back (identical to the fd
+    // "ref" arm of test_update_sw_sim.mjs) — no `writeProgramNcaTwoPass`.
+    const res = await update([b, u], { memory: true }, { keys, log, progress: silence, bktrMerge: true });
+    const buf = new Uint8Array(await res.blob.arrayBuffer());
+    rec = { s: (performance.now() - t0) / 1000, sha: crypto.createHash('sha256').update(buf).digest('hex'), total: buf.byteLength };
+  } else if (BUFFERED) {
+    // Buffered path (the browser "Buffer"/"Scatter" pills on a seekable output):
+    // merged RomFS fully in RAM (1x decompress), hash precompute from the buffer.
+    const res = await update([b, u], { memory: true }, { keys, log, progress: silence, bktrMerge: true, updateMode: 'buffered' });
+    const buf = new Uint8Array(await res.blob.arrayBuffer());
+    rec = { s: (performance.now() - t0) / 1000, sha: crypto.createHash('sha256').update(buf).digest('hex'), total: buf.byteLength };
+  } else {
+    // SW two-pass append-only: writable without read-back (HashWriter).
+    const out = new HashWriter();
+    await update([b, u], { writable: out }, { keys, log, progress: silence, bktrMerge: true });
+    rec = { s: (performance.now() - t0) / 1000, sha: out.digest(), total: out.total };
+  }
   b.reader.close(); u.reader.close();
-  const rec = { s: dt, sha: out.digest(), total: out.total };
   runs.push(rec);
-  console.log(`run ${i + 1}: ${rec.s.toFixed(1)}s  (${(rec.total / dt / 1048576).toFixed(0)} MB/s, sha=${rec.sha.slice(0, 16)})`);
+  console.log(`run ${i + 1}: ${rec.s.toFixed(1)}s  (${(rec.total / rec.s / 1048576).toFixed(0)} MB/s, sha=${rec.sha.slice(0, 16)})`);
 }
 
 const best = runs.reduce((a, b) => (b.s < a.s ? b : a));
