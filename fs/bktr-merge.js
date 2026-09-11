@@ -138,6 +138,51 @@ async function readBktrTables(updateSource, meta) {
 
 const SCRATCH_CHUNK = 0x1000000; // 16 MB
 
+// Shared per-run walkers used by both merge strategies. The base-copy run and
+// the patch-subsection walk are byte-identical between mergeRomFS (virtual
+// order) and scatterRomFS (physical order) — only the sink differs.
+//   sink(chunk, virtOffset) is called with each decrypted chunk at its VIRTUAL
+//   offset inside the merged RomFS.
+
+// Copy a contiguous virtual run of a non-patch entry from the base source
+// (CTR-decrypted), feeding each chunk to sink.
+async function readBaseRun(baseSource, baseRomfsSecMetaOffset, baseRomfsSecSize, baseCtr, physOffset, virtOffset, runLen, sink) {
+    if (physOffset + runLen > baseRomfsSecSize) {
+        throw new Error(`BKTR: base read OOB at 0x${physOffset.toString(16)}`);
+    }
+    let done = 0;
+    while (done < runLen) {
+        const n = Math.min(SCRATCH_CHUNK, runLen - done);
+        const phys = baseRomfsSecMetaOffset + physOffset + done;
+        const cipher = await baseSource.read(phys, n);
+        baseCtr.seek(phys);
+        const dec = await baseCtr.decrypt(cipher);
+        await sink(dec, virtOffset + done);
+        done += n;
+    }
+}
+
+// Decrypt a contiguous virtual run of a patch entry from the update source,
+// subsection-by-subsection, feeding each chunk to sink.
+async function readPatchRun(updReader, updateRomfsSecOffset, subBlock, titlekey, secureValue, physOffset, virtOffset, runLen, sink) {
+    let writePos = 0;
+    while (writePos < runLen) {
+        const phys = physOffset + writePos;
+        const absPhys = updateRomfsSecOffset + phys;
+        const subEntry = findSubsectionEntry(subBlock.entries, phys);
+        if (!subEntry) throw new Error(`BKTR: no subsection entry for physOffset 0x${phys.toString(16)}`);
+        const nxt = subEntryIdx(subBlock.entries, phys) + 1 < subBlock.entries.length
+            ? subBlock.entries[subEntryIdx(subBlock.entries, phys) + 1].offset : Infinity;
+        const remainingInSub = nxt - phys;
+        const remainingToWrite = runLen - writePos;
+        const readLen = Math.min(remainingInSub, remainingToWrite, SCRATCH_CHUNK);
+        const patchRaw = await updReader.read(absPhys, readLen);
+        const chunk = await decryptPatchRegionData(patchRaw, titlekey, secureValue, subEntry, absPhys);
+        await sink(chunk, virtOffset + writePos);
+        writePos += readLen;
+    }
+}
+
 // ── Virtual-order merge (default) ─────────────────────────────────────────────
 export async function mergeRomFS(baseNcaData, updateNcaData, options = {}) {
     const { keys, onChunk, onProgress } = options;
@@ -195,47 +240,14 @@ export async function mergeRomFS(baseNcaData, updateNcaData, options = {}) {
         const readSize = chunkEnd - pos;
 
         if (entry.isPatch) {
-            // Decrypt patch from update NCA using AesCtrEx
-            let writePos = pos;
-            let currentPhys = entry.physOffset + (pos - entry.virtOffset);
-
-            while (writePos < chunkEnd) {
-                const subEntry = findSubsectionEntry(subBlock.entries, currentPhys);
-                if (!subEntry) {
-                    throw new Error(`BKTR: no subsection entry for physOffset 0x${currentPhys.toString(16)}`);
-                }
-                const nextSubOff = subEntryIdx(subBlock.entries, currentPhys) + 1 < subBlock.entries.length
-                    ? subBlock.entries[subEntryIdx(subBlock.entries, currentPhys) + 1].offset
-                    : Infinity;
-                const remainingInSub = nextSubOff - currentPhys;
-                const remainingToWrite = chunkEnd - writePos;
-                const readLen = Math.min(remainingInSub, remainingToWrite, SCRATCH_CHUNK);
-
-                const fileOffset = updateRomfsSec.offset + currentPhys;
-                const patchRaw = await updateNcaData.source.read(fileOffset, readLen);
-                const chunk = await decryptPatchRegionData(
-                    patchRaw, updateTitlekey, secureValue, subEntry, fileOffset
-                );
-                await emitChunk(chunk, writePos);
-
-                writePos += readLen;
-                currentPhys += readLen;
-            }
+            // Decrypt patch from update NCA using AesCtrEx (run at pos).
+            await readPatchRun(updateNcaData.source, updateRomfsSec.offset, subBlock,
+                updateTitlekey, secureValue,
+                entry.physOffset + (pos - entry.virtOffset), pos, readSize, emitChunk);
         } else {
-            // Copy from base romfs
-            const baseOffset = entry.physOffset + (pos - entry.virtOffset);
-            if (baseOffset + readSize > baseRomfsSecMeta.size) {
-                throw new Error(`BKTR: base read OOB at 0x${baseOffset.toString(16)}`);
-            }
-            let done = 0;
-            while (done < readSize) {
-                const n = Math.min(SCRATCH_CHUNK, readSize - done);
-                const cipher = await baseNcaData.source.read(baseRomfsSecMeta.offset + baseOffset + done, n);
-                baseCtr.seek(baseRomfsSecMeta.offset + baseOffset + done);
-                const dec = await baseCtr.decrypt(cipher);
-                await emitChunk(dec, pos + done);
-                done += n;
-            }
+            // Copy from base romfs (run at pos).
+            await readBaseRun(baseNcaData.source, baseRomfsSecMeta.offset, baseRomfsSecMeta.size, baseCtr,
+                entry.physOffset + (pos - entry.virtOffset), pos, readSize, emitChunk);
         }
 
         pos = chunkEnd;
@@ -333,17 +345,8 @@ export async function scatterRomFS({ baseInput, updateCtx, options, writeFn, log
     const baseCtr = new AesCtr(baseTitlekey, baseNonce);
     for (const e of entries) {
         if (e.isPatch) continue;
-        const runLen = e.nextVirt - e.virtOffset;
-        let done = 0;
-        while (done < runLen) {
-            const n = Math.min(SCRATCH_CHUNK, runLen - done);
-            const phys = baseRomfsSecMeta.offset + (e.physOffset + done);
-            const cipher = await baseSource.read(phys, n);
-            baseCtr.seek(phys);
-            const dec = await baseCtr.decrypt(cipher);
-            await scatterWrite(dec, e.virtOffset + done);
-            done += n;
-        }
+        await readBaseRun(baseSource, baseRomfsSecMeta.offset, baseRomfsSecMeta.size, baseCtr,
+            e.physOffset, e.virtOffset, e.nextVirt - e.virtOffset, scatterWrite);
     }
 
     // ── Pass U: patch regions, physical order ──────────────────────────────
@@ -363,23 +366,9 @@ export async function scatterRomFS({ baseInput, updateCtx, options, writeFn, log
     }
 
     for (const r of patchEntries) {
-        const e = r.e;
-        let writePos = 0;
-        while (writePos < r.runLen) {
-            const phys = e.physOffset + writePos;
-            const absPhys = updateRomfsSec.offset + phys;
-            const subEntry = findSubsectionEntry(subBlock.entries, phys);
-            if (!subEntry) throw new Error(`BKTR scatter: no subsection entry for physOffset 0x${phys.toString(16)}`);
-            const nxt = subEntryIdx(subBlock.entries, phys) + 1 < subBlock.entries.length
-                ? subBlock.entries[subEntryIdx(subBlock.entries, phys) + 1].offset : Infinity;
-            const remainingInSub = nxt - phys;
-            const remainingToWrite = r.runLen - writePos;
-            const readLen = Math.min(remainingInSub, remainingToWrite, SCRATCH_CHUNK);
-            const patchRaw = await updReader.read(absPhys, readLen);
-            const chunk = await decryptPatchRegionData(patchRaw, updateTitlekey, secureValue, subEntry, absPhys);
-            await scatterWrite(chunk, e.virtOffset + writePos);
-            writePos += readLen;
-        }
+        await readPatchRun(updReader, updateRomfsSec.offset, subBlock,
+            updateTitlekey, secureValue,
+            r.e.physOffset, r.e.virtOffset, r.runLen, scatterWrite);
     }
 
     return { dataLevelOffset, dataLevelSize, relocEntries: entries.length, subsectionEntries: subBlock.entries.length };
