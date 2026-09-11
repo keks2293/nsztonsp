@@ -195,7 +195,26 @@ export class StreamingIvfcHasher {
         // of a completed block runs asynchronously while the stream continues.
         this.batcher = new BatchDigestor();
     }
-    update(chunk) {
+    update(chunk, borrow = false) {
+        // Borrowed fast path: when the caller guarantees the chunk buffer is
+        // stable until its digests resolve (fresh per-read allocations), whole
+        // block-aligned spans go straight to the batcher as views — zero copy
+        // for the interior blocks. Only a chunk tail that straddles a block
+        // boundary needs the pool then.
+        if (borrow && this.bufLen === 0 && chunk.length >= IVFC_HASH_BLOCK_SIZE) {
+            const full = chunk.length - (chunk.length % IVFC_HASH_BLOCK_SIZE);
+            for (let off = 0; off < full; off += IVFC_HASH_BLOCK_SIZE) {
+                const block = chunk.subarray(off, off + IVFC_HASH_BLOCK_SIZE);
+                const idx = this.blockIdx++;
+                this.batcher.submit(block, (d) => this.h1.set(d, idx * IVFC_HASH_SIZE));
+            }
+            const rest = chunk.length - full;
+            if (rest > 0) {
+                this.buf.set(chunk.subarray(full), 0);
+                this.bufLen = rest;
+            }
+            return;
+        }
         let off = 0;
         while (off < chunk.length) {
             const space = IVFC_HASH_BLOCK_SIZE - this.bufLen;
@@ -271,7 +290,22 @@ export class StreamingPfs0Hasher {
         this._hashCount = 0;
         this.batcher = new BatchDigestor();
     }
-    update(chunk) {
+    update(chunk, borrow = false) {
+        if (borrow && this.bufLen === 0 && chunk.length >= this.hashBlock) {
+            const full = chunk.length - (chunk.length % this.hashBlock);
+            for (let off = 0; off < full; off += this.hashBlock) {
+                const block = chunk.subarray(off, off + this.hashBlock);
+                const idx = this._hashCount++;
+                this._ensureCapacity((idx + 1) * IVFC_HASH_SIZE);
+                this.batcher.submit(block, (d) => this._hashBuf.set(d, idx * IVFC_HASH_SIZE));
+            }
+            const rest = chunk.length - full;
+            if (rest > 0) {
+                this.buf.set(chunk.subarray(full), 0);
+                this.bufLen = rest;
+            }
+            return;
+        }
         let off = 0;
         while (off < chunk.length) {
             const space = this.hashBlock - this.bufLen;
@@ -308,7 +342,9 @@ export class StreamingPfs0Hasher {
         if (this.bufLen > 0) {
             const idx = this._hashCount++;
             this._ensureCapacity((idx + 1) * IVFC_HASH_SIZE);
-            this.batcher.submit(this.buf.slice(0, this.bufLen), (d) => this._hashBuf.set(d, idx * IVFC_HASH_SIZE));
+            // finalize() is terminal — the assemble buffer is never written again,
+            // so the last partial block (hashed as-is, no padding) goes as a view.
+            this.batcher.submit(this.buf.subarray(0, this.bufLen), (d) => this._hashBuf.set(d, idx * IVFC_HASH_SIZE));
         }
         await this.batcher.drain();
         const hashTable = this._hashBuf.subarray(0, this._hashCount * IVFC_HASH_SIZE);
@@ -1057,7 +1093,7 @@ export async function packProgramNcaStream({ adapter, ncaOffset, exefsSize, romf
     await streamExefs(async (chunk, off) => {
         const n = chunk.length;
         await adapter.write(ncaOffset + sec0DataOff + off, chunk);
-        pfs0.update(chunk);
+        pfs0.update(chunk, true);
         rep(n);
     });
     const exeHash = await pfs0.finalize();
@@ -1080,7 +1116,7 @@ export async function packProgramNcaStream({ adapter, ncaOffset, exefsSize, romf
             let roff = 0;
             while (roff < romfsDataSize) {
                 const n = Math.min(0x1000000, romfsDataSize - roff);
-                ivfc.update(await adapter.read(ncaOffset + sec1DataOff + roff, n));
+                ivfc.update(await adapter.read(ncaOffset + sec1DataOff + roff, n), true);
                 roff += n;
                 rep(n);
             }
@@ -1092,7 +1128,7 @@ export async function packProgramNcaStream({ adapter, ncaOffset, exefsSize, romf
         await streamRomfs(async (chunk, off) => {
             const n = chunk.length;
             await adapter.write(ncaOffset + sec1DataOff + off, chunk);
-            ivfc.update(chunk);
+            ivfc.update(chunk, true);
             rep(n);
         });
         romIvfc = await ivfc.finalize();
@@ -1216,13 +1252,13 @@ export async function computeProgramNcaContentId({ exefsSize, romfsDataSize, tit
     _log('info', '  Pass 1: Computing hash metadata (1 romfs pass)...');
     let t0 = performance.now();
     const pfs0 = new StreamingPfs0Hasher(PFS0_EXEFS_HASH_BLOCK_SIZE);
-    await streamExefs(async (chunk, off) => { pfs0.update(chunk); rep(chunk.length); });
+    await streamExefs(async (chunk, off) => { pfs0.update(chunk, true); rep(chunk.length); });
     _log('info', `[timing] Pass 1 ExeFS (PFS0 hash): ${((performance.now() - t0) / 1000).toFixed(1)}s (${(exefsSize / 1048576).toFixed(0)} MB)`);
     const exeHash = await pfs0.finalize();
 
     const ivfc = new StreamingIvfcHasher(romfsDataSize);
     t0 = performance.now();
-    await streamRomfs(async (chunk, off) => { ivfc.update(chunk); rep(chunk.length); });
+    await streamRomfs(async (chunk, off) => { ivfc.update(chunk, true); rep(chunk.length); });
     _log('info', `[timing] Pass 1 RomFS (IVFC merge): ${((performance.now() - t0) / 1000).toFixed(1)}s (${(romfsDataSize / 1048576).toFixed(0)} MB)`);
     const romIvfc = await ivfc.finalize();
 
