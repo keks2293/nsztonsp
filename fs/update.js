@@ -192,14 +192,9 @@ async function rebuildCnmtNca(baseMeta, updateMeta, keys, log, mergedProgram = n
 // sequential — a section past the file start can only be reached by decoding
 // everything before it — so pulling several sections in one pass avoids a full
 // re-decompression for each extra section (e.g. update BKTR + ExeFS). Returns
-// the raw section buffers in the same order as `ranges`.
-async function extractNcaSections(reader, ranges, kind, keys, log) {
-    if (kind !== 'ncz') {
-        const bufs = [];
-        for (const r of ranges) bufs.push(await reader.read(r.offset, r.size));
-        return bufs;
-    }
-
+// the raw section buffers in the same order as `ranges`. Callers are always NCZ
+// (the raw-container read path is covered by FileRangeSource).
+async function extractNcaSections(reader, ranges, keys, log) {
     const parsed = await parseNczSections(reader);
     const last = ranges[ranges.length - 1];
     const lastEnd = last.offset + last.size;
@@ -348,6 +343,16 @@ async function writeFinalPfs0Header({ adapter, contentId, programSize, otherNcas
     return { pw, pfs0Header, totalData, rebuilt, programNcaPfs0Offset };
 }
 
+// The Program NCA is the first PFS0 member (data offset 0), so its output
+// offset is the PFS0 header size — a pure function of the fixed member name
+// lengths, knowable before the contentId.
+function programPfs0Offset(otherNcas) {
+    return pfs0HeaderSize(
+        [PROGRAM_NCA_NAME_LEN, ...otherNcas.map(m => m.name.length), CNMT_NAME_LEN],
+        { fixPadding: true, headerAlign: 0x10 },
+    );
+}
+
 // Shared PFS0 tail (final step): write the non-Program NCAs + CNMT, finish,
 // and report the tail timing.
 async function finalizeNspTail(adapter, { pw, pfs0Header, otherNcas, totalData, rebuilt, output, log, progress, phaseLabel, phaseBaseDone, phaseTotal }) {
@@ -390,10 +395,7 @@ async function writeTwoPassProgramAndFinish({ adapter, base, update, keys, log, 
         ({ pw, pfs0Header, totalData, rebuilt, programNcaPfs0Offset } = await writeFinalPfs0Header({ adapter, contentId, programSize, otherNcas, base, update, keys, log }));
         log('info', `[timing] CNMT + PFS0 header: ${((performance.now() - t0) / 1000).toFixed(1)}s`);
     } else {
-        programNcaPfs0Offset = pfs0HeaderSize(
-            [PROGRAM_NCA_NAME_LEN, ...otherNcas.map(m => m.name.length), CNMT_NAME_LEN],
-            { fixPadding: true, headerAlign: 0x10 },
-        );
+        programNcaPfs0Offset = programPfs0Offset(otherNcas);
     }
     t0 = performance.now();
     const id = await writeProgramNcaTwoPass({
@@ -615,7 +617,7 @@ export async function update(readers, output, options = {}) {
                 updRanges.push({ offset: updateExefsSec.offset, size: updateExefsSec.endOffset - updateExefsSec.offset });
                 log('info', `Extracting update NCZ sections in one pass: ${updRanges.map(r => `[0x${r.offset.toString(16)}..0x${(r.offset + r.size).toString(16)})`).join(', ')}...`);
                 await yieldToEventLoop();
-                const updData = await extractNcaSections(updateReader, updRanges, updateKind, keys, log);
+                const updData = await extractNcaSections(updateReader, updRanges, keys, log);
                 const updateSections = [];
                 let u = 0;
                 if (hasBktrRomfs && updateRomfsSec) updateSections.push({ offset: updateRomfsSec.offset, data: updData[u++] });
@@ -704,10 +706,7 @@ export async function update(readers, output, options = {}) {
             // The Program NCA is the first file (data offset 0), so its output
             // offset is the PFS0 header size — a pure function of the member name
             // lengths (all fixed before the contentId is known, see above).
-            const programNcaPfs0Offset = pfs0HeaderSize(
-                [PROGRAM_NCA_NAME_LEN, ...otherNcas.map(m => m.name.length), CNMT_NAME_LEN],
-                { fixPadding: true, headerAlign: 0x10 },
-            );
+            const programNcaPfs0Offset = programPfs0Offset(otherNcas);
             log('info', `PFS0 layout: ${programNcaPfs0Offset} bytes header, ${otherNcas.length + 2} members, Program NCA at 0x${programNcaPfs0Offset.toString(16)}`);
 
             // One write phase: program work (exefs + romfs writes + the full-NCA
