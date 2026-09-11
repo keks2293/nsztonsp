@@ -292,9 +292,10 @@ class AesXts {
         this.k2 = key.subarray(16, 32);
         const aesEnc = new AesEcb(this.k2);
         const aesDec = new AesEcb(this.k1);
+        const aesEncData = new AesEcb(this.k1);
         this._encTweak = (tweakBytes) => aesEnc.encryptBlock(tweakBytes);
         this._decData = (block) => aesDec.decryptBlock(block);
-        this._encData = (block) => new AesEcb(this.k1).encryptBlock(block);
+        this._encData = (block) => aesEncData.encryptBlock(block);
     }
 
     decrypt(data, startSector = 0) {
