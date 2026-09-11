@@ -13,39 +13,39 @@ export function parseBktrHeader(fsHdr, offset) {
     };
 }
 
-// Decrypt BKTR table ciphertext using AES-ECB with custom counter
-// (AesCtr.seek gives wrong counter for BKTR tables, hence manual counter).
-// cipher = the table region bytes; absOffset = their absolute NCA offset
-// (used for the per-16-byte-block counter, exactly as hactool does).
-export async function decryptBktrTableData(cipher, titlekey, nonce, absOffset) {
+// Shared AES-ECB block-counter ("AesCtrEx") loop: for each 16-byte block, the
+// constant counter head [0:8) is combined with the BE64 block index in [8:16),
+// the counter block is AES-ECB-encrypted to a keystream, and the cipher text
+// block is XORed with it. Both BKTR table and patch-region decryption are this
+// exact loop — only the counter head construction differs. Output == cipher size.
+function aesCtrExBlockLoop(aes, cipher, counterHead, offsetBase) {
     const size = cipher.length;
     const result = new Uint8Array(size);
-    const aes = new AesEcb(titlekey);
     const counter = new Uint8Array(16);
-    let pos = 0;
+    counter.set(counterHead, 0);
 
-    while (pos < size) {
+    for (let pos = 0; pos < size; pos += 16) {
         const chunkEnd = Math.min(pos + 16, size);
-        const fileOffsetForBlock = absOffset + pos;
-
-        counter.set(nonce, 0);
-        const blockIndex = Math.floor(fileOffsetForBlock / 16);
-        let tmp = blockIndex;
+        let tmp = (offsetBase + pos) / 16;
         for (let j = 15; j >= 8; j--) {
             counter[j] = tmp & 0xFF;
             tmp >>= 8;
         }
-
         const keystream = aes.encryptBlock(counter);
         const rawBlock = cipher.subarray(pos, chunkEnd);
         for (let i = 0; i < chunkEnd - pos; i++) {
             result[pos + i] = rawBlock[i] ^ keystream[i];
         }
-
-        pos += chunkEnd - pos;
     }
-
     return result;
+}
+
+// Decrypt BKTR table ciphertext using AES-ECB with custom counter
+// (AesCtr.seek gives wrong counter for BKTR tables, hence manual counter).
+// cipher = the table region bytes; absOffset = their absolute NCA offset
+// (used for the per-16-byte-block counter, exactly as hactool does).
+export async function decryptBktrTableData(cipher, titlekey, nonce, absOffset) {
+    return aesCtrExBlockLoop(new AesEcb(titlekey), cipher, nonce, absOffset);
 }
 
 // Parse relocation block per hactool bktr.h bktr_relocation_block_t
@@ -127,46 +127,19 @@ export function subEntryIdx(entries, physOffset) {
 //   ctr[4:8] = subEntry.ctrVal BE (generation from BKTR entry, u32 LE → BE)
 //   ctr[8:16] = fileOffset/16 BE
 export async function decryptPatchRegionData(cipher, titlekey, secureValue, subEntry, fileOffset) {
-    const size = cipher.length;
-    const result = new Uint8Array(size);
-    let pos = 0;
-    const counter = new Uint8Array(16);
-    const aes = new AesEcb(titlekey);
-
+    const counterHead = new Uint8Array(8);
     // ctr[0:4] = secure_value BE (constant for all blocks)
-    counter[0] = (secureValue >> 24) & 0xFF;
-    counter[1] = (secureValue >> 16) & 0xFF;
-    counter[2] = (secureValue >> 8) & 0xFF;
-    counter[3] = secureValue & 0xFF;
+    counterHead[0] = (secureValue >> 24) & 0xFF;
+    counterHead[1] = (secureValue >> 16) & 0xFF;
+    counterHead[2] = (secureValue >> 8) & 0xFF;
+    counterHead[3] = secureValue & 0xFF;
+    // ctr[4:8] = ctrVal BE (constant for this subsection)
+    counterHead[4] = (subEntry.ctrVal >> 24) & 0xFF;
+    counterHead[5] = (subEntry.ctrVal >> 16) & 0xFF;
+    counterHead[6] = (subEntry.ctrVal >> 8) & 0xFF;
+    counterHead[7] = subEntry.ctrVal & 0xFF;
 
-    while (pos < size) {
-        const chunkEnd = Math.min(pos + 16, size);
-        const fileOffsetForBlock = fileOffset + pos;
-
-        // ctr[4:8] = ctrVal BE (constant for this subsection)
-        counter[4] = (subEntry.ctrVal >> 24) & 0xFF;
-        counter[5] = (subEntry.ctrVal >> 16) & 0xFF;
-        counter[6] = (subEntry.ctrVal >> 8) & 0xFF;
-        counter[7] = subEntry.ctrVal & 0xFF;
-
-        // ctr[8:16] = blockIndex BE
-        const bi = Math.floor(fileOffsetForBlock / 16);
-        let tmp = bi;
-        for (let j = 15; j >= 8; j--) {
-            counter[j] = tmp & 0xFF;
-            tmp >>= 8;
-        }
-
-        const keystream = aes.encryptBlock(counter);
-        const rawBlock = cipher.subarray(pos, chunkEnd);
-        for (let i = 0; i < chunkEnd - pos; i++) {
-            result[pos + i] = rawBlock[i] ^ keystream[i];
-        }
-
-        pos += chunkEnd - pos;
-    }
-
-    return result;
+    return aesCtrExBlockLoop(new AesEcb(titlekey), cipher, counterHead, fileOffset);
 }
 
 // Load titlekeys from file (format: rights_id = titlekey)
