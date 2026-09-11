@@ -1,8 +1,8 @@
 import { AesCtr, aesBackend } from '../crypto/aes-ops.mjs';
 import { decompressBlock, decompressStream } from '../crypto/zstd.js';
-import { readLeU64, readLeU32 } from './bytes.js';
+import { readLeU64, readLeU32, CHUNK_16MB } from './bytes.js';
 const UNCOMPRESSABLE_HEADER_SIZE = 0x4000;
-const SECTION_CHUNK_SIZE = 0x1000000; // 16MB
+const SECTION_CHUNK_SIZE = CHUNK_16MB; // 16MB
 
 function allocByte(n) {
     return new Uint8Array(n);
@@ -20,7 +20,7 @@ function sliceBytes(bytes, start, end) {
     return bytes.subarray(start, end);
 }
 
-const READ_CHUNK_SIZE = 0x1000000; // 16 MB per chunk, streaming decompressor handles any size
+const READ_CHUNK_SIZE = CHUNK_16MB; // 16 MB per chunk, streaming decompressor handles any size
 
 class DataReader {
     async read(offset, size) {

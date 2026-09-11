@@ -2,6 +2,9 @@
 // Shared by container readers (ncz.js), NCA code (nca-pack.js, update.js, bktr*),
 // ticket handling, etc. No NCA/format-specific knowledge — DataView only.
 
+// Shared pipeline chunk size — the read/write/blend chunk everywhere (16 MiB).
+export const CHUNK_16MB = 0x1000000;
+
 export function hexToBytes(hex) {
     const buf = new Uint8Array(hex.length / 2);
     for (let i = 0; i < hex.length; i += 2) {

@@ -1,7 +1,7 @@
 import { AesCtr } from '../crypto/aes-ops.mjs';
 import { decryptNcaHeader } from './nca.js';
 import { BufferRangeSource, NczStreamSource } from './range-source.js';
-import { readLeU64, readLeU32 } from './bytes.js';
+import { readLeU64, readLeU32, CHUNK_16MB } from './bytes.js';
 import { yieldToEventLoop } from './event-loop.js';
 import { decryptNcaHeaderBytes, fsHeaderAt, reversedSectionCtr, extractTitlekeyFromTik, deriveTitlekeyFromKeyArea, IVFC_LEVEL_HDR, IVFC_LEVELS_OFFSET, IVFC_MAX_LEVEL, FS_HDR } from './nca-utils.js';
 import {
@@ -136,7 +136,7 @@ async function readBktrTables(updateSource, meta) {
     return { relocBlock, subBlock };
 }
 
-const SCRATCH_CHUNK = 0x1000000; // 16 MB
+const SCRATCH_CHUNK = CHUNK_16MB; // 16 MB
 
 // Shared per-run walkers used by both merge strategies. The base-copy run and
 // the patch-subsection walk are byte-identical between mergeRomFS (virtual
