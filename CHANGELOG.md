@@ -2,6 +2,8 @@
 
    ## ✅ Recent Changes (2026-09-11)
 
+    87. **Perf: `_nativeDigest` drops the `Buffer.from(data)` copy — zero-copy view over the source buffer** — `crypto/sha256.js`, `scripts/bench_sha256_nativedigest.mjs` (new). `Buffer.from(Uint8Array)` memcpys the whole input; `Buffer.from(data.buffer, data.byteOffset, data.byteLength)` shares it. `digest32` is the streaming pipeline's block-hash fallback (IVFC/PFS0 batches without `crypto.subtle`) and the full-NCA SHA256 fallback. Micro-bench (in-memory 64 MiB, best-of-7): **1.65 → 2.0 GB/s (~+21%)** — the JS-side memcpy was ~7 ms of a 40 ms hashing pass; node:crypto still buffers internally, so this is the JS-side copy only. Output byte-identical: `test_update_sw_sim` MATCH (`deec91cf…` across seekback ≡ two-pass ≡ buffered ≡ memory ≡ scatter(fd) ≡ scatter(memory)), `npm run build` OK (199.4 kb).
+
     86. **Perf: `AesXts` encrypt hoists the AES key schedule — was rebuilt per 16-byte block (`new AesEcb(k1)` inside every `_encData` call); now one expansion in the constructor** — `crypto/aes128.js`, `scripts/bench_aesxts_encdata.mjs` (new). Only the XTS *encrypt* path was affected (the decrypt `_encData`…`_decData` sibling was already hoisted). Micro-bench (`scripts/bench_aesxts_encdata.mjs`, in-memory 64 MiB, best-of-5, `AesXts.encrypt`): **2.3 → ~75 MB/s, ~33× faster** (old per-block cost = keySchedule + decKeys + object alloc ≈ 26 µs/block × 4.19 M blocks/64 MiB; new = nothing per block). `encryptBlock` is stateless, so the hoist is byte-identical. Verified: `npm run build` OK (199.4 kb), `test_aes128` 8/8 PASS (XTS sector-aligned == whole, deterministic), `test_vector` PASS.
 
    ## ✅ Recent Changes (2026-09-10)

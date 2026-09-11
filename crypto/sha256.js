@@ -224,10 +224,12 @@ if (isNode) {
         const { createHash } = await import('node:crypto');
         _nativeCreateHash = createHash;
         _nativeDigest = (data) => {
-            if (data instanceof Uint8Array || data instanceof ArrayBuffer) {
-                return new Uint8Array(createHash('sha256').update(Buffer.from(data)).digest());
-            }
-            return new Uint8Array(createHash('sha256').update(data).digest());
+            const buf = data instanceof Uint8Array
+                ? Buffer.from(data.buffer, data.byteOffset, data.byteLength)
+                : data instanceof ArrayBuffer
+                    ? Buffer.from(data)
+                    : data;
+            return new Uint8Array(createHash('sha256').update(buf).digest());
         };
     } catch {}
 }
