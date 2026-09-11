@@ -184,6 +184,10 @@ export class StreamingIvfcHasher {
         this.dataSize = dataSize;
         const numBlocks = Math.ceil(dataSize / IVFC_HASH_BLOCK_SIZE);
         this.h1 = new Uint8Array(numBlocks * IVFC_HASH_SIZE);
+        // Recycled 16 KB block buffers: a block is assembled directly into its
+        // own buffer and only handed back when its async digest has read it, so
+        // per-block copy-out is unnecessary (the assembly copy is the only one).
+        this._free = [];
         this.buf = new Uint8Array(IVFC_HASH_BLOCK_SIZE);
         this.bufLen = 0;
         this.blockIdx = 0;
@@ -200,11 +204,15 @@ export class StreamingIvfcHasher {
             this.bufLen += n;
             off += n;
             if (this.bufLen === IVFC_HASH_BLOCK_SIZE) {
-                // this.buf is reused immediately — copy the block before the
-                // async digest reads it.
-                const block = this.buf.slice();
+                // Submit the assembled block and only give its buffer back once
+                // the async digest has consumed it — no per-block copy.
+                const block = this.buf;
                 const idx = this.blockIdx++;
-                this.batcher.submit(block, (d) => this.h1.set(d, idx * IVFC_HASH_SIZE));
+                this.batcher.submit(block, (d) => {
+                    this.h1.set(d, idx * IVFC_HASH_SIZE);
+                    this._free.push(block);
+                });
+                this.buf = this._free.pop() ?? new Uint8Array(IVFC_HASH_BLOCK_SIZE);
                 this.bufLen = 0;
             }
         }
@@ -212,10 +220,14 @@ export class StreamingIvfcHasher {
     async finalize() {
         await this.batcher.drain();
         if (this.bufLen > 0) {
-            const padded = new Uint8Array(IVFC_HASH_BLOCK_SIZE);
+            const padded = this._free.pop() ?? new Uint8Array(IVFC_HASH_BLOCK_SIZE);
+            padded.fill(0);
             padded.set(this.buf.subarray(0, this.bufLen));
             const idx = this.blockIdx;
-            this.batcher.submit(padded, (d) => this.h1.set(d, idx * IVFC_HASH_SIZE));
+            this.batcher.submit(padded, (d) => {
+                this.h1.set(d, idx * IVFC_HASH_SIZE);
+                this._free.push(padded);
+            });
             await this.batcher.drain();
             this.blockIdx++;
         }
@@ -254,10 +266,9 @@ export class StreamingPfs0Hasher {
         this.hashBlock = hashBlock;
         this.buf = new Uint8Array(hashBlock);
         this.bufLen = 0;
+        this._free = [];
         this._hashBuf = new Uint8Array(4096);
         this._hashCount = 0;
-        // Independent per-block SHA256 via the WebCrypto batcher, same as
-        // StreamingIvfcHasher.
         this.batcher = new BatchDigestor();
     }
     update(chunk) {
@@ -269,13 +280,17 @@ export class StreamingPfs0Hasher {
             this.bufLen += n;
             off += n;
             if (this.bufLen === this.hashBlock) {
-                // this.buf is reused immediately — copy the block before the
-                // async digest reads it. Slot-addressed: WebCrypto digests
-                // finish out of order, and entry i must stay at slot i.
-                const block = this.buf.slice();
+                // Slot-addressed: WebCrypto digests finish out of order, and entry
+                // i must stay at slot i. The assembled block buffer is only handed
+                // back once its async digest has read it — no per-block copy.
+                const block = this.buf;
                 const idx = this._hashCount++;
                 this._ensureCapacity((idx + 1) * IVFC_HASH_SIZE);
-                this.batcher.submit(block, (d) => this._hashBuf.set(d, idx * IVFC_HASH_SIZE));
+                this.batcher.submit(block, (d) => {
+                    this._hashBuf.set(d, idx * IVFC_HASH_SIZE);
+                    this._free.push(block);
+                });
+                this.buf = this._free.pop() ?? new Uint8Array(this.hashBlock);
                 this.bufLen = 0;
             }
         }
