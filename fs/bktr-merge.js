@@ -289,20 +289,24 @@ export async function scatterRomFS({ baseInput, updateCtx, options, writeFn, log
     const _log = typeof log === 'function' ? log : () => {};
     const keys = options?.keys;
 
+    // NCZ updates stream both their tables (U1) and patch data (U2) from a fresh
+    // sequential source registered with only the needed ranges (in strictly
+    // increasing order); raw containers just reuse updateCtx.source. One
+    // definition instead of two streamable-dispatch sites.
+    const makeUpdateSource = (ranges) => {
+        if (!updateCtx.streamable) return updateCtx.source;
+        const src = new NczStreamSource(updateCtx.reader, updateCtx.parsed, _log);
+        for (const r of ranges) src.registerRange(r.off, r.len);
+        return src;
+    };
+
     // U1: capture the BKTR tables. For an NCZ update, a fresh stream source
     // registered with just the reloc + sub ranges (in strictly increasing order).
     const meta = await resolveBktrMeta(baseInput, updateCtx, options);
-    let tableSource;
-    if (updateCtx.streamable) {
-        tableSource = new NczStreamSource(updateCtx.reader, updateCtx.parsed, _log);
-        const tableRanges = [
-            { off: meta.relocAbsOffset, len: meta.relocHeader.size },
-            { off: meta.subAbsOffset, len: meta.subHeader.size },
-        ].sort((a, b) => a.off - b.off);
-        for (const r of tableRanges) tableSource.registerRange(r.off, r.len);
-    } else {
-        tableSource = updateCtx.source;
-    }
+    const tableSource = makeUpdateSource([
+        { off: meta.relocAbsOffset, len: meta.relocHeader.size },
+        { off: meta.subAbsOffset, len: meta.subHeader.size },
+    ].sort((a, b) => a.off - b.off));
     const { relocBlock, subBlock } = await readBktrTables(tableSource, meta);
     const { dataLevelOffset, dataLevelSize, updateRomfsSec, baseRomfsSecMeta, updateTitlekey, updateNonce, secureValue, baseTitlekey, baseNonce } = meta;
     const totalSize = relocBlock.totalSize;
@@ -331,15 +335,11 @@ export async function scatterRomFS({ baseInput, updateCtx, options, writeFn, log
     // ── Pass B: base regions (virtual order == physical order for base) ─────
     // Pre-register the base non-patch ranges (strictly increasing physical
     // offsets — base sectors are sequential) so an NCZ base streams in ONE pass.
-    let baseSource;
-    if (baseInput.source instanceof NczStreamSource) {
-        baseSource = baseInput.source;
-        for (const e of entries) {
-            if (e.isPatch) continue;
-            baseSource.registerRange(baseRomfsSecMeta.offset + e.physOffset, e.nextVirt - e.virtOffset);
-        }
-    } else {
-        baseSource = baseInput.source;
+    // registerRange is a no-op on non-stream sources (fs/range-source.js:78).
+    const baseSource = baseInput.source;
+    for (const e of entries) {
+        if (e.isPatch) continue;
+        baseSource.registerRange(baseRomfsSecMeta.offset + e.physOffset, e.nextVirt - e.virtOffset);
     }
 
     const baseCtr = new AesCtr(baseTitlekey, baseNonce);
@@ -355,15 +355,8 @@ export async function scatterRomFS({ baseInput, updateCtx, options, writeFn, log
         .map(e => ({ e, runLen: e.nextVirt - e.virtOffset, abs: updateRomfsSec.offset + e.physOffset }))
         .sort((a, b) => a.abs - b.abs);
 
-    let updReader;
-    if (updateCtx.streamable) {
-        updReader = new NczStreamSource(updateCtx.reader, updateCtx.parsed, _log);
-        for (const r of patchEntries) {
-            updReader.registerRange(r.abs, r.runLen);
-        }
-    } else {
-        updReader = updateCtx.source;
-    }
+    const updReader = makeUpdateSource(
+        patchEntries.map(r => ({ off: r.abs, len: r.runLen })));
 
     for (const r of patchEntries) {
         await readPatchRun(updReader, updateRomfsSec.offset, subBlock,
