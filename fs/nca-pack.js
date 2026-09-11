@@ -735,19 +735,24 @@ async function streamNcaSection(ncaData, offset, size, titlekey, ctrRev, onChunk
 
 // ── extractExefs / extractRomfs ─────────────────────────────────────────────
 
+// Buffered twins are collect-wrappers over the streaming variants: the only
+// difference is collecting chunks into one buffer instead of calling onChunk.
+
+async function collectStream(streamFn, ncaData, keys, tikData) {
+    const chunks = [];
+    let size = 0;
+    await streamFn(ncaData, keys, tikData, (chunk) => {
+        chunks.push(chunk);
+        size += chunk.length;
+    });
+    const all = new Uint8Array(size);
+    let off = 0;
+    for (const c of chunks) { all.set(c, off); off += c.length; }
+    return all;
+}
+
 export async function extractExefs(ncaData, keys, tikData = null) {
-    const { titlekey, sectionCtrRev, sectionOffset, sectionStart, sectionSize } = parseExefsSectionMeta(ncaData, keys, tikData);
-
-    const raw = await ncaRead(ncaData, sectionOffset, sectionStart + sectionSize);
-
-    if (!titlekey || sectionSize === 0) {
-        return raw.subarray(sectionStart, sectionStart + sectionSize);
-    }
-
-    const c = new AesCtr(titlekey, sectionCtrRev);
-    c.seek(sectionOffset);
-    const decrypted = await c.decrypt(raw);
-    return decrypted.subarray(sectionStart, sectionStart + sectionSize);
+    return collectStream(extractExefsStream, ncaData, keys, tikData);
 }
 
 // Streaming variant: feeds the ExeFS PFS0 data to onChunk(chunk, offInData)
@@ -758,15 +763,7 @@ export async function extractExefsStream(ncaData, keys, tikData, onChunk) {
 }
 
 export async function extractRomfs(ncaData, keys, tikData = null) {
-    const { titlekey, sectionCtrRev, sectionOffset, mediaSize } = parseRomfsSectionMeta(ncaData, keys, tikData);
-
-    const raw = await ncaRead(ncaData, sectionOffset, mediaSize);
-    if (!titlekey || mediaSize === 0) return raw;
-
-    const c = new AesCtr(titlekey, sectionCtrRev);
-    c.seek(sectionOffset);
-    const decrypted = await c.decrypt(raw);
-    return decrypted;
+    return collectStream(extractRomfsStream, ncaData, keys, tikData);
 }
 
 export async function extractRomfsStream(ncaData, keys, tikData, onChunk) {
