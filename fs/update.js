@@ -11,6 +11,7 @@ import { preparePlaintextProgramNca, writePlaintextProgramNca, packProgramNcaStr
 import { hexToBytes, writeU64LE, writeU32LE, readLeU64 } from './bytes.js';
 import { fsHeaderAt, FS_HDR, NCA_HEADER_SIZE, decryptNcaHeaderBytes, findRomfsFsHeader, isMetaNca } from './nca-utils.js';
 import { writeFromReader } from './convert-common.js';
+import { yieldToEventLoop } from './event-loop.js';
 
 function u32le(v) {
     const b = new Uint8Array(4);
@@ -608,7 +609,7 @@ export async function update(readers, output, options = {}) {
                 }
                 updRanges.push({ offset: updateExefsSec.offset, size: updateExefsSec.endOffset - updateExefsSec.offset });
                 log('info', `Extracting update NCZ sections in one pass: ${updRanges.map(r => `[0x${r.offset.toString(16)}..0x${(r.offset + r.size).toString(16)})`).join(', ')}...`);
-                await new Promise(r => setTimeout(r, 0));
+                await yieldToEventLoop();
                 const updData = await extractNcaSections(updateReader, updRanges, updateKind, keys, log);
                 const updateSections = [];
                 let u = 0;
@@ -688,7 +689,7 @@ export async function update(readers, output, options = {}) {
 
         if (outRead !== null && updateMode !== 'buffered') {
             log('info', `Streaming update (${scatterActive ? 'scatter, ' : ''}seekable output): ExeFS streamed, RomFS via ${hasBktrRomfs ? 'BKTR merge' : 'base as-is'} (no data buffer)...`);
-            await new Promise(r => setTimeout(r, 0));
+            await yieldToEventLoop();
             log('info', `Program NCA (streaming): exefs=${exefsSize} romfs=${romfsDataSize} total=${programSize}`);
 
             const adapter = await buildAdapter(output, outRead, { log, progress });
@@ -770,7 +771,7 @@ export async function update(readers, output, options = {}) {
         //         as-is (size from the base romfs fs-header).
         if (!hasBktrRomfs || (outRead === null && updateMode !== 'buffered')) {
             log('info', `Two-pass update (sequential output): ${hasBktrRomfs ? 'BKTR merge' : 'base RomFS + update ExeFS'}, ${appendOnly ? 3 : 2}× romfs reads, ~200 KB memory...`);
-            await new Promise(r => setTimeout(r, 0));
+            await yieldToEventLoop();
             log('info', `Program NCA (two-pass): exefs=${exefsSize} romfs=${romfsDataSize} total=${programSize}`);
 
             const adapter = await buildAdapter(output, null, { log, progress });
@@ -813,7 +814,7 @@ export async function update(readers, output, options = {}) {
         const phase1Label = 'Computing contentId (1/2)';
         const phase1 = (p) => progress(p, phase1Label, phase1Bytes);
         log('info', `Merging RomFS into RAM (buffered; base + update streamed in physical order, no SparseNcaView)...`);
-        await new Promise(r => setTimeout(r, 0));
+        await yieldToEventLoop();
         const mergedRomfs = new Uint8Array(romfsDataSize);
         const freshBase = baseKind === 'ncz'
             ? { headerRaw: baseHeaderRaw, source: new NczStreamSource(_baseReaderRef, _baseParsedRef, log) }
@@ -831,7 +832,7 @@ export async function update(readers, output, options = {}) {
         log('info', `Merged RomFS: ${mergedRomfs.length} bytes, ${mergeResult.relocEntries} reloc entries, ${mergeResult.subsectionEntries} subsection entries`);
 
         log('info', 'Streaming ExeFS from update Program NCA (ACID-filtered)...');
-        await new Promise(r => setTimeout(r, 0));
+        await yieldToEventLoop();
         const exefsData = new Uint8Array(exefsSize);
         await makeExefsStream(updateInput, keys, updateTikData, options, log)(async (chunk, off) => {
             exefsData.set(chunk, off);
@@ -870,7 +871,7 @@ export async function update(readers, output, options = {}) {
         const phase2Label = 'Writing output (2/2)';
         const phaseTotal = mergedProgram.size + otherNcas.reduce((s, m) => s + m.outLen, 0);
         log('info', 'Packing merged Program NCA (streaming)...');
-        await new Promise(r => setTimeout(r, 0));
+        await yieldToEventLoop();
         await writePlaintextProgramNca(preparedProgram, adapter, log, programNcaPfs0Offset,
             (p) => progress(p * mergedProgram.size / phaseTotal, phase2Label, phaseTotal));
 
