@@ -2,7 +2,7 @@ import { AesXts, AesCtr } from '../crypto/aes-ops.mjs';
 import { AesEcb } from '../crypto/aes128.js';
 import { sha256, digest32, BatchDigestor, createStreamingSHA256 } from '../crypto/sha256.js';
 import { PFS0, PFS0Writer } from './pfs0.js';
-import { hexToBytes, writeU64LE, writeU32LE, readLeU64 } from './bytes.js';
+import { hexToBytes, writeU64LE, writeU32LE, readLeU64, CHUNK_16MB } from './bytes.js';
 import { fsHeaderAt, sectionMedia, NCA_HDR, FS_HDR, NCA_HEADER_SIZE, toKeyBytes, decryptNcaHeaderBytes, resolveTitlekey, reversedSectionCtr, findRomfsFsHeader, MAGIC_IVFC, IVFC_HEADER_SIZE, IVFC_ID, IVFC_MASTER_HASH_SIZE, IVFC_NUM_LEVELS, IVFC_BLOCK_SIZE_LOG2, IVFC_HASH_BLOCK_SIZE, IVFC_HASH_SIZE, IVFC_LEVELS_OFFSET, IVFC_MASTER_HASH_OFFSET, IVFC_MAX_LEVEL, IVFC_LEVEL_HDR, NCA_CONTENT_TYPE } from './nca-utils.js';
 import { yieldToEventLoop } from './event-loop.js';
 
@@ -937,8 +937,8 @@ export async function preparePlaintextProgramNca(exefsData, romfsData, controlDa
     _log('info', '  Calculating NCA hash...');
     const ncaHasher = createStreamingSHA256();
     const updateChunked = async (data) => {
-        for (let off = 0; off < data.length; off += 0x1000000) {
-            const n = Math.min(0x1000000, data.length - off);
+        for (let off = 0; off < data.length; off += CHUNK_16MB) {
+            const n = Math.min(CHUNK_16MB, data.length - off);
             ncaHasher.update(data.subarray(off, off + n));
             rep(n);
             await yieldToEventLoop();
@@ -998,7 +998,7 @@ export async function writePlaintextProgramNca(prepared, outputAdapter, log, bas
     const total = prepared.size;
     let done = 0;
     const rep = (n) => { done += n; _prog(done / total); };
-    const CHUNK = 0x1000000;
+    const CHUNK = CHUNK_16MB;
     const writeAll = async (pos, data) => {
         for (let off = 0; off < data.length; off += CHUNK) {
             const n = Math.min(CHUNK, data.length - off);
@@ -1112,7 +1112,7 @@ export async function packProgramNcaStream({ adapter, ncaOffset, exefsSize, romf
         {
             let roff = 0;
             while (roff < romfsDataSize) {
-                const n = Math.min(0x1000000, romfsDataSize - roff);
+                const n = Math.min(CHUNK_16MB, romfsDataSize - roff);
                 ivfc.update(await adapter.read(ncaOffset + sec1DataOff + roff, n), true);
                 roff += n;
                 rep(n);
@@ -1165,7 +1165,7 @@ export async function packProgramNcaStream({ adapter, ncaOffset, exefsSize, romf
     const feedBuf = (buf) => {
         let off = 0;
         while (off < buf.length) {
-            const n = Math.min(0x1000000, buf.length - off);
+            const n = Math.min(CHUNK_16MB, buf.length - off);
             h.update(buf.subarray(off, off + n));
             off += n;
             rep(n);
@@ -1174,7 +1174,7 @@ export async function packProgramNcaStream({ adapter, ncaOffset, exefsSize, romf
     const feedRange = async (offset, size) => {
         let off = 0;
         while (off < size) {
-            const n = Math.min(0x1000000, size - off);
+            const n = Math.min(CHUNK_16MB, size - off);
             h.update(await adapter.read(ncaOffset + offset + off, n));
             off += n;
             rep(n);
