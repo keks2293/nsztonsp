@@ -888,7 +888,7 @@ export async function update(readers, output, options = {}) {
         members.push({ name: `${mergedProgram.id}.nca`, size: mergedProgram.size, data: mergedProgram.nca });
     }
 
-    const otherNcas = collectOtherNcas(update, mergedProgram ? new Set([6, 1]) : new Set([6]));
+    const otherNcas = collectOtherNcas(update, mergedProgram ? new Set([CNMT_ENTRY_TYPE.DELTA_FRAGMENT, CNMT_ENTRY_TYPE.PROGRAM]) : new Set([CNMT_ENTRY_TYPE.DELTA_FRAGMENT]));
     members.push(...otherNcas);
 
     // CNMT last (yanu member order)
