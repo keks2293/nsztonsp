@@ -336,6 +336,27 @@ async function finalizeOutputNsP(adapter, { pfs0Header, pw, otherNcas, totalData
     return finishOutput(adapter, pfs0Header, totalData, pw, output, log);
 }
 
+// Shared PFS0 tail (all four update paths): rebuild the CNMT NCA, build the
+// final PFS0 with the now-final Program contentId, and write the header at
+// offset 0. Returns the layout pieces the caller needs for its Program NCA
+// write step and the tail.
+async function writeFinalPfs0Header({ adapter, contentId, programSize, otherNcas, base, update, keys, log }) {
+    const rebuilt = await rebuildCnmtNca(base, update, keys, log, { hashHex: contentId, size: programSize });
+    const { pw, pfs0Header, totalData, programNcaPfs0Offset } = buildFinalPfs0(`${contentId.slice(0, 32)}.nca`, programSize, otherNcas, rebuilt);
+    await adapter.write(0, pfs0Header.buffer);
+    log('info', `PFS0 header ${pfs0Header.headerSize} bytes, ${pw.files.length} members`);
+    return { pw, pfs0Header, totalData, rebuilt, programNcaPfs0Offset };
+}
+
+// Shared PFS0 tail (final step): write the non-Program NCAs + CNMT, finish,
+// and report the tail timing.
+async function finalizeNspTail(adapter, { pw, pfs0Header, otherNcas, totalData, rebuilt, output, log, progress, phaseLabel, phaseBaseDone, phaseTotal }) {
+    const t0 = performance.now();
+    const result = await finalizeOutputNsP(adapter, { pfs0Header, pw, otherNcas, totalData, rebuilt, output, log, progress, phaseLabel, phaseBaseDone, phaseTotal });
+    log('info', `[timing] Tail (other NCAs + CNMT): ${((performance.now() - t0) / 1000).toFixed(1)}s`);
+    return result;
+}
+
 // Two-pass tail (shared by BKTR and non-BKTR two-pass paths): write the Program
 // NCA in pass 2 (streaming), rebuild the CNMT, then the other NCAs + CNMT.
 // Sources must already be nulled by the caller.
@@ -357,53 +378,37 @@ async function writeTwoPassProgramAndFinish({ adapter, base, update, keys, log, 
     const phaseTotal = programSize + tailBytes;
     const pass2Progress = (p) => progress(p * programSize / phaseTotal, 'Writing output (2/2)', phaseTotal);
 
-    if (appendOnly) {
-        // contentId is final after Pass 1 → real PFS0 header first, then the NCA.
-        let t0 = performance.now();
-        const rebuilt = await rebuildCnmtNca(base, update, keys, log, { hashHex: contentId, size: programSize });
-        const { pw, pfs0Header, totalData, programNcaPfs0Offset } = buildFinalPfs0(`${contentId.slice(0, 32)}.nca`, programSize, otherNcas, rebuilt);
-        await adapter.write(0, pfs0Header.buffer);
-        log('info', `PFS0 header ${pfs0Header.headerSize} bytes, ${pw.files.length} members`);
-        log('info', `[timing] CNMT + PFS0 header: ${((performance.now() - t0) / 1000).toFixed(1)}s`);
-        t0 = performance.now();
-        await writeProgramNcaTwoPass({
-            meta, adapter, ncaOffset: programNcaPfs0Offset, contentId,
-            streamExefs: makeStreamExefs(), streamRomfs: makeStreamRomfs(), log,
-            progress: pass2Progress,
-        });
-        log('info', `[timing] Pass 2 (Program NCA write): ${((performance.now() - t0) / 1000).toFixed(1)}s`);
-        t0 = performance.now();
-        const result = await finalizeOutputNsP(adapter, { pfs0Header, pw, otherNcas, totalData, rebuilt, output, log, progress, phaseLabel: 'Writing output (2/2)', phaseBaseDone: programSize, phaseTotal });
-        log('info', `[timing] Tail (other NCAs + CNMT): ${((performance.now() - t0) / 1000).toFixed(1)}s`);
-        return result;
-    }
-
-    // Seekable: the NCA is written first (the adapter zero-fills [0..offset)),
-    // so its offset must be known before the contentId — the header size is a
-    // pure function of the fixed name lengths (see the constants above).
-    // The real PFS0 header overwrites offset 0 after the NCA.
-    const programNcaPfs0Offset = pfs0HeaderSize(
-        [PROGRAM_NCA_NAME_LEN, ...otherNcas.map(m => m.name.length), CNMT_NAME_LEN],
-        { fixPadding: true, headerAlign: 0x10 },
-    );
+    // Header and NCA write differ only in order. appendOnly: contentId is final
+    // after Pass 1 → real PFS0 header first, then the NCA (and the header's
+    // programNcaPfs0Offset comes from that layout). Seekable: the NCA is
+    // written first (the adapter zero-fills [0..offset)), so its offset must be
+    // known before the contentId — the header size is a pure function of the
+    // fixed name lengths — and the real header overwrites offset 0 after.
     let t0 = performance.now();
+    let pw, pfs0Header, totalData, rebuilt, programNcaPfs0Offset;
+    if (appendOnly) {
+        ({ pw, pfs0Header, totalData, rebuilt, programNcaPfs0Offset } = await writeFinalPfs0Header({ adapter, contentId, programSize, otherNcas, base, update, keys, log }));
+        log('info', `[timing] CNMT + PFS0 header: ${((performance.now() - t0) / 1000).toFixed(1)}s`);
+    } else {
+        programNcaPfs0Offset = pfs0HeaderSize(
+            [PROGRAM_NCA_NAME_LEN, ...otherNcas.map(m => m.name.length), CNMT_NAME_LEN],
+            { fixPadding: true, headerAlign: 0x10 },
+        );
+    }
+    t0 = performance.now();
     const id = await writeProgramNcaTwoPass({
-        meta, adapter, ncaOffset: programNcaPfs0Offset,
+        meta, adapter, ncaOffset: programNcaPfs0Offset, contentId,
         streamExefs: makeStreamExefs(), streamRomfs: makeStreamRomfs(), log,
         progress: pass2Progress,
     });
-    log('info', `ContentId: ${id} (${programSize} bytes)`);
+    if (!appendOnly) log('info', `ContentId: ${id} (${programSize} bytes)`);
     log('info', `[timing] Pass 2 (Program NCA write): ${((performance.now() - t0) / 1000).toFixed(1)}s`);
-    t0 = performance.now();
-    const rebuilt = await rebuildCnmtNca(base, update, keys, log, { hashHex: id, size: programSize });
-    const { pw, pfs0Header, totalData } = buildFinalPfs0(`${id.slice(0, 32)}.nca`, programSize, otherNcas, rebuilt);
-    await adapter.write(0, pfs0Header.buffer);
-    log('info', `PFS0 header ${pfs0Header.headerSize} bytes, ${pw.files.length} members`);
-    log('info', `[timing] CNMT + PFS0 header: ${((performance.now() - t0) / 1000).toFixed(1)}s`);
-    t0 = performance.now();
-    const result = await finalizeOutputNsP(adapter, { pfs0Header, pw, otherNcas, totalData, rebuilt, output, log, progress, phaseLabel: 'Writing output (2/2)', phaseBaseDone: programSize, phaseTotal });
-    log('info', `[timing] Tail (other NCAs + CNMT): ${((performance.now() - t0) / 1000).toFixed(1)}s`);
-    return result;
+    if (!appendOnly) {
+        t0 = performance.now();
+        ({ pw, pfs0Header, totalData, rebuilt } = await writeFinalPfs0Header({ adapter, contentId: id, programSize, otherNcas, base, update, keys, log }));
+        log('info', `[timing] CNMT + PFS0 header: ${((performance.now() - t0) / 1000).toFixed(1)}s`);
+    }
+    return finalizeNspTail(adapter, { pw, pfs0Header, otherNcas, totalData, rebuilt, output, log, progress, phaseLabel: 'Writing output (2/2)', phaseBaseDone: programSize, phaseTotal });
 }
 
 // Factory for a streaming ExeFS extractor with NPDM ACID filtering applied.
@@ -743,15 +748,9 @@ export async function update(readers, output, options = {}) {
             updateSource = null;
             baseParsed = null;
 
-            const rebuilt = await rebuildCnmtNca(base, update, keys, log, { hashHex: contentId, size: programSize });
-            const { pw: realPw, pfs0Header: realPfs0, totalData } = buildFinalPfs0(`${contentId.slice(0, 32)}.nca`, programSize, otherNcas, rebuilt);
-            await adapter.write(0, realPfs0.buffer);
-            log('info', `PFS0 header ${realPfs0.headerSize} bytes, ${realPw.files.length} members`);
+            const { pw, pfs0Header, totalData, rebuilt } = await writeFinalPfs0Header({ adapter, contentId, programSize, otherNcas, base, update, keys, log });
 
-            t0 = performance.now();
-            const result = await finalizeOutputNsP(adapter, { pfs0Header: realPfs0, pw: realPw, otherNcas, totalData, rebuilt, output, log, progress, phaseLabel: 'Writing output (1/1)', phaseBaseDone: streamWork, phaseTotal });
-            log('info', `[timing] Tail (other NCAs + CNMT): ${((performance.now() - t0) / 1000).toFixed(1)}s`);
-            return result;
+            return finalizeNspTail(adapter, { pw, pfs0Header, otherNcas, totalData, rebuilt, output, log, progress, phaseLabel: 'Writing output (1/1)', phaseBaseDone: streamWork, phaseTotal });
         }
 
         // ── Two-pass path (sequential output): no data buffer ───────────────
@@ -854,17 +853,11 @@ export async function update(readers, output, options = {}) {
         mergedProgram = { hashHex: preparedProgram.hashHex, size: preparedProgram.size, id: preparedProgram.hashHex.slice(0, 32) };
         log('info', `Merged Program NCA: ${mergedProgram.size} bytes sha256=${mergedProgram.hashHex} contentId=${mergedProgram.id}`);
 
-        const rebuilt = await rebuildCnmtNca(base, update, keys, log,
-            { hashHex: mergedProgram.hashHex, size: mergedProgram.size });
-        log('info', `Rebuilt CNMT NCA: ${rebuilt.nca.length} bytes sha256=${sha256(rebuilt.nca)}`);
-
         const otherNcas = collectOtherNcas(update);
 
-        const { pw, pfs0Header, totalData, programNcaPfs0Offset } = buildFinalPfs0(`${mergedProgram.id}.nca`, mergedProgram.size, otherNcas, rebuilt);
-
         const adapter = await buildAdapter(output, null, { log, progress });
-        await adapter.write(0, pfs0Header.buffer);
-        log('info', `PFS0 header ${pfs0Header.headerSize} bytes, ${pw.files.length} members`);
+        const { pw, pfs0Header, totalData, rebuilt, programNcaPfs0Offset } = await writeFinalPfs0Header({ adapter, contentId: mergedProgram.hashHex, programSize: mergedProgram.size, otherNcas, base, update, keys, log });
+        log('info', `Rebuilt CNMT NCA: ${rebuilt.nca.length} bytes sha256=${sha256(rebuilt.nca)}`);
 
         // Phase 2: Program NCA write + tail form one continuous bar (same
         // protocol as the two-pass paths).
@@ -875,7 +868,7 @@ export async function update(readers, output, options = {}) {
         await writePlaintextProgramNca(preparedProgram, adapter, log, programNcaPfs0Offset,
             (p) => progress(p * mergedProgram.size / phaseTotal, phase2Label, phaseTotal));
 
-        return finalizeOutputNsP(adapter, { pfs0Header, pw, otherNcas, totalData, rebuilt, output, log, progress, phaseLabel: phase2Label, phaseBaseDone: mergedProgram.size, phaseTotal });
+        return finalizeNspTail(adapter, { pw, pfs0Header, otherNcas, totalData, rebuilt, output, log, progress, phaseLabel: phase2Label, phaseBaseDone: mergedProgram.size, phaseTotal });
     }
 
     // ── Non-merge path (original, buffered) ─────────────────────────────────
