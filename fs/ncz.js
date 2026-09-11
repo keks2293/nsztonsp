@@ -169,26 +169,22 @@ class NCZDecompressor {
             console.log('[NCZ] compression mode:', useBlock ? 'block' : 'streaming');
         }
 
-        if (writeChunk) {
-            if (ncaHeader) await writeChunk(ncaHeader, 0);
-        } else {
-            const output = allocByte(ncaSize);
-            if (ncaHeader) output.set(ncaHeader, 0);
-            const wfn = async (chunk, pos) => output.set(chunk, pos);
-
-            if (useBlock) {
-                await this._decompressBlocks(sections, ncaSize, headerEnd, progressCallback, wfn);
-            } else if (headerEnd < this.reader.length) {
-                await this._decompressStream(sections, ncaSize, headerEnd, progressCallback, wfn);
-            }
-            return output;
+        let output = null;
+        let wfn = writeChunk;
+        if (!wfn) {
+            output = allocByte(ncaSize);
+            wfn = async (chunk, pos) => output.set(chunk, pos);
         }
+
+        if (ncaHeader) await wfn(ncaHeader, 0);
 
         if (useBlock) {
-            await this._decompressBlocks(sections, ncaSize, headerEnd, progressCallback, writeChunk);
+            await this._decompressBlocks(sections, ncaSize, headerEnd, progressCallback, wfn);
         } else if (headerEnd < this.reader.length) {
-            await this._decompressStream(sections, ncaSize, headerEnd, progressCallback, writeChunk);
+            await this._decompressStream(sections, ncaSize, headerEnd, progressCallback, wfn);
         }
+
+        return output;
     }
 
     async _decompressStream(sections, ncaSize, headerEnd, progressCallback, writeChunk) {
