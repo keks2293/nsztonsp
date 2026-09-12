@@ -1,12 +1,15 @@
 import { openSync, fstatSync, readSync, readFileSync } from 'node:fs';
 import { PFS0 } from '../fs/pfs0.js';
 import { NCZDecompressor, AdapterNCZReader, parseNczSections } from '../fs/ncz.js';
+import { setZstdStreamForcedWasm } from '../crypto/zstd.js';
 
 // Real-pipeline benchmark: decompress a real .nsz (all NCZ members) with the
 // output DISCARDED (dev-null semantics) — no decompressed bytes hit the disk,
 // so the SSD is not worn. Run: node bench_real_nsz.mjs path/to/file.nsz [runs]
 //
 // Prints total decompressed MiB, wall time, and MB/s (best of N).
+// FORCE_WASM=1 forces the zstddec WASM streaming decoder (instead of node:zlib)
+// so Node-side A/B can measure the browser decoder path.
 
 const NSZ_PATH = process.argv[2];
 const RUNS = Number(process.argv[3] || 3);
@@ -14,6 +17,9 @@ if (!NSZ_PATH) {
     console.error('usage: node bench_real_nsz.mjs path/to/file.nsz [runs]');
     process.exit(1);
 }
+if (process.env.FORCE_WASM) setZstdStreamForcedWasm(true);
+const decoder = process.env.FORCE_WASM ? 'zstddec WASM' : 'node:zlib';
+console.log(`[decoder] ${decoder}`);
 
 const fd = openSync(NSZ_PATH, 'r');
 const fstat = fstatSync(fd);
