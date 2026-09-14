@@ -156,9 +156,19 @@ export function sectionMedia(decHeader, idx) {
 export function findRomfsFsHeader(decHeader, name) {
     for (let i = 0; i < 4; i++) {
         const fh = fsHeaderAt(decHeader, i);
-        if (fh[0x03] === 3) return { idx: i, fsHdr: fh };
+        if (fh[FS_HDR.HASH_TYPE] === SECTION_FS_TYPE.ROMFS) return { idx: i, fsHdr: fh };
     }
     throw new Error(`${name}: RomFS section not found`);
+}
+
+// Find the ExeFS / PFS0 section (hash_type 2) among the 4 FsHeaders.
+// Returns { idx, fsHdr } or throws.
+export function findExefsFsHeader(decHeader, name) {
+    for (let i = 0; i < 4; i++) {
+        const fh = fsHeaderAt(decHeader, i);
+        if (fh[FS_HDR.HASH_TYPE] === SECTION_FS_TYPE.PFS0) return { idx: i, fsHdr: fh };
+    }
+    throw new Error(`${name}: ExeFS (PFS0) section not found`);
 }
 
 // content_type field of the NCA header: 0=Program, 1=Meta (hacPack nca.c:249,617).
