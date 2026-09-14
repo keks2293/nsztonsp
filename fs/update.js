@@ -9,7 +9,7 @@ import { mergeRomFS, scatterRomFS } from './bktr-merge.js';
 import { FileRangeSource, NczStreamSource, ViewRangeSource, SparseNcaView } from './range-source.js';
 import { preparePlaintextProgramNca, writePlaintextProgramNca, packProgramNcaStream, computeProgramNcaContentId, writeProgramNcaTwoPass, extractExefsStream, extractRomfsStream, createExefsAcidFilter, packMetaNca, computeProgramNcaLayout } from './nca-pack.js';
 import { hexToBytes, writeU64LE, writeU32LE, readLeU64 } from './bytes.js';
-import { fsHeaderAt, FS_HDR, NCA_HEADER_SIZE, decryptNcaHeaderBytes, findRomfsFsHeader, isMetaNca } from './nca-utils.js';
+import { fsHeaderAt, FS_HDR, NCA_HEADER_SIZE, decryptNcaHeaderBytes, findRomfsFsHeader, isMetaNca, SECTION_FS_TYPE } from './nca-utils.js';
 import { writeFromReader } from './convert-common.js';
 import { yieldToEventLoop } from './event-loop.js';
 
@@ -498,9 +498,9 @@ export async function update(readers, output, options = {}) {
         const uHeader = decryptNcaHeader(raw, keys);
         updateHeaderDec = uHeader;
         if (uHeader) {
-            hasBktrRomfs = !!uHeader.sections.find(s => s.fsType === 3 && s.cryptoType === 4);
-            updateHasRomfs = !!uHeader.sections.find(s => s.fsType === 3 && s.size > 0);
-            updateHasExefs = !!uHeader.sections.find(s => s.fsType === 2 && s.size > 0);
+            hasBktrRomfs = !!uHeader.sections.find(s => s.fsType === SECTION_FS_TYPE.ROMFS && s.cryptoType === 4);
+            updateHasRomfs = !!uHeader.sections.find(s => s.fsType === SECTION_FS_TYPE.ROMFS && s.size > 0);
+            updateHasExefs = !!uHeader.sections.find(s => s.fsType === SECTION_FS_TYPE.PFS0 && s.size > 0);
             log('info', `Update Program NCA: BKTR RomFS=${hasBktrRomfs}, RomFS section=${updateHasRomfs}, ExeFS=${updateHasExefs}`);
         }
     }
@@ -570,9 +570,9 @@ export async function update(readers, output, options = {}) {
         // Update: patch physical offsets are NOT monotonic, so a .nsz update cannot
         // stream — its BKTR + ExeFS sections are decompressed once and served from a
         // zero-copy sparse view. A .nsp update is read on demand from the container.
-        const baseRomfsSec = baseHeaderDec.sections.find(s => s.fsType === 3);
-        const updateRomfsSec = updateHeaderDec.sections.find(s => s.fsType === 3 && s.cryptoType === 4);
-        const updateExefsSec = updateHeaderDec.sections.find(s => s.fsType === 2);
+        const baseRomfsSec = baseHeaderDec.sections.find(s => s.fsType === SECTION_FS_TYPE.ROMFS);
+        const updateRomfsSec = updateHeaderDec.sections.find(s => s.fsType === SECTION_FS_TYPE.ROMFS && s.cryptoType === 4);
+        const updateExefsSec = updateHeaderDec.sections.find(s => s.fsType === SECTION_FS_TYPE.PFS0);
 
         if (!baseRomfsSec) throw new Error('update: base Program NCA has no RomFS section');
         if (!updateExefsSec) throw new Error('update: update Program NCA has no ExeFS section');

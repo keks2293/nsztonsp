@@ -2,9 +2,7 @@ import { AesCtr, AesXts } from '../crypto/aes-ops.mjs';
 import { PFS0 } from './pfs0.js';
 import { Cnmt } from './cnmt.js';
 import { bytesToHex } from './bytes.js';
-import { toKeyBytes, deriveTitlekeyFromKeyArea, isMetaNca, NCA_HDR, FS_HDR, NCA_HEADER_SIZE } from './nca-utils.js';
-
-const FsType = Object.freeze({ NONE: 0, PFS0: 2, ROMFS: 3 });
+import { toKeyBytes, deriveTitlekeyFromKeyArea, isMetaNca, NCA_HDR, FS_HDR, NCA_HEADER_SIZE, SECTION_FS_TYPE } from './nca-utils.js';
 
 class SectionHeader {
     constructor(buffer) {
@@ -79,7 +77,7 @@ export class NCAHeader {
             const sectionHdr = new SectionHeader(sectionHeaderData);
             const st = sectionTables[i];
 
-            if (sectionHdr.fsType) {
+            if (sectionHdr.fsType !== SECTION_FS_TYPE.NONE) {
                 sections.push({
                     offset: st.offset,
                     endOffset: st.endOffset,
@@ -174,4 +172,4 @@ export function parseCnmtFromDecryptedSection(fsData, section) {
     return Cnmt.parse(raw);
 }
 
-export { FsType, SectionHeader };
+export { SectionHeader };

@@ -46,6 +46,11 @@ export const FS_HDR = {
     SECURE_VALUE: 0x144,
 };
 
+// NCA section header fs_type (byte at FsHeader+0x02, absolute 0x203; hactool
+// section_fs_type_t: FS_TYPE_PFS0=2, FS_TYPE_ROMFS=3). PARSE domain — do NOT
+// confuse with nca-pack.js FS_TYPE (hacPack pack domain: 0=ROMFS, 1=PFS0).
+export const SECTION_FS_TYPE = { NONE: 0, PFS0: 2, ROMFS: 3 };
+
 // content_type field of the NCA header 0x205 (switchbrew NCA; hacPack nca.c:249,617).
 export const NCA_CONTENT_TYPE = { PROGRAM: 0x00, META: 0x01, CONTROL: 0x02, MANUAL: 0x03, DATA: 0x04, PUBLIC_DATA: 0x05 };
 
