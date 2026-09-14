@@ -449,7 +449,6 @@ export async function update(readers, output, options = {}) {
         if (!cnmtEntry) throw new Error(`update: no .cnmt.nca found in ${r.name}`);
         const m = await readCnmtNca(r.reader, cnmtEntry, keys);
         if (!m) throw new Error(`update: cannot decrypt/parse CNMT in ${r.name}`);
-        m.raw = await r.reader.read(cnmtEntry.offset, cnmtEntry.size);
         m.cnmtNcaName = cnmtEntry.name;
         m.reader = r.reader;
         m.entries = entries;
