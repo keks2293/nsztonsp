@@ -203,9 +203,9 @@ async function main() {
 
     try {
         if (isXcz) {
-            await convertXCZ(inReader, inputFd, inputPath, outputDir, keys, verify, overwrite, rmSource);
+            await convertArchive(inReader, inputPath, outputDir, keys, { ext: 'xcz', convert: convertXCZFile, fixPadding: false }, verify, overwrite, rmSource);
         } else {
-            await convertNSZ(inReader, inputFd, inputPath, outputDir, keys, fixPadding, verify, overwrite, rmSource);
+            await convertArchive(inReader, inputPath, outputDir, keys, { ext: 'nsz', convert: convertNSZFile, fixPadding }, verify, overwrite, rmSource);
         }
     } finally {
         fs.closeSync(inputFd);
@@ -411,10 +411,12 @@ async function splitNSP(inFdInfo, inputPath, outputDir, keys, overwrite, rmSourc
     }
 }
 
-async function convertXCZ(inReader, inputFd, inputPath, outputDir, keys, verify, overwrite, rmSource) {
+async function convertArchive(inReader, inputPath, outputDir, keys, { ext, convert, fixPadding }, verify, overwrite, rmSource) {
+    const outExt = ext === 'xcz' ? 'xci' : 'nsp';
+    const re = new RegExp(`\\.${ext}$`, 'i');
+    const outPath = outputDir ? path.join(outputDir, path.basename(inputPath).replace(re, `.${outExt}`)) : inputPath.replace(re, `.${outExt}`);
     console.log(`[VERIFY NSZ] ${inputPath}`);
-    console.log('Detected XCZ file');
-    const outPath = outputDir ? path.join(outputDir, path.basename(inputPath).replace(/\.xcz$/i, '.xci')) : inputPath.replace(/\.xcz$/i, '.xci');
+    if (ext === 'xcz') console.log('Detected XCZ file');
     console.log(`Output: ${outPath}`);
 
     if (!overwrite && fs.existsSync(outPath)) {
@@ -424,47 +426,7 @@ async function convertXCZ(inReader, inputFd, inputPath, outputDir, keys, verify,
 
     const outputFd = fs.openSync(outPath, 'w');
     try {
-        await convertXCZFile(inReader, { fd: outputFd }, {
-            verify,
-            log: (level, msg) => console.log(msg),
-            progress: () => {},
-            createHash: () => {
-                const h = crypto.createHash('sha256');
-                return { update: (d) => h.update(d), hex: () => h.digest('hex') };
-            },
-            extractCnmtHashMap: makeExtractCnmtHashMap(keys),
-        });
-    } catch (e) {
-        fs.closeSync(outputFd);
-        try { fs.unlinkSync(outPath); } catch {}
-        throw e;
-    }
-    fs.closeSync(outputFd);
-
-    const outStat = fs.statSync(outPath);
-    console.log('');
-    console.log('=== DONE ===');
-    console.log(`Output: ${outPath} (${formatBytes(outStat.size)})`);
-
-    if (rmSource) {
-        fs.unlinkSync(inputPath);
-        console.log(`Deleted source: ${inputPath}`);
-    }
-}
-
-async function convertNSZ(inReader, inputFd, inputPath, outputDir, keys, fixPadding, verify, overwrite, rmSource) {
-    const outPath = outputDir ? path.join(outputDir, path.basename(inputPath).replace(/\.nsz$/i, '.nsp')) : inputPath.replace(/\.nsz$/i, '.nsp');
-    console.log(`[VERIFY NSZ] ${inputPath}`);
-    console.log(`Output: ${outPath}`);
-
-    if (!overwrite && fs.existsSync(outPath)) {
-        console.error(`Error: ${outPath} already exists. Use -w/--overwrite to overwrite.`);
-        process.exit(1);
-    }
-
-    const outputFd = fs.openSync(outPath, 'w');
-    try {
-        await convertNSZFile(inReader, { fd: outputFd }, {
+        await convert(inReader, { fd: outputFd }, {
             verify, fixPadding,
             log: (level, msg) => console.log(msg),
             progress: () => {},
