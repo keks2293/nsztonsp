@@ -1,5 +1,9 @@
   # NSZ to NSP Converter - Status Report
 
+   ## ✅ Recent Changes (2026-09-13)
+
+    101. **Diag+decision: browser zstd decoder `-Os` rebuild measured and REVERTED — kept the upstream npm `-Oz` build** — `static/zstddec.mjs`. The custom rebuild (zstd v1.5.7 `zstddeclib.c`, emcc 6.0.9 `-Os`, wasm 61,269 B, commit `6c1b6ba`) was A/B'd against the npm build (wasm 59,312 B) three ways: (1) raw full-payload `decode()` +16% (1954→1688ms); (2) Node real conversion (Little Nightmares II 4.99 GB, `FORCE_WASM=1`, best-of-3): ×1.03 (10950→10643ms); (3) **genuine browser A/B** — headless Chromium, FSA-shape two-pass (stub `showDirectoryPicker` + in-memory writable so `outRead=null`, real WASM + webcrypto + pure-JS SHA256), Stardew base+update, best-of-2: Pass 1 (contentId) 7.0/7.1 → 6.9/6.9s, Pass 2 RomFS 11.4/11.6 → 11.4/11.4s, Pass 2 (Program NCA write) 12.2/12.5 → 12.2/12.3s; contentId byte-identical `6e41adaf…`. All deltas ≤0.3s = noise — the decoder is a small fraction of the two-pass merge+hash+write pipeline. New `scripts/probe_sw_write_pattern.mjs` also showed write-call batching is pointless (816 calls, 16 MB-dominant, call overhead ≤1% even at 1 ms IPC). Decision: **keep the upstream npm `-Oz` build**; rebuild steps + full numbers in IMPROVEMENTS.md (Speed Optimization).
+
    ## ✅ Recent Changes (2026-09-11)
 
     100. **Refactor: one shared `CHUNK_16MB` constant (P9)** — `fs/bytes.js` exports `CHUNK_16MB`; the 16 MiB read/write/blend chunk now lives once instead of 10 sites: `fs/ncz.js` (`SECTION_CHUNK_SIZE`, `READ_CHUNK_SIZE`), `fs/bktr-merge.js` (`SCRATCH_CHUNK`), `fs/nca-pack.js` (6 inline `0x1000000`s incl. `writePlaintextProgramNca` CHUNK, IVFC scatter re-read, contentId feeds). Restored from `stash@{0}` (conflict with the borrow-flag edit at the IVFC re-read was merged manually). Pure maintenance, no behavior change. Verified: `npm run build` OK, `test_update_sw_sim` MATCH (`deec91cf…`, all 6 modes).
