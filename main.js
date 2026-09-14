@@ -458,6 +458,79 @@ async function main() {
         return dl;
     }
 
+    // Shared SW/FSA output fallback for all run-* pipelines. Returns a writable
+    // output adapter, or null (mode not SW/FSA, SW unavailable, or create failed).
+    // lazy → the runUpdate variant: connects the SW stream only on the first
+    // write() so Firefox doesn't kill the idle SW during the long prep phase.
+    async function swWritable(outputName, lazy = false) {
+        if (!(downloadMode === 'sw' || downloadMode === 'fsa')) return null;
+        if (!(await ensureSW())) return null;
+        const iframe = document.createElement('iframe');
+        iframe.style.display = 'none';
+        document.body.appendChild(iframe);
+        if (!lazy) {
+            try {
+                return await createSWWritable(outputName, iframe);
+            } catch (e) {
+                addLog('info', 'SW not available: ' + e.message);
+                return null;
+            }
+        }
+        const dl = new SWDownloader(outputName, iframe);
+        let real = null;
+        return {
+            async write(position, data) {
+                if (!real) {
+                    addLog('info', 'Connecting to SW...');
+                    await dl.start();
+                    dl.triggerDownload();
+                    addLog('info', 'Stream ready');
+                    real = dl;
+                }
+                return real.write(position, data);
+            },
+            async close() { if (real) await real.close(); },
+            get bytesWritten() { return real ? real.bytesWritten : 0; },
+        };
+    }
+
+    // Open the output file in the picked directory. Returns:
+    //   { writable }       — created
+    //   { exists: true }   — already exists AND !overwrite → caller skips
+    //   { writable: null } — blob mode / no handle / create failed (logged)
+    async function openFSAOutput(outputName, directoryHandle) {
+        if (downloadMode === 'blob' || !directoryHandle) return { writable: null };
+        const create = async () => {
+            const h = await directoryHandle.getFileHandle(outputName, { create: true });
+            return h.createWritable();
+        };
+        try {
+            if (overwrite) return { writable: await create() };
+            try {
+                await directoryHandle.getFileHandle(outputName);
+                return { exists: true };
+            } catch {
+                return { writable: await create() };
+            }
+        } catch (e) {
+            addLog('warn', 'Failed to create file: ' + e.message);
+            return { writable: null };
+        }
+    }
+
+    async function deliverResult(writable, blob, name) {
+        if (writable) await writable.close();
+        else downloadBlob(blob, name);
+    }
+
+    async function cleanupFailedWritable(writable, outputName, directoryHandle) {
+        if (!writable) return;
+        try { await writable.close(); } catch (_) {}
+        if (directoryHandle && outputName) {
+            try { await directoryHandle.removeEntry(outputName); } catch (_) {}
+        }
+    }
+
     function downloadBlob(blob, name) {
         const url = URL.createObjectURL(blob);
         const a = document.createElement('a');
@@ -519,13 +592,6 @@ async function main() {
         const directoryHandle = await pickOrAbort();
         if (directoryHandle === 'ABORT') return;
 
-        const fileIframes = files.map(() => {
-            const iframe = document.createElement('iframe');
-            iframe.style.display = 'none';
-            document.body.appendChild(iframe);
-            return iframe;
-        });
-
         let accumulatedBytes = 0;
         for (let i = 0; i < files.length; i++) {
             const file = files[i];
@@ -542,36 +608,16 @@ async function main() {
                     ? file.name.replace(/\.xcz$/i, '.xci')
                     : file.name.replace(/\.nsz$/i, '.nsp');
 
-                if (downloadMode !== 'blob' && directoryHandle) {
-                    try {
-                        let fileHandle;
-                        if (overwrite) {
-                            fileHandle = await directoryHandle.getFileHandle(outputName, { create: true });
-                        } else {
-                            try {
-                                fileHandle = await directoryHandle.getFileHandle(outputName);
-                                addLog('warn', `Exists, skipping: ${outputName}`);
-                                fileStatus[i] = 'skip';
-                                updateFileList();
-                                accumulatedBytes += file.size;
-                                continue;
-                            } catch {
-                                fileHandle = await directoryHandle.getFileHandle(outputName, { create: true });
-                            }
-                        }
-                        writable = await fileHandle.createWritable();
-                    } catch (e) {
-                        addLog('warn', 'Failed to create file: ' + e.message);
-                    }
+                const out = await openFSAOutput(outputName, directoryHandle);
+                if (out.exists) {
+                    addLog('warn', `Exists, skipping: ${outputName}`);
+                    fileStatus[i] = 'skip';
+                    updateFileList();
+                    accumulatedBytes += file.size;
+                    continue;
                 }
-
-                if (!writable && (downloadMode === 'sw' || downloadMode === 'fsa') && await ensureSW()) {
-                    try {
-                        writable = await createSWWritable(outputName, fileIframes[i]);
-                    } catch (e) {
-                        addLog('info', 'SW not available: ' + e.message);
-                    }
-                }
+                writable = out.writable;
+                if (!writable) writable = await swWritable(outputName);
 
                 let result;
                 updateFileProgress(i, 0);
@@ -598,14 +644,8 @@ async function main() {
                     });
                 }
                 checkSwDelivered(writable, result.size);
-
-                if (writable) {
-                    await writable.close();
-                    addLog('success', `${result.name} (${result.size ? formatBytes(result.size) : '?'})`);
-                } else {
-                    downloadBlob(result.blob, result.name);
-                    addLog('success', `${result.name}`);
-                }
+                await deliverResult(writable, result.blob, result.name);
+                addLog('success', writable ? `${result.name} (${result.size ? formatBytes(result.size) : '?'})` : `${result.name}`);
 
                 fileStatus[i] = 'ok';
                 updateFileList();
@@ -613,12 +653,7 @@ async function main() {
                 addLog('info', `[timing] ${file.name}: ${((performance.now() - fileT0) / 1000).toFixed(1)}s (incl. SW/FSA setup + close)`);
             } catch (error) {
                 addLog('error', `Failed: ${error.message}`);
-                if (writable) {
-                    try { await writable.close(); } catch (_) {}
-                    if (directoryHandle && outputName) {
-                        try { await directoryHandle.removeEntry(outputName); } catch (_) {}
-                    }
-                }
+                await cleanupFailedWritable(writable, outputName, directoryHandle);
                 fileStatus[i] = 'err';
                 updateFileList();
             }
@@ -644,40 +679,16 @@ async function main() {
         const directoryHandle = await pickOrAbort();
         if (directoryHandle === 'ABORT') return;
 
-        const iframe = document.createElement('iframe');
-        iframe.style.display = 'none';
-        document.body.appendChild(iframe);
-
         const outputName = files[0].name.replace(/\.(nsp|nsz|xci|xcz)$/i, '') + '_merged.nsp';
-        let writable = null;
-        if (downloadMode !== 'blob' && directoryHandle) {
-            try {
-                let fileHandle;
-                if (overwrite) {
-                    fileHandle = await directoryHandle.getFileHandle(outputName, { create: true });
-                } else {
-                    try {
-                        fileHandle = await directoryHandle.getFileHandle(outputName);
-                        addLog('warn', `Exists, skipping: ${outputName}`);
-                        converting = false;
-                        updateButtonLabel();
-                        return;
-                    } catch {
-                        fileHandle = await directoryHandle.getFileHandle(outputName, { create: true });
-                    }
-                }
-                writable = await fileHandle.createWritable();
-            } catch (e) {
-                addLog('warn', 'Failed to create file: ' + e.message);
-            }
+        const out = await openFSAOutput(outputName, directoryHandle);
+        if (out.exists) {
+            addLog('warn', `Exists, skipping: ${outputName}`);
+            converting = false;
+            updateButtonLabel();
+            return;
         }
-        if (!writable && (downloadMode === 'sw' || downloadMode === 'fsa') && await ensureSW()) {
-            try {
-                writable = await createSWWritable(outputName, iframe);
-            } catch (e) {
-                addLog('info', 'SW not available: ' + e.message);
-            }
-        }
+        let writable = out.writable;
+        if (!writable) writable = await swWritable(outputName);
 
         const onProgress = (p) => { updateProgress(p); updateStats(p); };
 
@@ -689,22 +700,13 @@ async function main() {
                 nodelta: noDeltas,
             });
             checkSwDelivered(writable, result.size);
-            if (writable) {
-                await writable.close();
-            } else {
-                downloadBlob(result.blob, result.name);
-            }
+            await deliverResult(writable, result.blob, result.name);
             addLog('success', `${result.name} (${formatBytes(result.size)}), ${result.memberCount} members`);
             for (let i = 0; i < files.length; i++) fileStatus[i] = 'ok';
             updateFileList();
         } catch (error) {
             addLog('error', `Merge failed: ${error.message}`);
-            if (writable) {
-                try { await writable.close(); } catch (_) {}
-                if (directoryHandle) {
-                    try { await directoryHandle.removeEntry(outputName); } catch (_) {}
-                }
-            }
+            await cleanupFailedWritable(writable, outputName, directoryHandle);
             fileStatus[0] = 'err';
             updateFileList();
         }
@@ -726,55 +728,16 @@ async function main() {
         const directoryHandle = await pickOrAbort();
         if (directoryHandle === 'ABORT') return;
 
-        const iframe = document.createElement('iframe');
-        iframe.style.display = 'none';
-        document.body.appendChild(iframe);
-
         const outputName = files[0].name.replace(/\.(nsp|nsz|xci|xcz)$/i, '') + '_updated.nsp';
-        let writable = null;
-        if (downloadMode !== 'blob' && directoryHandle) {
-            try {
-                let fileHandle;
-                if (overwrite) {
-                    fileHandle = await directoryHandle.getFileHandle(outputName, { create: true });
-                } else {
-                    try {
-                        fileHandle = await directoryHandle.getFileHandle(outputName);
-                        addLog('warn', `Exists, skipping: ${outputName}`);
-                        converting = false;
-                        updateButtonLabel();
-                        return;
-                    } catch {
-                        fileHandle = await directoryHandle.getFileHandle(outputName, { create: true });
-                    }
-                }
-                writable = await fileHandle.createWritable();
-            } catch (e) {
-                addLog('warn', 'Failed to create file: ' + e.message);
-            }
+        const out = await openFSAOutput(outputName, directoryHandle);
+        if (out.exists) {
+            addLog('warn', `Exists, skipping: ${outputName}`);
+            converting = false;
+            updateButtonLabel();
+            return;
         }
-        if (!writable && (downloadMode === 'sw' || downloadMode === 'fsa') && await ensureSW()) {
-            // Lazy SW: start the stream only on first write() so Firefox
-            // doesn't kill the idle SW during the long prep phase.
-            let real = null;
-            const dl = new SWDownloader(outputName, iframe);
-            writable = {
-                async write(position, data) {
-                    if (!real) {
-                        addLog('info', 'Connecting to SW...');
-                        await dl.start();
-                        dl.triggerDownload();
-                        addLog('info', 'Stream ready');
-                        real = dl;
-                    }
-                    return real.write(position, data);
-                },
-                async close() {
-                    if (real) await real.close();
-                },
-                get bytesWritten() { return real ? real.bytesWritten : 0; },
-            };
-        }
+        let writable = out.writable;
+        if (!writable) writable = await swWritable(outputName, true);
 
         const onProgress = (p, label, phaseBytes) => {
             updateProgress(p);
@@ -800,22 +763,13 @@ async function main() {
                     : 'two-pass',
             });
             checkSwDelivered(writable, result.size);
-            if (writable) {
-                await writable.close();
-            } else {
-                downloadBlob(result.blob, result.name);
-            }
+            await deliverResult(writable, result.blob, result.name);
             addLog('success', `${result.name} (${formatBytes(result.size)}), ${result.memberCount} members`);
             for (let i = 0; i < files.length; i++) fileStatus[i] = 'ok';
             updateFileList();
         } catch (error) {
             addLog('error', `Update failed: ${error.message}`);
-            if (writable) {
-                try { await writable.close(); } catch (_) {}
-                if (directoryHandle) {
-                    try { await directoryHandle.removeEntry(outputName); } catch (_) {}
-                }
-            }
+            await cleanupFailedWritable(writable, outputName, directoryHandle);
             fileStatus[0] = 'err';
             updateFileList();
         }
@@ -846,29 +800,10 @@ async function main() {
                 onLog: addLog,
                 outputFactory: async (group, index, name) => {
                     if (downloadMode === 'blob') return { memory: true, name };
-                    if (downloadMode !== 'blob' && directoryHandle) {
-                        if (!overwrite) {
-                            try {
-                                await directoryHandle.getFileHandle(name);
-                                addLog('warn', `Exists, skipping: ${name}`);
-                                return null;
-                            } catch (_) {}
-                        }
-                        const fileHandle = await directoryHandle.getFileHandle(name, { create: true });
-                        const writable = await fileHandle.createWritable();
-                        return { writable, name };
-                    }
-                    if ((downloadMode === 'sw' || downloadMode === 'fsa') && await ensureSW()) {
-                        try {
-                            const iframe = document.createElement('iframe');
-                            iframe.style.display = 'none';
-                            document.body.appendChild(iframe);
-                            return { writable: await createSWWritable(name, iframe), name };
-                        } catch (e) {
-                            addLog('info', 'SW not available: ' + e.message);
-                        }
-                    }
-                    return { memory: true, name };
+                    const out = await openFSAOutput(name, directoryHandle);
+                    if (out.exists) { addLog('warn', `Exists, skipping: ${name}`); return null; }
+                    const w = out.writable || await swWritable(name);
+                    return w ? { writable: w, name } : { memory: true, name };
                 },
             });
 
