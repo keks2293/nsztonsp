@@ -3,6 +3,7 @@ import { KeysParser } from '../keys.js';
 import { decryptNcaHeader } from '../fs/nca.js';
 import { PFS0 } from '../fs/pfs0.js';
 import { AesXts } from '../crypto/aes-ops.mjs';
+import { NCA_HEADER_SIZE } from '../fs/nca-utils.js';
 
 const DIR = '/Users/rmitkov/Downloads/Stardew Valley [NSZ]';
 const basePath = `${DIR}/Stardew Valley [0100E65002BB8000][v0] (0.87 GB).nsp`;
@@ -39,10 +40,10 @@ const baseNca = getProgram(base.d, base.entries);
 const updNca = getProgram(upd.d, upd.entries);
 
 const xts = new AesXts(Buffer.from(keys.header_key, 'hex'));
-const baseDec = Buffer.from(xts.decrypt(baseNca.subarray(0, 0xC00), 0));
-const updDec = Buffer.from(xts.decrypt(updNca.subarray(0, 0xC00), 0));
-const baseHdr = decryptNcaHeader(baseNca.subarray(0, 0xC00), keys);
-const updHdr = decryptNcaHeader(updNca.subarray(0, 0xC00), keys);
+const baseDec = Buffer.from(xts.decrypt(baseNca.subarray(0, NCA_HEADER_SIZE), 0));
+const updDec = Buffer.from(xts.decrypt(updNca.subarray(0, NCA_HEADER_SIZE), 0));
+const baseHdr = decryptNcaHeader(baseNca.subarray(0, NCA_HEADER_SIZE), keys);
+const updHdr = decryptNcaHeader(updNca.subarray(0, NCA_HEADER_SIZE), keys);
 
 for (const [label, hdr, dec] of [['BASE', baseHdr, baseDec], ['UPDATE', updHdr, updDec]]) {
     for (let i = 0; i < 4; i++) {
@@ -62,14 +63,13 @@ const { merged } = await mergeRomFS(baseNca, updNca, {
     baseTik: base.d.subarray(baseTik.offset, baseTik.offset + baseTik.size),
     updateTik: upd.d.subarray(updTik.offset, updTik.offset + updTik.size),
 });
-const { extractExefs, extractControl } = await import('./fs/nca-pack.js');
+const { extractExefs } = await import('./fs/nca-pack.js');
 const exefsData = await extractExefs(updNca, keys, upd.d.subarray(updTik.offset, updTik.offset + updTik.size));
-const controlData = await extractControl(baseNca, keys);
-console.log(`\nexefs=${exefsData.length} mergedRomfs=${merged.length} control=${controlData?.length}`);
+console.log(`\nexefs=${exefsData.length} mergedRomfs=${merged.length}`);
 const { packPlaintextProgramNca } = await import('./fs/nca-pack.js');
-const packed = await packPlaintextProgramNca(exefsData, merged, controlData, baseHdr.titleId.toString(16), keys);
-const packedHdr = decryptNcaHeader(packed.subarray(0, 0xC00), keys);
-const packedDec = Buffer.from(xts.decrypt(packed.subarray(0, 0xC00), 0));
+const packed = await packPlaintextProgramNca(exefsData, merged, null, baseHdr.titleId.toString(16), keys);
+const packedHdr = decryptNcaHeader(packed.subarray(0, NCA_HEADER_SIZE), keys);
+const packedDec = Buffer.from(xts.decrypt(packed.subarray(0, NCA_HEADER_SIZE), 0));
 for (let i = 0; i < 4; i++) {
     const s = packedHdr.sections[i];
     if (!s || s.size === 0) continue;

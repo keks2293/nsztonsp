@@ -1379,22 +1379,3 @@ export async function writeProgramNcaTwoPass({ meta, adapter, ncaOffset, streamE
     _prog(1);
     return contentId;
 }
-
-export async function extractControl(updateNcaData, keys) {
-    const { decryptNcaHeader } = await import('./nca.js');
-
-    const header = decryptNcaHeader(updateNcaData.subarray(0, NCA_HEADER_SIZE), keys);
-    if (!header) throw new Error('Failed to decrypt update NCA header');
-
-    const controlSec = header.sections[2];
-    if (!controlSec || controlSec.size === 0) return null;
-
-    const raw = updateNcaData.subarray(controlSec.offset, controlSec.offset + controlSec.size);
-
-    if (controlSec.cryptoType === 1) {
-        return raw;
-    }
-
-    const { decryptNcaSection } = await import('./nca.js');
-    return await decryptNcaSection(raw, controlSec);
-}

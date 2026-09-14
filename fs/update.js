@@ -9,7 +9,7 @@ import { mergeRomFS, scatterRomFS } from './bktr-merge.js';
 import { FileRangeSource, NczStreamSource, ViewRangeSource, SparseNcaView } from './range-source.js';
 import { preparePlaintextProgramNca, writePlaintextProgramNca, packProgramNcaStream, computeProgramNcaContentId, writeProgramNcaTwoPass, extractExefsStream, extractRomfsStream, createExefsAcidFilter, packMetaNca, computeProgramNcaLayout } from './nca-pack.js';
 import { hexToBytes, writeU64LE, writeU32LE, readLeU64 } from './bytes.js';
-import { fsHeaderAt, FS_HDR, NCA_HEADER_SIZE, decryptNcaHeaderBytes, findRomfsFsHeader, isMetaNca, SECTION_FS_TYPE } from './nca-utils.js';
+import { fsHeaderAt, FS_HDR, NCA_HEADER_SIZE, decryptNcaHeaderBytes, findRomfsFsHeader, findExefsFsHeader, isMetaNca, SECTION_FS_TYPE } from './nca-utils.js';
 import { writeFromReader } from './convert-common.js';
 import { yieldToEventLoop } from './event-loop.js';
 
@@ -689,7 +689,8 @@ export async function update(readers, output, options = {}) {
             const { idx: romfsIdx } = findRomfsFsHeader(baseDecBytes, 'base');
             const baseRomfsFsHdr = fsHeaderAt(baseDecBytes, romfsIdx);
             romfsDataSize = readLeU64(baseRomfsFsHdr, FS_HDR.ROMFS_DATA_SIZE);
-            const updateExefsFsHdr = fsHeaderAt(updateDecBytes, 0);
+            const { idx: updateExefsIdx } = findExefsFsHeader(updateDecBytes, 'update');
+            const updateExefsFsHdr = fsHeaderAt(updateDecBytes, updateExefsIdx);
             exefsSize = readLeU64(updateExefsFsHdr, FS_HDR.PFS0_SIZE);
             programSize = programNcaSize(exefsSize, romfsDataSize);
         }
