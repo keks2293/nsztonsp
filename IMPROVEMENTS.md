@@ -128,6 +128,19 @@ Prioritized areas for improvement identified 2026-05-30.
 
 ## Speed Optimization
 
+- ❌ **Browser zstd decoder `-Os` rebuild was measured and REVERTED — kept the upstream npm `-Oz` build** — `static/zstddec.mjs` is a copy of `node_modules/zstddec/dist/zstddec-stream.modern.js` (wasm 59,312 B). A custom rebuild (zstd v1.5.7 `zstddeclib.c`, emcc 6.0.9 `-Os`, wasm 61,269 B, from commit `6c1b6ba`) was A/B'd three ways and showed **no real-pipeline gain**, so it was dropped — do NOT refresh from a custom build. Measurements:
+    - **Raw decode** (full 700,338,688 B payload, `decode()`): 1954→1688ms (358→415 MB/s, ×1.16).
+    - **Node real conversion** (Little Nightmares II 4.99 GB, `FORCE_WASM=1`, best-of-3, dev-null): 10950→10643ms (×1.03).
+    - **Genuine browser A/B** (headless Chromium, FSA-shape two-pass via a stub `showDirectoryPicker` + in-memory writable so `outRead=null`, real WASM + webcrypto + SHA256, Stardew base+update, best-of-2): Pass 1 (contentId) 7.0/7.1 → 6.9/6.9s; Pass 2 RomFS 11.4/11.6 → 11.4/11.4s; Pass 2 (Program NCA write) 12.2/12.5 → 12.2/12.3s — all within noise (≤0.3s), contentId byte-identical `6e41adaf…`. The decoder is a small fraction of the two-pass merge+hash+write pipeline, so the C-level win doesn't survive.
+    - Rebuild steps, should it ever be revisited: decompress `facebook/zstd` v1.5.7 → `build/single_file_libs/zstddeclib.c`, then
+      ```shell
+      emcc --no-entry -Os -sALLOW_MEMORY_GROWTH=1 zstddeclib.c \
+        -sEXPORTED_FUNCTIONS='["_malloc","_free","_ZSTD_decompress","_ZSTD_findDecompressedSize","_ZSTD_DStreamInSize","_ZSTD_DStreamOutSize","_ZSTD_createDCtx","_ZSTD_freeDCtx","_ZSTD_decompressStream"]' \
+        -o zstddec-Os.wasm
+      ```
+      then substitute the base64 into the upstream `zstddec-stream` ESM wrapper (the only quoted `[A-Za-z0-9+/=]{1000,}` string is the wasm). Same exported API as upstream, so no consumer-side changes. Size/power table (streaming exports, emcc 6.0.9): `-Oz` 58.3 KB, `-Os` 59.8 KB, `-O2` 68.0 KB, `-O3` 69.4 KB — `-Os` = `-O3` in E2E speed at 6× cheaper, hence `-Os` was the candidate.
+- ❌ **Write-call batching on sequential outputs measured — pointless** — `scripts/probe_sw_write_pattern.mjs`. Probe of the SW/two-pass write pattern on the real Stardew pair (701,770,512 B output): only **816** `adapter.write()` calls, ~465 MB shipped in ≤16 MB chunks (merge already batches via `CHUNK_16MB`); the in-process write wall time is 0.2 ms total. Even at an unrealistic 1 ms IPC per call, batching would save ≤3.8% of a 21.3 s run (realistic FSA IPC 0.05–0.25 ms → 0.2–1%). The measured Pass2−Pass1 gap on real FSA (~7.5 s / 578 MB = ~77 MB/s) is the FSA backend write bandwidth, not call overhead — nothing to gain by coalescing writes.
+
 - ✅ **Use node:zlib for block decompression on Node.js** — `fs/ncz.js:443-445`. Block decompression now uses `node:zlib` (`zstdDecompressSync`) on Node.js instead of WASM (`ZstdDecompressor.decompressBuffer`). At the time streaming used the zstd CLI (spawn) — since 2026-08-06 streaming also runs in-process via `zlib.createZstdDecompress` (no subprocess). Benchmark on Trackline Express (109 MB) and Little Nightmares II (580 MB):
 
     **Block mode** (1MB blocks, sequential):
