@@ -45,17 +45,28 @@ async function readPlaintextNcaHeader(containerReader, src) {
     if (src.name.toLowerCase().endsWith('.ncz')) {
         const nczReader = new AdapterNCZReader(containerReader, src.offset, src.size);
         const parsed = await parseNczSections(nczReader);
-        const raw = new Uint8Array(NCA_HEADER_SIZE);
-        const decomp = new NCZDecompressor(nczReader);
-        await decomp.decompress(
-            () => {},
-            (chunk, offset) => {
-                if (offset >= NCA_HEADER_SIZE) return;
-                const end = Math.min(offset + chunk.length, NCA_HEADER_SIZE);
-                raw.set(chunk.subarray(0, end - offset), offset);
-            },
-            parsed,
-        );
+        let raw;
+        if (parsed.ncaHeader) {
+            // Standard NCZ layout: the raw NCA header sits at the very start of
+            // the file (first UNCOMPRESSABLE_HEADER_SIZE bytes; the whole
+            // NCA_HEADER_SIZE header fits inside that raw region).
+            // Read it directly instead of decompressing the whole NCZ.
+            raw = await containerReader.read(src.offset, Math.min(src.size, NCA_HEADER_SIZE));
+        } else {
+            // Legacy layout (NCZSECTN at offset 0): header bytes are inside the
+            // compressed stream — fall back to decompression.
+            raw = new Uint8Array(NCA_HEADER_SIZE);
+            const decomp = new NCZDecompressor(nczReader);
+            await decomp.decompress(
+                () => {},
+                (chunk, offset) => {
+                    if (offset >= NCA_HEADER_SIZE) return;
+                    const end = Math.min(offset + chunk.length, NCA_HEADER_SIZE);
+                    raw.set(chunk.subarray(0, end - offset), offset);
+                },
+                parsed,
+            );
+        }
         return { raw, parsed };
     }
     return {
