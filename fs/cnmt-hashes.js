@@ -1,4 +1,4 @@
-import { decryptNcaHeader, decryptNcaSection, parseCnmtFromDecryptedSection } from './nca.js';
+import { decryptNcaHeader, readCnmtFromMeta } from './nca.js';
 
 export async function extractContentHashMap(ncaData, keys) {
     const map = new Map();
@@ -8,26 +8,11 @@ export async function extractContentHashMap(ncaData, keys) {
     if (!header) return map;
 
     try {
-        const section = header.sections && header.sections[0];
-        if (!section) return map;
-
-        const fsOffset = section.offset;
-        const fsSize = section.size;
-
-        if (fsSize > 0 && fsOffset + fsSize <= arr.length) {
-            const sectionData = arr.subarray(fsOffset, fsOffset + fsSize);
-
-            if (!section.cryptoKey) {
-                console.error('No titleKeyDec for masterKey:', header.masterKey);
-                return map;
-            }
-
-            const fsData = await decryptNcaSection(sectionData, section);
-            const cnmt = parseCnmtFromDecryptedSection(fsData, section);
-            if (cnmt && cnmt.contentEntries) {
-                for (const entry of cnmt.contentEntries) {
-                    map.set(entry.ncaId, entry.hash);
-                }
+        const reader = { read: (offset, length) => arr.subarray(offset, offset + length) };
+        const cnmt = await readCnmtFromMeta(reader, { offset: 0, size: arr.length }, header);
+        if (cnmt && cnmt.contentEntries) {
+            for (const entry of cnmt.contentEntries) {
+                map.set(entry.ncaId, entry.hash);
             }
         }
     } catch (e) {
