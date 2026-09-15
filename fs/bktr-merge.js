@@ -39,9 +39,13 @@ async function resolveBktrMeta(baseNcaData, updateNcaData, options) {
     baseNcaData = toNcaInput(baseNcaData);
     updateNcaData = toNcaInput(updateNcaData);
 
-    const baseHeader = decryptNcaHeader(baseNcaData.headerRaw, keys);
-    const updateHeader = decryptNcaHeader(updateNcaData.headerRaw, keys);
-    if (!baseHeader || !updateHeader) throw new Error('BKTR: failed to decrypt NCA headers');
+    let baseHeader, updateHeader;
+    try {
+        baseHeader = decryptNcaHeader(baseNcaData.headerRaw, keys);
+        updateHeader = decryptNcaHeader(updateNcaData.headerRaw, keys);
+    } catch (e) {
+        throw new Error(`BKTR: failed to decrypt NCA headers: ${e.message}`);
+    }
 
     const baseRomfsSec = baseHeader.sections.find(s => s.fsType === SECTION_FS_TYPE.ROMFS);
     const updateRomfsSec = updateHeader.sections.find(s => s.fsType === SECTION_FS_TYPE.ROMFS && s.cryptoType === SECTION_CRYPTO_TYPE.BKTR);

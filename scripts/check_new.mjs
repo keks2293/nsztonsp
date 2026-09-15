@@ -10,7 +10,8 @@ const files = pfs0.getFiles();
 const cnmtFile = files.find(f => f.name.endsWith('.cnmt.nca'));
 console.log('CNMT NCA:', cnmtFile.name, cnmtFile.size);
 const raw = ours.subarray(cnmtFile.offset, cnmtFile.offset + cnmtFile.size);
-const header = decryptNcaHeader(raw, keys);
+let header;
+try { header = decryptNcaHeader(raw, keys); } catch (_) { header = null; }
 console.log('Header OK:', header ? 'YES' : 'NO');
 if (header) {
   console.log('  titleId:', header.titleId);

@@ -94,7 +94,8 @@ try {
     console.log('\n=== Merged Program NCA ===');
     console.log(`size: ${programFile.size}`);
     const raw = out.subarray(programFile.offset, programFile.offset + programFile.size);
-    const h = decryptNcaHeader(raw.subarray(0, Math.min(programFile.size, 0xC00)), keys);
+    let h;
+    try { h = decryptNcaHeader(raw.subarray(0, Math.min(programFile.size, 0xC00)), keys); } catch (_) { h = null; }
     if (h) {
       console.log(`titleId: ${h.titleId} rightsId: ${h.rightsId || '(none)'}`);
       for (const [i, s] of h.sections.entries()) {

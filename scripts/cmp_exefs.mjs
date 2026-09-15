@@ -102,8 +102,12 @@ async function outputExefs(path) {
     const prog = p.files.filter(f => /\.nca$/i.test(f.name) && !/cnmt/i.test(f.name)).sort((a, b) => b.size - a.size)[0];
     console.log(`  Program NCA: ${prog.name} (${prog.size} B) at 0x${prog.offset.toString(16)}`);
     const hdrRaw = await r.read(prog.offset, NCA_HDR);
-    const hdr = decryptNcaHeader(hdrRaw, keys);
-    if (!hdr) throw new Error('cannot decrypt output Program NCA header');
+    let hdr;
+    try {
+        hdr = decryptNcaHeader(hdrRaw, keys);
+    } catch (e) {
+        throw new Error(`cannot decrypt output Program NCA header: ${e.message}`);
+    }
     const exeSec = hdr.sections.find(s => s.fsType === 2);
     console.log(`  ExeFS section: 0x${exeSec.offset.toString(16)}..0x${exeSec.endOffset.toString(16)} (cryptoType=${exeSec.cryptoType}, start=0x${exeSec.sectionStart.toString(16)}, size=${exeSec.sectionSize})`);
     // Repacked NCA sections are plaintext (FsHeader crypt_type 1 = CRYPT_NONE per

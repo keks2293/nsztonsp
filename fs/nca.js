@@ -127,15 +127,24 @@ export class NCAHeader {
 }
 
 export function decryptNcaHeader(raw, keys = null) {
-    if (!keys || !keys.header_key) return null;
+    if (!keys || !keys.header_key) {
+        throw new Error('decryptNcaHeader: header_key is required to decrypt an NCA header');
+    }
     const headerKey = toKeyBytes(keys.header_key);
-    if (headerKey.length !== 32) return null;
+    if (headerKey.length !== 32) {
+        throw new Error(`decryptNcaHeader: invalid header_key (${headerKey.length} bytes, expected 32)`);
+    }
     const arr = raw instanceof Uint8Array ? raw : new Uint8Array(raw);
     const len = Math.min(NCA_HEADER_SIZE, arr.length);
     // Header is ALWAYS XTS-encrypted (hacPack encrypts unconditionally).
     // cryptoType byte = keygen index, NOT "no encryption".
     const decrypted = new AesXts(headerKey).decrypt(arr.subarray(0, len), 0);
-    return NCAHeader.parse(decrypted, keys);
+    const magic = String.fromCharCode(decrypted[NCA_HDR.MAGIC], decrypted[NCA_HDR.MAGIC + 1], decrypted[NCA_HDR.MAGIC + 2], decrypted[NCA_HDR.MAGIC + 3]);
+    const header = NCAHeader.parse(decrypted, keys);
+    if (!header) {
+        throw new Error(`Failed to decrypt NCA header: bad magic '${magic}' (expected NCA2/NCA3)`);
+    }
+    return header;
 }
 
 export async function decryptNcaSection(data, section) {
@@ -147,12 +156,15 @@ export async function decryptNcaSection(data, section) {
 
 export async function parseCnmtFromRawNca(raw, keys) {
     const header = decryptNcaHeader(raw.subarray(0, NCA_HEADER_SIZE), keys);
-    if (!header) return null;
     const section = header.sections[0];
-    if (!section) return null;
+    if (!section) {
+        throw new Error(`parseCnmtFromRawNca: not a CNMT NCA (no usable section; contentType=${header.contentType})`);
+    }
     const fsData = await decryptNcaSection(raw.subarray(section.offset, section.offset + section.size), section);
     const cnmt = parseCnmtFromDecryptedSection(fsData, section);
-    if (!cnmt) return null;
+    if (!cnmt) {
+        throw new Error('parseCnmtFromRawNca: section is not a CNMT (no PFS0/CNMT content)');
+    }
     return { header, section, fsData, cnmt };
 }
 

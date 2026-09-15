@@ -33,7 +33,8 @@ for (const yf of yanuFiles) {
 const programFile = outFiles.find(f => f.name.toLowerCase().endsWith('.nca') && !f.name.toLowerCase().endsWith('.cnmt.nca') && f.size > 100 * 1024 * 1024);
 if (programFile) {
   const raw = out.subarray(programFile.offset, programFile.offset + programFile.size);
-  const h = decryptNcaHeader(raw.subarray(0, Math.min(programFile.size, 0xC00)), keys);
+  let h;
+  try { h = decryptNcaHeader(raw.subarray(0, Math.min(programFile.size, 0xC00)), keys); } catch (_) { h = null; }
   console.log(`\n=== Merged Program NCA (${programFile.size} bytes) ===`);
   if (h) {
     console.log(`titleId: ${h.titleId} rightsId: ${h.rightsId || '(none)'}`);
@@ -51,7 +52,11 @@ if (programFile) {
 const cnmtFile = outFiles.find(f => f.name.endsWith('.cnmt.nca'));
 if (cnmtFile) {
   const raw = out.subarray(cnmtFile.offset, cnmtFile.offset + cnmtFile.size);
-  const header = decryptNcaHeader(raw.subarray(0, Math.min(cnmtFile.size, 0xC00)), keys);
+  let header;
+  try { header = decryptNcaHeader(raw.subarray(0, Math.min(cnmtFile.size, 0xC00)), keys); } catch (e) {
+    console.error('cannot decrypt output CNMT header:', e.message);
+    process.exit(1);
+  }
   const section = header.sections[0];
   const fsData = await decryptNcaSection(raw.subarray(section.offset, section.offset + section.size), section);
   const cnmt = parseCnmtFromDecryptedSection(fsData, section);

@@ -20,7 +20,8 @@ function findNca(pfs0, entries, kind) {
     const candidates = entries.filter(e => e.name.toLowerCase().endsWith('.nca') && !e.name.toLowerCase().endsWith('.cnmt.nca'));
     for (const e of candidates) {
         const raw = pfs0.subarray(e.offset, e.offset + e.size);
-        const h = decryptNcaHeader(raw.subarray(0, 0xC00), keys);
+        let h;
+        try { h = decryptNcaHeader(raw.subarray(0, 0xC00), keys); } catch (_) { h = null; }
         if (!h) continue;
         if (h.contentType !== 0) continue;
         const tid = h.titleId ? h.titleId.toString(16) : '?';
@@ -63,7 +64,8 @@ for (const [label, path] of [['BASE', basePath], ['UPDATE', updatePath]]) {
     for (const e of entries) {
         if (!e.name.toLowerCase().endsWith('.nca') || e.name.toLowerCase().endsWith('.cnmt.nca')) continue;
         const raw = pfs0.subarray(e.offset, e.offset + e.size);
-        const h = decryptNcaHeader(raw.subarray(0, 0xC00), keys);
+        let h;
+        try { h = decryptNcaHeader(raw.subarray(0, 0xC00), keys); } catch (_) { h = null; }
         if (!h) continue;
         const isProgram = h.contentType === 0;
         const isMeta = h.contentType === 1;
@@ -86,7 +88,8 @@ for (const [label, path] of [['BASE', basePath], ['UPDATE', updatePath]]) {
     for (const e of entries) {
         if (!e.name.toLowerCase().endsWith('.nca') || e.name.toLowerCase().endsWith('.cnmt.nca')) continue;
         const raw = pfs0.subarray(e.offset, e.offset + e.size);
-        const h = decryptNcaHeader(raw.subarray(0, 0xC00), keys);
+        let h;
+        try { h = decryptNcaHeader(raw.subarray(0, 0xC00), keys); } catch (_) { h = null; }
         if (!h || h.contentType !== 0) continue;
 
         // find tik

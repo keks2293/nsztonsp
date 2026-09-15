@@ -6,7 +6,7 @@ export async function extractContentHashMap(ncaData, keys) {
 
     try {
         const m = await parseCnmtFromRawNca(arr, keys);
-        if (m && m.cnmt.contentEntries) {
+        if (m.cnmt.contentEntries) {
             for (const entry of m.cnmt.contentEntries) {
                 map.set(entry.ncaId, entry.hash);
             }
