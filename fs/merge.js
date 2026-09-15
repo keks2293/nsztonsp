@@ -1,12 +1,11 @@
 import { PFS0Writer } from './pfs0.js';
 import { buildAdapter, collectBlob } from './adapter.js';
 import { parseNczSections, AdapterNCZReader } from './ncz.js';
-import { decryptNcaHeader, readCnmtFromMeta } from './nca.js';
+import { parseCnmtFromRawNca } from './nca.js';
 import { CNMT_ENTRY_TYPE } from './cnmt.js';
 import { openContainer } from './container.js';
 import { writeFromReader } from './convert-common.js';
 import { formatBytes } from './format.js';
-import { isMetaNca } from './nca-utils.js';
 
 export async function mergeNSP(readers, output, options = {}) {
     const { log = () => {}, progress = () => {}, nodelta = false, keys = null } = options;
@@ -35,15 +34,10 @@ export async function mergeNSP(readers, output, options = {}) {
         for (const e of entries) {
             const lower = e.name.toLowerCase();
             if (!lower.endsWith('.cnmt.nca')) continue;
-            let header = null;
-            try {
-                const raw = await r.reader.read(e.offset, Math.min(e.size, 0xC00));
-                header = decryptNcaHeader(raw, keys);
-            } catch (_e) {}
-            if (!isMetaNca(header)) continue;
             let cnmt = null;
             try {
-                cnmt = await readCnmtFromMeta(r.reader, e, header);
+                const raw = await r.reader.read(e.offset, e.size);
+                cnmt = (await parseCnmtFromRawNca(raw, keys))?.cnmt ?? null;
             } catch (_e) {}
             if (!cnmt) continue;
 

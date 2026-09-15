@@ -2,14 +2,14 @@ import { PFS0, PFS0Writer, pfs0HeaderSize } from './pfs0.js';
 import { buildAdapter, buildRead, collectBlob } from './adapter.js';
 import { openContainer } from './container.js';
 import { NCZDecompressor, AdapterNCZReader, parseNczSections } from './ncz.js';
-import { decryptNcaHeader, decryptNcaSection, parseCnmtFromDecryptedSection } from './nca.js';
+import { decryptNcaHeader, parseCnmtFromRawNca } from './nca.js';
 import { Cnmt, CNMT_ENTRY_TYPE, CNMT_TITLE_TYPE } from './cnmt.js';
 import { sha256 } from '../crypto/sha256.js';
 import { mergeRomFS, scatterRomFS } from './bktr-merge.js';
 import { FileRangeSource, NczStreamSource, ViewRangeSource, SparseNcaView } from './range-source.js';
 import { preparePlaintextProgramNca, writePlaintextProgramNca, packProgramNcaStream, computeProgramNcaContentId, writeProgramNcaTwoPass, extractExefsStream, extractRomfsStream, createExefsAcidFilter, packMetaNca, computeProgramNcaLayout } from './nca-pack.js';
 import { hexToBytes, writeU64LE, writeU32LE, readLeU64 } from './bytes.js';
-import { fsHeaderAt, FS_HDR, NCA_HEADER_SIZE, decryptNcaHeaderBytes, findRomfsFsHeader, findExefsFsHeader, isMetaNca, SECTION_FS_TYPE, SECTION_CRYPTO_TYPE } from './nca-utils.js';
+import { fsHeaderAt, FS_HDR, NCA_HEADER_SIZE, decryptNcaHeaderBytes, findRomfsFsHeader, findExefsFsHeader, SECTION_FS_TYPE, SECTION_CRYPTO_TYPE } from './nca-utils.js';
 import { writeFromReader } from './convert-common.js';
 import { yieldToEventLoop } from './event-loop.js';
 
@@ -126,14 +126,9 @@ function contentInfo(hashHex, type, size) {
 
 async function readCnmtNca(reader, entry, keys) {
     const raw = await reader.read(entry.offset, entry.size);
-    const header = decryptNcaHeader(raw.subarray(0, Math.min(entry.size, 0xC00)), keys);
-    if (!isMetaNca(header)) return null;
-    const section = header.sections[0];
-    if (!section) return null;
-    const data = await reader.read(entry.offset + section.offset, section.size);
-    const fsData = await decryptNcaSection(data, section);
-    const cnmt = parseCnmtFromDecryptedSection(fsData, section);
-    if (!cnmt) return null;
+    const m = await parseCnmtFromRawNca(raw, keys);
+    if (!m) return null;
+    const { header, section, cnmt, fsData } = m;
     const pfs0Raw = fsData.subarray(section.sectionStart);
     const files = new PFS0(pfs0Raw).getFiles();
     let cnmtRaw = null;

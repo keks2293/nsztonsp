@@ -1,5 +1,5 @@
 import { PFS0, PFS0Writer } from './pfs0.js';
-import { decryptNcaHeader, readCnmtFromMeta } from './nca.js';
+import { decryptNcaHeader, parseCnmtFromRawNca } from './nca.js';
 import { Ticket } from './ticket.js';
 import { buildAdapter, collectBlob, copyRange } from './adapter.js';
 import { isMetaNca, NCA_HEADER_SIZE } from './nca-utils.js';
@@ -90,7 +90,8 @@ export async function splitNSP(reader, keys, outputFactory, options = {}) {
 
         let cnmt = null;
         try {
-            cnmt = await readCnmtFromMeta(reader, metaEntry, header);
+            const raw = await reader.read(metaEntry.offset, metaEntry.size);
+            cnmt = (await parseCnmtFromRawNca(raw, keys))?.cnmt ?? null;
         } catch (e) {
             log('warn', `Failed to parse CNMT from ${metaEntry.name}: ${e.message}`);
             continue;

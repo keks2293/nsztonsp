@@ -2,7 +2,7 @@ import { AesCtr, AesXts } from '../crypto/aes-ops.mjs';
 import { PFS0 } from './pfs0.js';
 import { Cnmt } from './cnmt.js';
 import { bytesToHex } from './bytes.js';
-import { toKeyBytes, deriveTitlekeyFromKeyArea, isMetaNca, NCA_HDR, FS_HDR, NCA_HEADER_SIZE, SECTION_FS_TYPE, SECTION_CRYPTO_TYPE } from './nca-utils.js';
+import { toKeyBytes, deriveTitlekeyFromKeyArea, NCA_HDR, FS_HDR, NCA_HEADER_SIZE, SECTION_FS_TYPE, SECTION_CRYPTO_TYPE } from './nca-utils.js';
 
 class SectionHeader {
     constructor(buffer) {
@@ -145,14 +145,15 @@ export async function decryptNcaSection(data, section) {
     return await aesCtr.decrypt(data);
 }
 
-export async function readCnmtFromMeta(reader, entry, header) {
-    if (!isMetaNca(header)) return null;
+export async function parseCnmtFromRawNca(raw, keys) {
+    const header = decryptNcaHeader(raw.subarray(0, NCA_HEADER_SIZE), keys);
+    if (!header) return null;
     const section = header.sections[0];
     if (!section) return null;
-
-    const data = await reader.read(entry.offset + section.offset, section.size);
-    const fsData = await decryptNcaSection(data, section);
-    return parseCnmtFromDecryptedSection(fsData, section);
+    const fsData = await decryptNcaSection(raw.subarray(section.offset, section.offset + section.size), section);
+    const cnmt = parseCnmtFromDecryptedSection(fsData, section);
+    if (!cnmt) return null;
+    return { header, section, fsData, cnmt };
 }
 
 function isPfs0(data, offset) {

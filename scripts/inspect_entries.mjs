@@ -3,7 +3,7 @@
 import fs from 'fs';
 import { KeysParser } from '../keys.js';
 import { PFS0 } from '../fs/pfs0.js';
-import { decryptNcaHeader, readCnmtFromMeta } from '../fs/nca.js';
+import { decryptNcaHeader, parseCnmtFromRawNca } from '../fs/nca.js';
 
 function hex(b) {
     return Array.from(b).map(x => x.toString(16).padStart(2, '0')).join('');
@@ -65,7 +65,8 @@ async function inspectFile(filePath, keys) {
         let cnmtInfo = '';
         if (isMeta && header.contentType === 1) {
             try {
-                const cnmt = await readCnmtFromMeta(reader, f, header);
+                const raw = await reader.read(f.offset, f.size);
+                const cnmt = (await parseCnmtFromRawNca(raw, keys))?.cnmt ?? null;
                 if (cnmt) {
                     const entries = cnmt.contentEntries.map(c => {
                         const typeName = CNMT_CONTENT_TYPES[c.type] ?? `type${c.type}`;
