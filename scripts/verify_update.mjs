@@ -69,8 +69,13 @@ const cf = pfs0.getFiles().find(x => x.name.endsWith('.cnmt.nca'));
 if (!cf) { console.error('no .cnmt.nca in base'); process.exit(1); }
 const rawNca = await reader.read(cf.offset, cf.size);
 fs.closeSync(fd);
-const header = decryptNcaHeader(rawNca.subarray(0, 0xC00), keys);
-if (!header) { console.error('cannot decrypt base NCA header (keys?)'); process.exit(1); }
+let header;
+try {
+    header = decryptNcaHeader(rawNca.subarray(0, 0xC00), keys);
+} catch (e) {
+    console.error('cannot decrypt base NCA header (keys?)', e.message);
+    process.exit(1);
+}
 const section = header.sections[0];
 console.log('base CNMT NCA size', rawNca.length, 'section media offset', section.offset, 'size', section.size);
 console.log('pfs0Offset', section.sectionStart, 'pfs0Size', section.sectionSize);

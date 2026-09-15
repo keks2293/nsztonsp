@@ -74,12 +74,11 @@ export async function splitNSP(reader, keys, outputFactory, options = {}) {
 
     const parsedHeaders = new Map();
     for (const [name, entry] of ncaEntries) {
-        const raw = await reader.read(entry.offset, Math.min(entry.size, NCA_HEADER_SIZE));
-        const header = decryptNcaHeader(raw, keys);
-        if (header) {
-            parsedHeaders.set(entry, header);
-        } else {
-            log('warn', `Could not decrypt NCA header: ${entry.name}`);
+        try {
+            const raw = await reader.read(entry.offset, Math.min(entry.size, NCA_HEADER_SIZE));
+            parsedHeaders.set(entry, decryptNcaHeader(raw, keys));
+        } catch (e) {
+            log('warn', `Could not decrypt NCA header: ${entry.name} (${e.message})`);
         }
     }
 
@@ -91,13 +90,9 @@ export async function splitNSP(reader, keys, outputFactory, options = {}) {
         let cnmt = null;
         try {
             const raw = await reader.read(metaEntry.offset, metaEntry.size);
-            cnmt = (await parseCnmtFromRawNca(raw, keys))?.cnmt ?? null;
+            cnmt = (await parseCnmtFromRawNca(raw, keys)).cnmt;
         } catch (e) {
             log('warn', `Failed to parse CNMT from ${metaEntry.name}: ${e.message}`);
-            continue;
-        }
-        if (!cnmt) {
-            log('warn', `No CNMT found in ${metaEntry.name}`);
             continue;
         }
 

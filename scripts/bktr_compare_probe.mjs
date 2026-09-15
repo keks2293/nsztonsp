@@ -44,7 +44,8 @@ function ctrDecrypt(raw, titlekey, nonce, seek) {
     for (const e of entries) {
         if (!e.name.toLowerCase().endsWith('.nca') || e.name.toLowerCase().endsWith('.cnmt.nca')) continue;
         const raw = pfs0.subarray(e.offset, e.offset + e.size);
-        const h = decryptNcaHeader(raw.subarray(0, 0xC00), keys);
+        let h;
+        try { h = decryptNcaHeader(raw.subarray(0, 0xC00), keys); } catch (_) { h = null; }
         if (!h || h.contentType !== 0) continue;
         console.log(`\n### BASE program ${e.name}`);
         for (let i = 0; i < 4; i++) {
@@ -78,7 +79,8 @@ function ctrDecrypt(raw, titlekey, nonce, seek) {
     for (const e of entries) {
         if (!e.name.toLowerCase().endsWith('.nca') || e.name.toLowerCase().endsWith('.cnmt.nca')) continue;
         const raw = pfs0.subarray(e.offset, e.offset + e.size);
-        const h = decryptNcaHeader(raw.subarray(0, 0xC00), keys);
+        let h;
+        try { h = decryptNcaHeader(raw.subarray(0, 0xC00), keys); } catch (_) { h = null; }
         if (!h || h.contentType !== 0) continue;
         console.log(`\n### UPDATE program ${e.name}`);
         const xts = new AesXts(Buffer.isBuffer(keys.header_key) ? keys.header_key : Buffer.from(keys.header_key, 'hex'));

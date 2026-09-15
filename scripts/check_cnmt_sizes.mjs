@@ -23,8 +23,13 @@ async function readCnmt(nsp, label) {
     if (!cnmtFile) { console.log('  No CNMT NCA'); return; }
     
     const cnmtRaw = nsp.subarray(cnmtFile.offset, cnmtFile.offset + cnmtFile.size);
-    const header = decryptNcaHeader(cnmtRaw.subarray(0, 0xC00), keys);
-    if (!header) { console.log('  Failed to decrypt CNMT header'); return; }
+    let header;
+    try {
+        header = decryptNcaHeader(cnmtRaw.subarray(0, 0xC00), keys);
+    } catch (e) {
+        console.log('  Failed to decrypt CNMT header:', e.message);
+        return;
+    }
     
     const section = header.sections[0];
     if (!section) { console.log('  No section'); return; }

@@ -66,7 +66,7 @@ async function inspectFile(filePath, keys) {
         if (isMeta && header.contentType === 1) {
             try {
                 const raw = await reader.read(f.offset, f.size);
-                const cnmt = (await parseCnmtFromRawNca(raw, keys))?.cnmt ?? null;
+                const cnmt = (await parseCnmtFromRawNca(raw, keys)).cnmt;
                 if (cnmt) {
                     const entries = cnmt.contentEntries.map(c => {
                         const typeName = CNMT_CONTENT_TYPES[c.type] ?? `type${c.type}`;

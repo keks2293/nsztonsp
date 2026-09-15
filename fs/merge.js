@@ -37,7 +37,7 @@ export async function mergeNSP(readers, output, options = {}) {
             let cnmt = null;
             try {
                 const raw = await r.reader.read(e.offset, e.size);
-                cnmt = (await parseCnmtFromRawNca(raw, keys))?.cnmt ?? null;
+                cnmt = (await parseCnmtFromRawNca(raw, keys)).cnmt;
             } catch (_e) {}
             if (!cnmt) continue;
 

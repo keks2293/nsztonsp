@@ -127,7 +127,6 @@ function contentInfo(hashHex, type, size) {
 async function readCnmtNca(reader, entry, keys) {
     const raw = await reader.read(entry.offset, entry.size);
     const m = await parseCnmtFromRawNca(raw, keys);
-    if (!m) return null;
     const { header, section, cnmt, fsData } = m;
     const pfs0Raw = fsData.subarray(section.sectionStart);
     const files = new PFS0(pfs0Raw).getFiles();
@@ -454,7 +453,6 @@ export async function update(readers, output, options = {}) {
         const cnmtEntry = entries.find(e => e.name.toLowerCase().endsWith('.cnmt.nca'));
         if (!cnmtEntry) throw new Error(`update: no .cnmt.nca found in ${r.name}`);
         const m = await readCnmtNca(r.reader, cnmtEntry, keys);
-        if (!m) throw new Error(`update: cannot decrypt/parse CNMT in ${r.name}`);
         m.cnmtNcaName = cnmtEntry.name;
         m.reader = r.reader;
         m.entries = entries;
@@ -500,14 +498,11 @@ export async function update(readers, output, options = {}) {
         const { raw, parsed } = await readPlaintextNcaHeader(update.reader, updateProgramEntry.src);
         updateHeaderRaw = raw;
         updateParsed = parsed;
-        const uHeader = decryptNcaHeader(raw, keys);
-        updateHeaderDec = uHeader;
-        if (uHeader) {
-            hasBktrRomfs = !!uHeader.sections.find(s => s.fsType === SECTION_FS_TYPE.ROMFS && s.cryptoType === SECTION_CRYPTO_TYPE.BKTR);
-            updateHasRomfs = !!uHeader.sections.find(s => s.fsType === SECTION_FS_TYPE.ROMFS && s.size > 0);
-            updateHasExefs = !!uHeader.sections.find(s => s.fsType === SECTION_FS_TYPE.PFS0 && s.size > 0);
-            log('info', `Update Program NCA: BKTR RomFS=${hasBktrRomfs}, RomFS section=${updateHasRomfs}, ExeFS=${updateHasExefs}`);
-        }
+        updateHeaderDec = decryptNcaHeader(raw, keys);
+        hasBktrRomfs = !!updateHeaderDec.sections.find(s => s.fsType === SECTION_FS_TYPE.ROMFS && s.cryptoType === SECTION_CRYPTO_TYPE.BKTR);
+        updateHasRomfs = !!updateHeaderDec.sections.find(s => s.fsType === SECTION_FS_TYPE.ROMFS && s.size > 0);
+        updateHasExefs = !!updateHeaderDec.sections.find(s => s.fsType === SECTION_FS_TYPE.PFS0 && s.size > 0);
+        log('info', `Update Program NCA: BKTR RomFS=${hasBktrRomfs}, RomFS section=${updateHasRomfs}, ExeFS=${updateHasExefs}`);
     }
 
     // Pre-read the base/update .tik titlekey data — the BKTR merge needs the titlekeys
@@ -553,7 +548,6 @@ export async function update(readers, output, options = {}) {
         const baseHeaderRaw = baseHdr.raw;
         let baseParsed = baseHdr.parsed;
         const baseHeaderDec = decryptNcaHeader(baseHeaderRaw, keys);
-        if (!baseHeaderDec) throw new Error('update: cannot decrypt base Program NCA header');
 
         // ── Extract update Program NCA header ────────────────────────────────
         // The header was already read + decrypted for the BKTR check above; reuse
@@ -565,7 +559,6 @@ export async function update(readers, output, options = {}) {
             updateParsed = uHdr.parsed ?? updateParsed;
             updateHeaderDec = decryptNcaHeader(updateHeaderRaw, keys);
         }
-        if (!updateHeaderDec) throw new Error('update: cannot decrypt update Program NCA header');
 
         // ── Build NCA range sources (the NSZ→NSP converter's streaming discipline) ──
         // Base: the whole NCA is served from the container — .nsp is random access,

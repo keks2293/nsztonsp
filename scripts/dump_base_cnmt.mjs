@@ -11,7 +11,8 @@ const cf = files.find(f => f.name.endsWith('.cnmt.nca'));
 console.log('base cnmt file:', cf.name, cf.size);
 const raw = base.subarray(cf.offset, cf.offset + cf.size);
 console.log('base CNMT hdr[0x440..0x450]:', Array.from(raw.subarray(0x440, 0x450)).map(b=>b.toString(16).padStart(2,'0')).join(' '));
-const h = decryptNcaHeader(raw.subarray(0, 0xC00), keys);
+let h;
+try { h = decryptNcaHeader(raw.subarray(0, 0xC00), keys); } catch (_) { h = null; }
 if (h && h.sections[0]) {
   const s = h.sections[0];
   console.log('base CNMT sec[0] offset=0x'+s.offset.toString(16)+' size=0x'+s.size.toString(16)+' cryptoType='+s.cryptoType+' sectionStart=0x'+s.sectionStart.toString(16)+' sectionSize=0x'+s.sectionSize.toString(16));
