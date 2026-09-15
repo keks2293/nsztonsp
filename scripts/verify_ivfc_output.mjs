@@ -13,10 +13,9 @@ import fs from 'fs';
 import { createHash } from 'crypto';
 import { KeysParser } from '../keys.js';
 import { PFS0 } from '../fs/pfs0.js';
-import { AesXts } from '../crypto/aes-ops.mjs';
+import { decryptNcaHeaderBytes, NCA_HDR, NCA_CONTENT_TYPE, NCA_HEADER_SIZE } from '../fs/nca-utils.js';
 
 const keys = KeysParser.parse(fs.readFileSync('../static/prod.keys', 'utf8'));
-const keyBuf = Buffer.from(keys.header_key, 'hex');
 const sh = b => createHash('sha256').update(b).digest('hex');
 const BS = 0x4000;
 
@@ -26,10 +25,13 @@ function readNsp(path) {
     return { buf, files };
 }
 function progNca(nsp) {
-    const e = nsp.files.find(f => f.name.endsWith('.nca') && !f.name.endsWith('.cnmt.nca') && f.size > 100000000);
-    const data = nsp.buf.subarray(e.offset, e.offset + e.size);
-    const hdr = Buffer.from(new AesXts(keyBuf).decrypt(data.subarray(0, 0xC00), 0));
-    return { e, data, hdr };
+    for (const e of nsp.files) {
+        if (!e.name.endsWith('.nca') || e.name.endsWith('.cnmt.nca')) continue;
+        const data = nsp.buf.subarray(e.offset, e.offset + e.size);
+        const hdr = decryptNcaHeaderBytes(data.subarray(0, NCA_HEADER_SIZE), keys);
+        if (hdr[NCA_HDR.CONTENT_TYPE] === NCA_CONTENT_TYPE.PROGRAM) return { e, data, hdr: Buffer.from(hdr) };
+    }
+    throw new Error('Program NCA not found');
 }
 // Hashes ceil(len/BS) blocks; the last partial block is zero-padded to BS
 // (matches Nintendo/yanu: stored level-4 hash of a partial block == sha256(padded)).

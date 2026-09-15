@@ -51,6 +51,17 @@ export const FS_HDR = {
 // confuse with nca-pack.js FS_TYPE (hacPack pack domain: 0=ROMFS, 1=PFS0).
 export const SECTION_FS_TYPE = { NONE: 0, PFS0: 2, ROMFS: 3 };
 
+// NCA section header crypto_type (byte at FsHeader+0x04, absolute 0x205;
+// hactool section_crypto_type_t: CRYPTO_NONE=0, CRYPTO_AES_XTS=1,
+// CRYPTO_AES_CTR=2, CRYPTO_AES_CTR_EX=3, CRYPTO_BKTR=4).
+// A higher type "overrides" the crypto of the same section (nca_process reads
+// max(crypto_type, crypto_type2) at the NCA-header level).
+// NCA DOMAIN ONLY. The NCZ container (.ncz section tables) uses a DIFFERENT
+// enum (python nsz Type.Crypto: 1=NONE, 2=XTS, 3=CTR, 4=BKTR) — see
+// NCZ_CRYPTO_TYPE in fs/ncz.js. `fs/nca.js` works on NCA headers too, so its
+// `decryptNcaSection` cryptoType===1 check is AES_XTS, NOT plaintext.
+export const SECTION_CRYPTO_TYPE = { NONE: 0, AES_XTS: 1, AES_CTR: 2, AES_CTR_EX: 3, BKTR: 4 };
+
 // content_type field of the NCA header 0x205 (switchbrew NCA; hacPack nca.c:249,617).
 export const NCA_CONTENT_TYPE = { PROGRAM: 0x00, META: 0x01, CONTROL: 0x02, MANUAL: 0x03, DATA: 0x04, PUBLIC_DATA: 0x05 };
 
@@ -80,9 +91,24 @@ export function toKeyBytes(v) {
     return typeof v === 'string' ? hexToBytes(v) : new Uint8Array(v);
 }
 
+// Cache of ready-built XTS instances by header_key string, so repeated header
+// decrypts (per-NCA candidates, base+update) skip both the hex->bytes re-parse
+// and the AesEcb key schedule construction on every call.
+const headerXtsCache = new Map();
+
+function getHeaderXts(keys) {
+    const key = keys.header_key;
+    let xts = headerXtsCache.get(key);
+    if (!xts) {
+        xts = new AesXts(toKeyBytes(key));
+        headerXtsCache.set(key, xts);
+    }
+    return xts;
+}
+
 // XTS-decrypt a raw NCA header (0xC00 bytes) with header_key.
 export function decryptNcaHeaderBytes(raw, keys) {
-    return new AesXts(toKeyBytes(keys.header_key)).decrypt(raw, 0);
+    return getHeaderXts(keys).decrypt(raw, 0);
 }
 
 // Derive titlekey from the NCA header key area (hactool nca.c: nca_decrypt_key_area,

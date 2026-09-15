@@ -3,7 +3,7 @@ import { decryptNcaHeader } from './nca.js';
 import { BufferRangeSource, NczStreamSource } from './range-source.js';
 import { readLeU64, readLeU32, CHUNK_16MB } from './bytes.js';
 import { yieldToEventLoop } from './event-loop.js';
-import { decryptNcaHeaderBytes, fsHeaderAt, reversedSectionCtr, extractTitlekeyFromTik, deriveTitlekeyFromKeyArea, IVFC_LEVEL_HDR, IVFC_LEVELS_OFFSET, IVFC_MAX_LEVEL, FS_HDR, SECTION_FS_TYPE } from './nca-utils.js';
+import { decryptNcaHeaderBytes, fsHeaderAt, reversedSectionCtr, extractTitlekeyFromTik, deriveTitlekeyFromKeyArea, IVFC_LEVEL_HDR, IVFC_LEVELS_OFFSET, IVFC_MAX_LEVEL, FS_HDR, SECTION_FS_TYPE, SECTION_CRYPTO_TYPE } from './nca-utils.js';
 import {
     parseBktrHeader,
     decryptBktrTableData,
@@ -20,7 +20,7 @@ import {
 // source.read(offset, length) serves NCA ciphertext by absolute offset.
 function toNcaInput(nca) {
     if (nca && typeof nca.subarray === 'function' && !nca.source) {
-        return { headerRaw: nca.subarray(0, 0xC00), source: new BufferRangeSource(nca) };
+        return { headerRaw: nca.subarray(0, NCA_HEADER_SIZE), source: new BufferRangeSource(nca) };
     }
     return nca;
 }
@@ -44,7 +44,7 @@ async function resolveBktrMeta(baseNcaData, updateNcaData, options) {
     if (!baseHeader || !updateHeader) throw new Error('BKTR: failed to decrypt NCA headers');
 
     const baseRomfsSec = baseHeader.sections.find(s => s.fsType === SECTION_FS_TYPE.ROMFS);
-    const updateRomfsSec = updateHeader.sections.find(s => s.fsType === SECTION_FS_TYPE.ROMFS && s.cryptoType === 4);
+    const updateRomfsSec = updateHeader.sections.find(s => s.fsType === SECTION_FS_TYPE.ROMFS && s.cryptoType === SECTION_CRYPTO_TYPE.BKTR);
     if (!baseRomfsSec) throw new Error('BKTR: base romfs section not found');
     if (!updateRomfsSec) throw new Error('BKTR: update BKTR romfs section not found');
 

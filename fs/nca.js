@@ -2,7 +2,7 @@ import { AesCtr, AesXts } from '../crypto/aes-ops.mjs';
 import { PFS0 } from './pfs0.js';
 import { Cnmt } from './cnmt.js';
 import { bytesToHex } from './bytes.js';
-import { toKeyBytes, deriveTitlekeyFromKeyArea, isMetaNca, NCA_HDR, FS_HDR, NCA_HEADER_SIZE, SECTION_FS_TYPE } from './nca-utils.js';
+import { toKeyBytes, deriveTitlekeyFromKeyArea, isMetaNca, NCA_HDR, FS_HDR, NCA_HEADER_SIZE, SECTION_FS_TYPE, SECTION_CRYPTO_TYPE } from './nca-utils.js';
 
 class SectionHeader {
     constructor(buffer) {
@@ -139,7 +139,7 @@ export function decryptNcaHeader(raw, keys = null) {
 }
 
 export async function decryptNcaSection(data, section) {
-    if (section.cryptoType === 1 || !section.cryptoKey) return data;
+    if (section.cryptoType === SECTION_CRYPTO_TYPE.AES_XTS || !section.cryptoKey) return data;
     const aesCtr = new AesCtr(section.cryptoKey, section.cryptoCounter);
     aesCtr.seek(section.offset);
     return await aesCtr.decrypt(data);
