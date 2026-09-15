@@ -1,7 +1,7 @@
 import fs from 'fs';
 import { KeysParser } from '../keys.js';
 import { PFS0 } from '../fs/pfs0.js';
-import { AesXts } from '../crypto/aes-ops.mjs';
+import { decryptNcaHeaderBytes, NCA_HDR, NCA_CONTENT_TYPE, NCA_HEADER_SIZE } from '../fs/nca-utils.js';
 
 // Analyze the level-5 (RomFS) data region of a Program NCA inside an NSP:
 //   - romfs_header fields
@@ -21,7 +21,6 @@ import { AesXts } from '../crypto/aes-ops.mjs';
 // Requires ../static/prod.keys.
 
 const keys = KeysParser.parse(fs.readFileSync('../static/prod.keys', 'utf8'));
-const keyBuf = Buffer.from(keys.header_key, 'hex');
 
 function readNsp(path) {
     const buf = fs.readFileSync(path);
@@ -29,10 +28,13 @@ function readNsp(path) {
     return { buf, files };
 }
 function progNca(nsp) {
-    const e = nsp.files.find(f => f.name.endsWith('.nca') && !f.name.endsWith('.cnmt.nca') && f.size > 100000000);
-    const data = nsp.buf.subarray(e.offset, e.offset + e.size);
-    const hdr = Buffer.from(new AesXts(keyBuf).decrypt(data.subarray(0, 0xC00), 0));
-    return { e, data, hdr };
+    for (const e of nsp.files) {
+        if (!e.name.endsWith('.nca') || e.name.endsWith('.cnmt.nca')) continue;
+        const data = nsp.buf.subarray(e.offset, e.offset + e.size);
+        const hdr = decryptNcaHeaderBytes(data.subarray(0, NCA_HEADER_SIZE), keys);
+        if (hdr[NCA_HDR.CONTENT_TYPE] === NCA_CONTENT_TYPE.PROGRAM) return { e, data, hdr: Buffer.from(hdr) };
+    }
+    throw new Error('Program NCA not found');
 }
 function level5(n) {
     const si = n.hdr.readUInt32LE(0x240 + 1 * 0x10) * 0x200;

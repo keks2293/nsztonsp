@@ -596,9 +596,9 @@ export async function packMetaNca(cnmtData, pfs0FileName, titleId, keys, log) {
 
     // ── Section layout ─────────────────────────────────────────────────────
     const sectionDataSize = pad200(pfs0Offset + pfs0Size);
-    const sectionStart = 0xC00;
+    const sectionStart = NCA_HEADER_SIZE;
     const sectionEnd = sectionStart + sectionDataSize;
-    const ncaSize = sectionEnd; // header(0xC00) + section
+    const ncaSize = sectionEnd; // header(NCA_HEADER_SIZE) + section
 
     _log('info', `  CNMT section: htable=${htablePadded.length} B, PFS0=${pfs0Size} B, total=${sectionDataSize} B, NCA=${ncaSize} B`);
 

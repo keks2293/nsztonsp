@@ -4,6 +4,12 @@ import { readLeU64, readLeU32, CHUNK_16MB } from './bytes.js';
 const UNCOMPRESSABLE_HEADER_SIZE = 0x4000;
 const SECTION_CHUNK_SIZE = CHUNK_16MB; // 16MB
 
+// NCZ container crypto_type (python nsz `Type.Crypto`), as stored in the
+// .ncz section tables. DIFFERENT from the NCA-header enum (SECTION_CRYPTO_TYPE
+// in nca-utils.js): here 1 = NONE/plaintext (FakeSection gap / unencrypted
+// ExeFS), 2 = XTS, 3 = CTR, 4 = BKTR.
+const NCZ_CRYPTO_TYPE = { NONE: 1, XTS: 2, CTR: 3, BKTR: 4 };
+
 function allocByte(n) {
     return new Uint8Array(n);
 }
@@ -86,7 +92,7 @@ class FakeSection {
     constructor(offset, size) {
         this.offset = offset;
         this.size = size;
-        this.cryptoType = 1;
+        this.cryptoType = NCZ_CRYPTO_TYPE.NONE;
         this.cryptoKey = allocByte(16);
         this.cryptoCounter = allocByte(16);
     }
@@ -192,7 +198,7 @@ class NCZDecompressor {
         const sortedSections = [...sections].sort((a, b) => a.offset - b.offset);
         const sectionAesCtrs = new Map();
         for (const s of sortedSections) {
-            if (s.cryptoType === 3 || s.cryptoType === 4) {
+            if (s.cryptoType === NCZ_CRYPTO_TYPE.CTR || s.cryptoType === NCZ_CRYPTO_TYPE.BKTR) {
                 sectionAesCtrs.set(s, new AesCtr(s.cryptoKey, s.cryptoCounter, 0, aesBackend()));
             }
         }
@@ -278,7 +284,7 @@ class NCZDecompressor {
             }
 
             let aesCtr = null;
-            if (section.cryptoType === 3 || section.cryptoType === 4) {
+            if (section.cryptoType === NCZ_CRYPTO_TYPE.CTR || section.cryptoType === NCZ_CRYPTO_TYPE.BKTR) {
                 aesCtr = new AesCtr(section.cryptoKey, section.cryptoCounter, 0, aesBackend());
                 aesCtr.seek(i);
             }

@@ -3,9 +3,13 @@ import { decryptNcaHeader, readCnmtFromMeta } from './nca.js';
 import { Ticket } from './ticket.js';
 import { buildAdapter, collectBlob, copyRange } from './adapter.js';
 import { isMetaNca, NCA_HEADER_SIZE } from './nca-utils.js';
-import { CNMT_ENTRY_TYPE } from './cnmt.js';
+import { CNMT_ENTRY_TYPE, CNMT_TITLE_TYPE } from './cnmt.js';
 
-const META_TYPE_LABELS = { 0x80: 'base', 0x81: 'update', 0x82: 'dlc' };
+const META_TYPE_LABELS = {
+    [CNMT_TITLE_TYPE.APPLICATION]: 'base',
+    [CNMT_TITLE_TYPE.APPLICATION_PATCH]: 'update',
+    [CNMT_TITLE_TYPE.ADD_ON_CONTENT]: 'dlc',
+};
 
 const ZERO_RIGHTS_ID = '0'.repeat(32);
 

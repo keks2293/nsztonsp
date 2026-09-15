@@ -14,6 +14,15 @@ export const CNMT_ENTRY_TYPE = {
     DELTA_FRAGMENT: 6,
 };
 
+// CNMT titleType (nn::ncm::ContentMetaType; switchbrew CnmT). 0x80 =
+// Application (base), 0x81 = ApplicationPatch (update), 0x82 = AddOnContent
+// (DLC). Same scale as META_TYPE_LABELS in split.js.
+export const CNMT_TITLE_TYPE = {
+    APPLICATION: 0x80,
+    APPLICATION_PATCH: 0x81,
+    ADD_ON_CONTENT: 0x82,
+};
+
 function hex(bytes, reverse = false) {
     let h = '';
     if (reverse) {
