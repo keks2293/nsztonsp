@@ -7,7 +7,7 @@ import { Cnmt, CNMT_ENTRY_TYPE, CNMT_TITLE_TYPE } from './cnmt.js';
 import { sha256 } from '../crypto/sha256.js';
 import { mergeRomFS, scatterRomFS } from './bktr-merge.js';
 import { FileRangeSource, NczStreamSource, ViewRangeSource, SparseNcaView } from './range-source.js';
-import { preparePlaintextProgramNca, writePlaintextProgramNca, packProgramNcaStream, computeProgramNcaContentId, writeProgramNcaTwoPass, extractExefsStream, extractRomfsStream, createExefsAcidFilter, packMetaNca, computeProgramNcaLayout } from './nca-pack.js';
+import { preparePlaintextProgramNca, preparePlaintextProgramNcaInPlace, writePlaintextProgramNca, packProgramNcaStream, computeProgramNcaContentId, writeProgramNcaTwoPass, extractExefsStream, extractRomfsStream, createExefsAcidFilter, packMetaNca, computeProgramNcaLayout } from './nca-pack.js';
 import { hexToBytes, writeU64LE, writeU32LE, readLeU64 } from './bytes.js';
 import { fsHeaderAt, FS_HDR, NCA_HEADER_SIZE, decryptNcaHeaderBytes, findRomfsFsHeader, findExefsFsHeader, SECTION_FS_TYPE, SECTION_CRYPTO_TYPE } from './nca-utils.js';
 import { writeFromReader } from './convert-common.js';
@@ -812,30 +812,36 @@ export async function update(readers, output, options = {}) {
         const phase1 = (p) => progress(p, phase1Label, phase1Bytes);
         log('info', `Merging RomFS into RAM (buffered; base + update streamed in physical order, no SparseNcaView)...`);
         await yieldToEventLoop();
-        const mergedRomfs = new Uint8Array(romfsDataSize);
+        // Allocate ONE contiguous NCA-sized buffer and merge the RomFS data
+        // DIRECTLY into its final slot (sec1DataOff). The ExeFS data streams
+        // into sec0DataOff next. No separate mergedRomfs/exefsData buffers and
+        // no final contiguous copy: when prepare runs, the buffer IS the NCA
+        // (minus header/hash-table/IVFC levels, which it places in place) —
+        // its contentId is a single one-shot WebCrypto digest over the buffer.
+        const L = computeProgramNcaLayout(exefsSize, romfsDataSize);
+        const ncaBuf = new Uint8Array(L.ncaSize);
         const freshBase = baseKind === 'ncz'
             ? { headerRaw: baseHeaderRaw, source: new NczStreamSource(_baseReaderRef, _baseParsedRef, log) }
             : baseInput;
         const mergeResult = await scatterRomFS({
             baseInput: freshBase, updateCtx,
             options: { keys, baseTik: baseTikData, updateTik: updateTikData },
-            // The merged RomFS accumulates in RAM at its virtual offsets — the same
+            // The merged RomFS accumulates at its final NCA offset — the same
             // scatter-style buffer, only here it is written to the output forward
             // (buffered tail) instead of via seek-back.
-            writeFn: (off, chunk) => mergedRomfs.set(chunk, off),
+            writeFn: (off, chunk) => ncaBuf.set(chunk, L.sec1DataOff + off),
             log,
             onProgress: (pos, total) => phase1((Math.min(pos, total) / total) * (romfsDataSize || 1) / phase1Bytes),
         });
-        log('info', `Merged RomFS: ${mergedRomfs.length} bytes, ${mergeResult.relocEntries} reloc entries, ${mergeResult.subsectionEntries} subsection entries`);
+        log('info', `Merged RomFS: ${romfsDataSize} bytes at sec1DataOff=0x${L.sec1DataOff.toString(16)}, ${mergeResult.relocEntries} reloc entries, ${mergeResult.subsectionEntries} subsection entries`);
 
         log('info', 'Streaming ExeFS from update Program NCA (ACID-filtered)...');
         await yieldToEventLoop();
-        const exefsData = new Uint8Array(exefsSize);
         await makeExefsStream(updateInput, keys, updateTikData, options, log)(async (chunk, off) => {
-            exefsData.set(chunk, off);
+            ncaBuf.set(chunk, L.sec0DataOff + off);
             phase1((romfsDataSize + Math.min(off + chunk.length, exefsSize)) / phase1Bytes);
         });
-        log('info', `ExeFS: ${exefsData.length} bytes`);
+        log('info', `ExeFS: ${exefsSize} bytes streamed into sec0DataOff=0x${L.sec0DataOff.toString(16)}`);
 
         phase1((romfsDataSize + exefsSize) / phase1Bytes);
 
@@ -843,10 +849,10 @@ export async function update(readers, output, options = {}) {
         updateSource = null;
         baseParsed = null;
 
-        log('info', 'Preparing merged Program NCA (hash precompute)...');
-        const preparedProgram = await preparePlaintextProgramNca(
-            exefsData, mergedRomfs, null, base.cnmt.titleId, keys, log,
-            (f) => phase1((romfsDataSize + exefsSize) / phase1Bytes + f * (romfsDataSize + exefsSize) / phase1Bytes)
+        log('info', 'Preparing merged Program NCA (hash precompute in place)...');
+        const preparedProgram = await preparePlaintextProgramNcaInPlace(
+            { ncaBuf, L, titleId: base.cnmt.titleId, keys, log,
+              progress: (f) => phase1((romfsDataSize + exefsSize) / phase1Bytes + f * (romfsDataSize + exefsSize) / phase1Bytes) }
         );
         mergedProgram = { hashHex: preparedProgram.hashHex, size: preparedProgram.size, id: preparedProgram.hashHex.slice(0, 32) };
         log('info', `Merged Program NCA: ${mergedProgram.size} bytes sha256=${mergedProgram.hashHex} contentId=${mergedProgram.id}`);
