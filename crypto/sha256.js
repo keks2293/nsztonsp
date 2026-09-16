@@ -321,9 +321,12 @@ export class NodeSHA256 {
 
 // Test hook: force the pure-JS streaming hash even when the native backend is
 // present — scripts run BOTH paths (default = native in Node; FORCE_JS=1 = the
-// exact browser path). No-op unless called.
+// exact browser path). No-op unless called. isForceJsSha256() lets callers also
+// force the pure-JS path where they would otherwise pick native/WebCrypto, so
+// FORCE_JS=1 keeps exercising the JS backend end-to-end.
 let _forceJsSha = false;
 export function setForceJsSha256(value) { _forceJsSha = !!value; }
+export function isForceJsSha256() { return _forceJsSha; }
 
 // Streaming SHA256 factory (SYNC): node:crypto when available (Node), the
 // pure-JS SHA256 otherwise (browser — identical API; all update()/digest()/hex()

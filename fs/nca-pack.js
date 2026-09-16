@@ -1,8 +1,8 @@
 import { AesXts, AesCtr } from '../crypto/aes-ops.mjs';
 import { AesEcb } from '../crypto/aes128.js';
-import { sha256, digest32, BatchDigestor, createStreamingSHA256 } from '../crypto/sha256.js';
+import { sha256, digest32, BatchDigestor, createStreamingSHA256, webcryptoDigest, isForceJsSha256 } from '../crypto/sha256.js';
 import { PFS0, PFS0Writer } from './pfs0.js';
-import { hexToBytes, writeU64LE, writeU32LE, readLeU64, CHUNK_16MB } from './bytes.js';
+import { hexToBytes, bytesToHex, writeU64LE, writeU32LE, readLeU64, CHUNK_16MB } from './bytes.js';
 import { fsHeaderAt, sectionMedia, NCA_HDR, FS_HDR, NCA_HEADER_SIZE, toKeyBytes, decryptNcaHeaderBytes, resolveTitlekey, reversedSectionCtr, findRomfsFsHeader, findExefsFsHeader, MAGIC_IVFC, IVFC_HEADER_SIZE, IVFC_ID, IVFC_MASTER_HASH_SIZE, IVFC_NUM_LEVELS, IVFC_BLOCK_SIZE_LOG2, IVFC_HASH_BLOCK_SIZE, IVFC_HASH_SIZE, IVFC_LEVELS_OFFSET, IVFC_MASTER_HASH_OFFSET, IVFC_MAX_LEVEL, IVFC_LEVEL_HDR, NCA_CONTENT_TYPE } from './nca-utils.js';
 import { yieldToEventLoop } from './event-loop.js';
 
@@ -981,12 +981,116 @@ export async function preparePlaintextProgramNca(exefsData, romfsData, controlDa
     };
 }
 
+// Plan B: fill a CALLER-PROVIDED contiguous NCA buffer (ncaBuf, laid out via
+// computeProgramNcaLayout) and hash it with a ONE-SHOT WebCrypto digest. The
+// caller writes the merged ExeFS data at L.sec0DataOff and the merged RomFS
+// data at L.sec1DataOff DIRECTLY into ncaBuf during merge/streaming — no
+// separate mergedRomfs/exefsData buffers, no second contiguous copy. This
+// computes the block hashes from those in-place views, writes the encrypted
+// header / padded hash table / IVFC levels into their slots (exe/rom padding
+// are already zeros), and digests the whole NCA at once.
+//
+// Returns { data: { ncaBuf }, hashHex, size } — writePlaintextProgramNca()
+// writes the single buffer chunked.
+export async function preparePlaintextProgramNcaInPlace({ ncaBuf, L, titleId, keys, log, progress }) {
+    const _log = typeof log === 'function' ? log : () => {};
+    const _prog = typeof progress === 'function' ? progress : () => {};
+    _log('info', '----> Preparing Program NCA (single contiguous buffer):');
+
+    // Progress over ALL hash work: PFS0 table (exefs) + IVFC (romfs) + the
+    // full-NCA SHA256 (ncaSize — one-shot or chunked below). Same shape as
+    // preparePlaintextProgramNca so callers' phase maps stay valid.
+    const workTotal = L.exefsSize + L.romfsDataSize + L.ncaSize;
+    let done = 0;
+    const rep = (n) => { done += n; _prog(done / workTotal); };
+
+    // Zero-copy views over the already-merged bytes (no copies, no temp arrays).
+    const exefsView = ncaBuf.subarray(L.sec0DataOff, L.sec0DataOff + L.exefsSize);
+    const romfsView = ncaBuf.subarray(L.sec1DataOff, L.sec1DataOff + L.romfsDataSize);
+
+    _log('info', '  Computing ExeFS PFS0 hash table...');
+    const exeHash = await buildPfs0HashTable(exefsView, PFS0_EXEFS_HASH_BLOCK_SIZE);
+    rep(L.exefsSize);
+    _log('info', '  Computing IVFC hash tree (5 levels + data)...');
+    const romIvfc = await buildIvfcHashTree(romfsView);
+    rep(L.romfsDataSize);
+
+    // Place the PFS0 hash table at the start of section 0.
+    ncaBuf.set(exeHash.hashTable, L.sec0Start);
+
+    // Place the IVFC levels h5..h1 at sec1Start; the data level (levelFiles'
+    // last entry === romfsView) is already in place at sec1DataOff.
+    let pos = L.sec1Start;
+    for (let i = 0; i < romIvfc.levelFiles.length - 1; i++) {
+        const lvl = romIvfc.levelFiles[i];
+        ncaBuf.set(lvl, pos);
+        pos += lvl.length;
+    }
+
+    _log('info', '  Building NCA header...');
+    const encHeader = buildEncryptedProgramNcaHeader({
+        titleId, keys, exeHash, exePfs0Offset: L.exeHtableSize, exefsSize: L.exefsSize, romIvfc,
+        exeSectionSize: L.exeSectionSize, romSectionSize: L.romSectionSize,
+    });
+    ncaBuf.set(encHeader, 0);
+
+    // contentId: ONE-SHOT WebCrypto digest over the whole contiguous NCA buffer
+    // (~6× the streamed pure-JS rate, #78: 440 ms vs 2.7 s on 699 MB). Falls
+    // back to chunked streaming (16 MiB, with progress) when WebCrypto is
+    // unavailable (non-secure context), FORCE_JS is set, or the NCA exceeds
+    // WebCrypto's ~2 GiB per-digest input cap. Both paths are byte-identical.
+    _log('info', '  Calculating NCA hash...');
+    const hashHex = (webcryptoDigest && !isForceJsSha256() && L.ncaSize <= 0x7FFFFFFF)
+        ? (rep(L.ncaSize), bytesToHex(new Uint8Array(await webcryptoDigest(ncaBuf))))
+        : await (async () => {
+            const ncaHasher = createStreamingSHA256();
+            for (let off = 0; off < L.ncaSize; off += CHUNK_16MB) {
+                const n = Math.min(CHUNK_16MB, L.ncaSize - off);
+                ncaHasher.update(ncaBuf.subarray(off, off + n));
+                rep(n);
+                await yieldToEventLoop();
+            }
+            return ncaHasher.hex();
+        })();
+    _log('info', '  ----> Prepared Program NCA: ' + L.ncaSize + ' bytes sha256=' + hashHex);
+
+    return {
+        data: { ncaBuf },
+        hashHex, size: L.ncaSize,
+    };
+}
+
+// Writes `count` bytes from `buf` at `baseOffset` in 16 MiB subarray chunks to
+// the output adapter, reporting per-chunk progress. Never passes full-buffer
+// views to the adapter, so SW transfer cannot detach the source buffer.
+async function writeChunked(outputAdapter, baseOffset, buf, start, count, rep) {
+    for (let off = start; off < start + count; off += CHUNK_16MB) {
+        const n = Math.min(CHUNK_16MB, start + count - off);
+        await outputAdapter.write(baseOffset + off, buf.subarray(off, off + n));
+        rep(n);
+    }
+}
+
 // Writes a previously prepared plaintext Program NCA to the output adapter.
 // The bytes written are byte-identical to what `preparePlaintextProgramNca`
 // hashed, so `prepared.hashHex` remains valid.
 export async function writePlaintextProgramNca(prepared, outputAdapter, log, baseOffset = 0, progress) {
     const _log = typeof log === 'function' ? log : () => {};
     const _prog = typeof progress === 'function' ? progress : () => {};
+    // Plan B single-buffer path: the prepared.data.ncaBuf already contains the
+    // fully-assembled NCA (header + htable + IVFC levels + data), so write the
+    // whole buffer chunked. Chunks are subarrays (never full-buffer views), so
+    // SW transfer never detaches the source.
+    if (prepared.data.ncaBuf) {
+        const ncaBuf = prepared.data.ncaBuf;
+        _log('info', '  Writing NCA to output adapter (single buffer)...');
+        const total = ncaBuf.length;
+        let done = 0;
+        const wrRep = (n) => { done += n; _prog(done / total); };
+        await writeChunked(outputAdapter, baseOffset, ncaBuf, 0, total, wrRep);
+        return;
+    }
+
     const { encHeader, exeHtablePadded, exePfs0Offset, exefsData, romIvfc,
             sec0Start, exePaddingSize, romPaddingSize } = prepared.data;
     _log('info', '  Writing NCA to output adapter (streaming)...');
