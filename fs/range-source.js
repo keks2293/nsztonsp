@@ -17,9 +17,12 @@ import { NCZDecompressor } from './ncz.js';
 // Lazy zero-copy "sparse NCA" view. Serves subarray() over [header @0, sections at
 // their original NCA offsets, zeros elsewhere] WITHOUT allocating an NCA-sized
 // buffer (the old buildSparseNcaBuffer copied every section into a full-size
-// zero-filled Uint8Array, doubling memory). A range fully inside one section
-// returns a zero-copy subview; mixed ranges (zero gap + data, header straddles)
-// are materialized — in practice those are small (exefs section gap, 0xC00).
+// zero-filled Uint8Array, doubling memory). A range fully inside the header or
+// inside ONE section returns a zero-copy subview. A range that straddles a gap
+// between sections/header is a USAGE ERROR (no current caller does it — reads
+// are whole-section: BKTR tables + ExeFS stream + patch runs), so it throws
+// instead of materializing a mixed buffer (which silently served wrong bytes:
+// start-relative offsets read as section-relative).
 export class SparseNcaView {
     constructor(header, sections) {
         this._header = header;
@@ -41,16 +44,7 @@ export class SparseNcaView {
                 return s.data.subarray(start - s.offset, end - s.offset);
             }
         }
-        const out = new Uint8Array(end - start);
-        if (start < NCA_HEADER_SIZE) {
-            out.set(this._header.subarray(start, Math.min(end, NCA_HEADER_SIZE)), 0);
-        }
-        for (const s of this._sections) {
-            const a = Math.max(start, s.offset) - start;
-            const b = Math.min(end, s.offset + s.data.length) - start;
-            if (b > a) out.set(s.data.subarray(s.offset + a - s.offset, s.offset + b - s.offset), a);
-        }
-        return out;
+        throw new Error(`SparseNcaView: read [0x${start.toString(16)}, 0x${end.toString(16)}) is outside the header and any single section — whole-section/header ranges only`);
     }
 }
 
