@@ -2,6 +2,8 @@
 
     ## ✅ Recent Changes (2026-09-16)
 
+118. **Perf: zero-copy memory re-read for the chunk-path contentId — `fs/adapter.js`**. `buildRead`'s `memory` branch used to copy every re-read slice into a fresh `Uint8Array` (`new Uint8Array(16MB)` + per-chunk `out.set`) — that memcpy runs over the whole ExeFS+RomFS during the streaming/chunk-path contentId re-read. Now, when the requested range sits wholly inside a single `_chunks` entry, it returns an in-place `subarray` view (no temp alloc, no memcpy); the copy fallback is kept only for ranges that span multiple chunks. NCZ emits 16 MB chunks on the same grid as the 16 MB re-read slices, so the zero-copy fast path hits on the dominant ExeFS+RomFS re-read; the view is safe because the chunk stays alive in `_chunks` until `collectBlob` and the consumer hashes it synchronously. Byte-identical: `test_update_sw_sim` MATCH (all modes), `test_twopass_fsa_sim`/`test_twopass_sw_sim` PASS. Verified: `node --check` OK, build OK.
+
 117. **UI: expose the Buffer (buffered one-shot) option for blob — `main.js`, `index.html`**. The Buffer pill (`main.js:97`) was hidden for blob on the assumption that buffering is meaningless in-memory; that only holds for RAM, not for hash speed — blob+buffered routes to the one-shot WebCrypto contentId (#116) at the same RAM, so the pill is now shown for blob and its tooltip (`index.html:763`) restates the real trade (1 vs 2 RomFS passes, same RAM, ~6× faster hash). UI-only, no engine change. Verified: `npm run build` OK.
 
     ## ✅ Recent Changes (2026-09-14)
