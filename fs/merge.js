@@ -38,7 +38,9 @@ export async function mergeNSP(readers, output, options = {}) {
             try {
                 const raw = await r.reader.read(e.offset, e.size);
                 cnmt = (await parseCnmtFromRawNca(raw, keys)).cnmt;
-            } catch (_e) {}
+            } catch (e) {
+                log('warn', `merge: failed to parse CNMT from ${e.name}: ${e.message} — delta fragments may be missed (nodelta scan)`);
+            }
             if (!cnmt) continue;
 
             for (const content of cnmt.contentEntries) {
