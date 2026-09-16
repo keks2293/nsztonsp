@@ -760,7 +760,7 @@
                                        <button class="pill" id="noDeltaBtn" title="Merge: exclude delta-fragment NCAs (needs keys to detect them).">No Deltas</button>
                                        <button class="pill" id="keepAcidSigBtn" title="Update: keep the original ACID signature in main.npdm (hacpack --nozeronpdmsig). Zeroed by default.">Keep ACID Sig</button>
                                         <button class="pill" id="keepAcidKeyBtn" title="Update: keep the original ACID key in main.npdm (hacpack --nozeroacidkey). Zeroed by default.">Keep ACID Key</button>
-                                        <button class="pill" id="bufferedBtn" title="Update: buffer the merged RomFS in memory (much more RAM, single pass; update is re-streamed per-pass, no separate update buffer). Off = streaming (~200 KB RAM, re-reads the sources).">Buffer</button>
+                                        <button class="pill" id="bufferedBtn" title="Program NCA hash profile. On disk/FSA: Buffer = merge RomFS in RAM then one-shot WebCrypto contentId (2× RAM vs streaming, much faster hash). On blob: output is already one contiguous in-memory buffer — Buffer switches to a one-pass in-place merge + one-shot hash (1 vs 2 RomFS passes, RAM identical, roughly 6× faster hash). Off = two-pass streaming (low RAM on disk, chunked pure-JS hash on blob).">Buffer</button>
                                         <button class="pill" id="scatterBtn" title="Update: merged RomFS in memory, update re-streamed per pass (same as Buffer). Works on every output (SW/FSA/blob) — on SW/FSA it enables Buffer automatically (hashes from the merged buffer, no readable output needed).">Scatter</button>
                                     </div>
                             </div>

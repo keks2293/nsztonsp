@@ -94,7 +94,7 @@ async function main() {
         // Scatter works on any output: on SW/FSA it implies the merged buffer
         // (hashes come from it, no readable output needed — routes to 'buffered');
         // on blob it re-streams standalone (re-reads the in-memory output).
-        bufferedBtn.classList.toggle('hidden', !(keepAcidVisible && downloadMode !== 'blob'));
+        bufferedBtn.classList.toggle('hidden', !keepAcidVisible);
         scatterBtn.classList.toggle('hidden', !keepAcidVisible);
     }
 

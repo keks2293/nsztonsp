@@ -1,5 +1,9 @@
   # NSZ to NSP Converter - Status Report
 
+    ## ✅ Recent Changes (2026-09-16)
+
+117. **UI: expose the Buffer (buffered one-shot) option for blob — `main.js`, `index.html`**. The Buffer pill (`main.js:97`) was hidden for blob on the assumption that buffering is meaningless in-memory; that only holds for RAM, not for hash speed — blob+buffered routes to the one-shot WebCrypto contentId (#116) at the same RAM, so the pill is now shown for blob and its tooltip (`index.html:763`) restates the real trade (1 vs 2 RomFS passes, same RAM, ~6× faster hash). UI-only, no engine change. Verified: `npm run build` OK.
+
     ## ✅ Recent Changes (2026-09-14)
 
 116. **Feature (Plan B): buffered full-NCA `contentId` hash for blob/memory outputs — one-shot WebCrypto digest over ONE contiguous Program NCA buffer — `fs/nca-pack.js`, `fs/update.js`, `crypto/sha256.js`**. New `preparePlaintextProgramNcaInPlace` (nca-pack.js): takes a **single caller-supplied contiguous buffer** covering the whole Program NCA; merged RomFS is written **directly into its final slot** `sec1DataOff` via the scatter-style writer and ExeFS into `sec0DataOff` (no separate `mergedRomfs`/`exefsData` buffers, no second contiguous copy), then `contentId` = **one-shot WebCrypto digest over the whole buffer** (`webcryptoDigest`, sha256.js) — the buffered-mode hash the two-pass path can't beat: one pass, one contiguous digest, no chunk churn. Buffered gate in update.js (`outRead === null && updateMode !== 'buffered'` → two-pass) now lets `updateMode: 'buffered'` write blob/memory outputs through this path; `isForceJsSha256()` (sha256.js) keeps the pure-JS SHA-256 A/B switchable (`FORCE_JS=1`) with byte-identical results. Byte-identical to the two-pass path for all modes. Verified: `node --check` OK, build OK (199.6 kb), `test_vector` PASS, `test_twopass_fsa_sim`/`test_twopass_sw_sim` byte-identical, `test_merge_ncz` ALL TESTS PASSED, `test_blob_buffered` byte-identical (`sha256=…03c3`).
