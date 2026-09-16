@@ -88,12 +88,26 @@ async function buildRead(output) {
     if (output.memory) {
         // Memory output buffers every write into output._chunks (kept sorted by
         // offset at write time, shared with buildAdapter). Read back by walking the
-        // sorted chunks and copying only the requested range — no flat copy of the
-        // whole output. Mirrors the fd read path and unlocks the streaming
+        // sorted chunks. Fast path: when the requested range sits wholly inside one
+        // chunk, return an in-place view (no temp alloc, no memcpy) — the chunk
+        // stays alive in _chunks until collectBlob and the consumer (the contentId
+        // re-read hash) reads it synchronously, so there is no detach risk. The copy
+        // fallback (temp buffer + out.set per chunk) is kept only for ranges that
+        // span multiple chunks. Mirrors the fd read path and unlocks the streaming
         // single-decompression update path (contentId by re-read) for in-memory
         // browser outputs.
         return (offset, length) => {
             const chunks = output._chunks || [];
+            for (const c of chunks) {
+                if (c.offset >= offset + length) break;
+                if (c.offset + c.data.length <= offset) continue;
+                // First chunk overlapping the range.
+                if (c.offset <= offset && offset + length <= c.offset + c.data.length) {
+                    const start = offset - c.offset;
+                    return c.data.subarray(start, start + length);
+                }
+                break; // range spans chunks — fall back to the copy below
+            }
             const out = new Uint8Array(length);
             let filled = 0;
             for (const c of chunks) {
