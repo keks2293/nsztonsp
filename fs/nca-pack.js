@@ -1217,7 +1217,7 @@ export async function packProgramNcaStream({ adapter, ncaOffset, exefsSize, romf
             let roff = 0;
             while (roff < romfsDataSize) {
                 const n = Math.min(CHUNK_16MB, romfsDataSize - roff);
-                ivfc.update(await adapter.read(ncaOffset + sec1DataOff + roff, n), true);
+                for (const v of await adapter.read(ncaOffset + sec1DataOff + roff, n)) ivfc.update(v, true);
                 roff += n;
                 rep(n);
             }
@@ -1279,7 +1279,7 @@ export async function packProgramNcaStream({ adapter, ncaOffset, exefsSize, romf
         let off = 0;
         while (off < size) {
             const n = Math.min(CHUNK_16MB, size - off);
-            h.update(await adapter.read(ncaOffset + offset + off, n));
+            for (const v of await adapter.read(ncaOffset + offset + off, n)) h.update(v);
             off += n;
             rep(n);
         }
