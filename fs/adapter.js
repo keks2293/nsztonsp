@@ -51,16 +51,23 @@ function collectBlob(adapter, totalSize) {
 }
 
 // Build a seekable read(offset, length) for the output, or null if the output
-// cannot be read back (e.g. sequential-only SW download, chunked memory). Used by
-// the streaming update path to re-read the written Program NCA and compute its
-// contentId (sha256) — mirroring hacpack's nca_calculate_hash reading the file.
+// cannot be read back (e.g. sequential-only SW download). read() returns the
+// requested range as an ORDERED LIST of zero-copy views (Uint8Array[]) covering
+// [offset, offset+length) in file order — the consumer (the streaming contentId /
+// IVFC hashers) feeds the views sequentially, which is all a streaming hash needs,
+// so no flat buffer / memcpy is required. fd and FSA have no pre-existing chunk
+// structure, so they return a single view over a freshly-read buffer; the memory
+// output returns one in-place view per overlapping _chunks entry (the chunks stay
+// alive until collectBlob). Used by the streaming update path to re-read the
+// written Program NCA and compute its contentId (sha256) — mirroring hacpack's
+// nca_calculate_hash reading the file.
 async function buildRead(output) {
     if (output.fd !== undefined) {
         const fs = await import('node:fs');
         return (offset, length) => {
             const buf = Buffer.alloc(length);
             fs.readSync(output.fd, buf, 0, length, offset);
-            return new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength);
+            return [new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength)];
         };
     }
     // NOTE: the File System Access API's FileSystemWritableFileStream has seek()
@@ -82,43 +89,30 @@ async function buildRead(output) {
                 filled += n;
             }
             reader.releaseLock();
-            return out.subarray(0, filled);
+            return [out.subarray(0, filled)];
         };
     }
     if (output.memory) {
         // Memory output buffers every write into output._chunks (kept sorted by
-        // offset at write time, shared with buildAdapter). Read back by walking the
-        // sorted chunks. Fast path: when the requested range sits wholly inside one
-        // chunk, return an in-place view (no temp alloc, no memcpy) — the chunk
-        // stays alive in _chunks until collectBlob and the consumer (the contentId
-        // re-read hash) reads it synchronously, so there is no detach risk. The copy
-        // fallback (temp buffer + out.set per chunk) is kept only for ranges that
-        // span multiple chunks. Mirrors the fd read path and unlocks the streaming
-        // single-decompression update path (contentId by re-read) for in-memory
-        // browser outputs.
+        // offset at write time, shared with buildAdapter). read() walks the sorted
+        // chunks and returns the requested range as an ordered list of in-place
+        // zero-copy views — one subarray per overlapping chunk (no temp alloc, no
+        // memcpy; the chunk buffers stay alive in _chunks until collectBlob, and
+        // the consumer hashes them sequentially). Simpler and copy-free for every
+        // range, including ones that span multiple chunks (the scatter case, where
+        // BKTR-sized chunks make a flat single-buffer read impossible to build
+        // without a copy).
         return (offset, length) => {
             const chunks = output._chunks || [];
-            for (const c of chunks) {
-                if (c.offset >= offset + length) break;
-                if (c.offset + c.data.length <= offset) continue;
-                // First chunk overlapping the range.
-                if (c.offset <= offset && offset + length <= c.offset + c.data.length) {
-                    const start = offset - c.offset;
-                    return c.data.subarray(start, start + length);
-                }
-                break; // range spans chunks — fall back to the copy below
-            }
-            const out = new Uint8Array(length);
-            let filled = 0;
+            const views = [];
             for (const c of chunks) {
                 if (c.offset >= offset + length) break;
                 if (c.offset + c.data.length <= offset) continue;
                 const s = Math.max(c.offset, offset);
                 const e = Math.min(c.offset + c.data.length, offset + length);
-                out.set(c.data.subarray(s - c.offset, e - c.offset), s - offset);
-                filled += e - s;
+                views.push(c.data.subarray(s - c.offset, e - c.offset));
             }
-            return out.subarray(0, filled);
+            return views;
         };
     }
     return null;
