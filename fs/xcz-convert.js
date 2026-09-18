@@ -1,7 +1,7 @@
 import { HFS0Writer } from './hfs0.js';
 import { XCIReader } from './xci.js';
 import { buildAdapter, collectBlob } from './adapter.js';
-import { collectFileMetas, writeFromReader } from './convert-common.js';
+import { collectFileMetas, writeFromReader, collectCnmtHashMap } from './convert-common.js';
 
 const PARTITION_HEADER_SIZE = 0x8000;
 const ROOT_HFS0_PADDED_SIZE = 0x8000;
@@ -26,15 +26,7 @@ async function buildPartitionMetas(xci, verify, adapter, extractCnmtHashMap) {
 
         const partitionFiles = hfs0.getFiles();
 
-        const cnmtHashMap = new Map();
-        if (verify && extractCnmtHashMap) {
-            const cnmtFiles = partitionFiles.filter(f => f.name.toLowerCase().endsWith('.cnmt.nca'));
-            for (const cnmtFile of cnmtFiles) {
-                const cnmtData = await adapter.read(cnmtFile.offset, cnmtFile.size);
-                const m = await extractCnmtHashMap(cnmtData);
-                for (const [ncaId, hash] of m) cnmtHashMap.set(ncaId, hash);
-            }
-        }
+        const cnmtHashMap = await collectCnmtHashMap(partitionFiles, (offset, size) => adapter.read(offset, size), extractCnmtHashMap, verify);
 
         const fileMetas = await collectFileMetas(partitionFiles, adapter);
         const fileTotalSize = fileMetas.reduce((s, m) => s + m.size, 0);

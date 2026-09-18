@@ -1,6 +1,6 @@
 import { PFS0Writer, PFS0 } from './pfs0.js';
 import { buildAdapter, collectBlob } from './adapter.js';
-import { collectFileMetas, writeFromReader } from './convert-common.js';
+import { collectFileMetas, writeFromReader, collectCnmtHashMap } from './convert-common.js';
 
 async function convertNSZStreaming(pfs0, adapter, options, cnmtHashes = new Map()) {
     const { verify = false, fixPadding = false } = options;
@@ -48,16 +48,9 @@ export async function convertNSZ(reader, output, options = {}) {
     const pfs0 = await PFS0.open(reader);
     log('info', `[timing] Container parse: ${((performance.now() - t0) / 1000).toFixed(2)}s`);
 
-    const cnmtHashMap = new Map();
+    t0 = performance.now();
+    const cnmtHashMap = await collectCnmtHashMap(pfs0.getFiles(), (offset, size) => reader.read(offset, size), extractCnmtHashMap, verify);
     if (verify && extractCnmtHashMap) {
-        t0 = performance.now();
-        for (const f of pfs0.getFiles()) {
-            if (f.name.toLowerCase().endsWith('.cnmt.nca')) {
-                const data = await reader.read(f.offset, f.size);
-                const m = await extractCnmtHashMap(data);
-                for (const [ncaId, hash] of m) cnmtHashMap.set(ncaId, hash);
-            }
-        }
         log('info', `[timing] CNMT extraction: ${((performance.now() - t0) / 1000).toFixed(2)}s`);
     }
 
