@@ -49,6 +49,23 @@ export function verifyNcaHash({ hash, inputName, outputName, cnmtHashMap, log })
     }
 }
 
+// ── CNMT hash map ───────────────────────────────────────────────────────────
+
+// Build the CNMT `contentId → hash` map consumed by verifyNcaHash. `read(offset,
+// size)` serves the container bytes (NSZ: reader, XCZ: adapter). Returns an empty
+// map when verification is off or no extractor is available, so callers cannot
+// forget the `verify` gate.
+export async function collectCnmtHashMap(files, read, extractCnmtHashMap, verify) {
+    const map = new Map();
+    if (!verify || !extractCnmtHashMap) return map;
+    for (const f of files) {
+        if (!f.name.toLowerCase().endsWith('.cnmt.nca')) continue;
+        const m = await extractCnmtHashMap(await read(f.offset, f.size));
+        for (const [ncaId, hash] of m) map.set(ncaId, hash);
+    }
+    return map;
+}
+
 // ── Member meta + write ─────────────────────────────────────────────────────
 
 // Collect output metas for PFS0/HFS0 members. NCZ files are probed (header
