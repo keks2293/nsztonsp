@@ -49,7 +49,7 @@ export async function convertNSZ(reader, output, options = {}) {
     log('info', `[timing] Container parse: ${((performance.now() - t0) / 1000).toFixed(2)}s`);
 
     const cnmtHashMap = new Map();
-    if (extractCnmtHashMap) {
+    if (verify && extractCnmtHashMap) {
         t0 = performance.now();
         for (const f of pfs0.getFiles()) {
             if (f.name.toLowerCase().endsWith('.cnmt.nca')) {
