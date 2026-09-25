@@ -570,9 +570,10 @@ export async function update(readers, output, options = {}) {
 
         // ── Build NCA range sources (the NSZ→NSP converter's streaming discipline) ──
         // Base: the whole NCA is served from the container — .nsp is random access,
-        // .nsz is ONE sequential NCZ decompression pass (base offsets are monotonic
-        // in merge order, so every needed range is served in-stream; nothing is
-        // buffered beyond transient 16 MB decrypt chunks).
+        // .nsz is ONE sequential NCZ decompression pass. The base ranges are
+        // registered in PHYSICAL (ascending) order (bktr-merge.js sorts them — the
+        // base physical order need not match the reloc/virtual order, e.g. LN2), so
+        // the stream can serve them; the merge reads them back in virtual order.
         // Update: patch physical offsets are NOT monotonic, so a .nsz update cannot
         // stream — its BKTR + ExeFS sections are decompressed once and served from a
         // zero-copy sparse view. A .nsp update is read on demand from the container.
@@ -585,7 +586,7 @@ export async function update(readers, output, options = {}) {
 
         let baseSource;
         if (baseKind === 'ncz') {
-            log('info', `Base .nsz: RomFS section (0x${baseRomfsSec.offset.toString(16)}..0x${(baseRomfsSec.endOffset).toString(16)}) streamed from NCZ, nothing buffered...`);
+            log('info', `Base .nsz: RomFS section (0x${baseRomfsSec.offset.toString(16)}..0x${(baseRomfsSec.endOffset).toString(16)}) streamed from NCZ in one pass...`);
             baseSource = new NczStreamSource(baseReader, baseParsed, log);
         } else {
             log('info', `Base .nsp: RomFS section (0x${baseRomfsSec.offset.toString(16)}..0x${(baseRomfsSec.endOffset).toString(16)}) read on demand from container...`);

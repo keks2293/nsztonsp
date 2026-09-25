@@ -27,6 +27,32 @@ function toNcaInput(nca) {
 
 const BKTR_MAGIC = 0x52544B42; // "BKTR"
 
+// Register the base romfs ranges on a source (possibly a sequential NczStreamSource).
+// The base physical order is NOT guaranteed to match the reloc (virtual) order, and
+// entries can OVERLAP or NEST: an update re-lays-out the base romfs, so several
+// virtual runs may reference the same base offset with different lengths (LN2:
+// 2780/2800 base ranges are non-monotonic in virtual order, 275 overlap after a
+// plain sort). A sequential source needs strictly-increasing, non-overlapping
+// ranges, so: sort by start, merge overlapping/nested ranges into their union, then
+// register. Reads are sub-ranges and map to the merged range by physical offset,
+// independent of registration order. File/buffer sources ignore registration (no-op),
+// so this is a no-op for them.
+//   ranges: [{ start, end }] absolute NCA offsets of each base run.
+function registerBaseRanges(source, ranges) {
+    ranges.sort((a, b) => a.start - b.start);
+    const merged = [];
+    for (const r of ranges) {
+        const last = merged[merged.length - 1];
+        if (last && r.start <= last.end) {
+            last.end = Math.max(last.end, r.end); // overlap or nesting — take the union
+        } else {
+            merged.push({ start: r.start, end: r.end });
+        }
+    }
+    for (const r of merged) source.registerRange(r.start, r.end - r.start);
+    return merged;
+}
+
 // Shared BKTR preamble, step 1: decrypt headers, find sections, resolve titlekeys.
 // Purely header-based — does NOT read the update source. Returns the crypto
 // parameters plus the absolute table offsets, so the caller can pre-register the
@@ -199,17 +225,21 @@ export async function mergeRomFS(baseNcaData, updateNcaData, options = {}) {
         = { ...meta, ...await readBktrTables(updateNcaData.source, meta) };
     const totalSize = relocBlock.totalSize;
 
-    // Pre-register the base romfs ranges (in strictly increasing order) so an
-    // NCZ stream source can serve them in ONE sequential decompression pass
-    // without buffering the whole base romfs section. File/buffer sources
-    // ignore registration.
+    // Pre-register the base romfs ranges so an NCZ stream source can serve them in
+    // ONE sequential decompression pass. The merge below READS them in virtual
+    // (entry) order — a read is a sub-range and maps to its range by physical
+    // offset, independent of registration order. registerBaseRanges sorts by
+    // physical offset and merges overlaps (see its comment) because the base
+    // physical order need not match the reloc (virtual) order.
+    const baseRanges = [];
     for (let i = 0; i < relocBlock.entries.length; i++) {
         const e = relocBlock.entries[i];
         if (e.isPatch) continue;
         const nextVirt = i + 1 < relocBlock.entries.length
             ? relocBlock.entries[i + 1].virtOffset : relocBlock.totalSize;
-        baseNcaData.source.registerRange(baseRomfsSecMeta.offset + e.physOffset, nextVirt - e.virtOffset);
+        baseRanges.push({ start: baseRomfsSecMeta.offset + e.physOffset, end: baseRomfsSecMeta.offset + e.physOffset + (nextVirt - e.virtOffset) });
     }
+    registerBaseRanges(baseNcaData.source, baseRanges);
 
     const baseCtr = new AesCtr(baseTitlekey, baseNonce);
 
@@ -336,15 +366,20 @@ export async function scatterRomFS({ baseInput, updateCtx, options, writeFn, log
         await yieldToEventLoop();
     };
 
-    // ── Pass B: base regions (virtual order == physical order for base) ─────
-    // Pre-register the base non-patch ranges (strictly increasing physical
-    // offsets — base sectors are sequential) so an NCZ base streams in ONE pass.
-    // registerRange is a no-op on non-stream sources (fs/range-source.js:78).
+    // ── Pass B: base regions ─────────────────────────────────────────────────
+    // Pre-register the base non-patch ranges so an NCZ base streams in ONE pass.
+    // The reads below stay in virtual (entry) order — a read is a sub-range and
+    // maps to its range by physical offset, independent of registration order.
+    // registerBaseRanges sorts by physical offset and merges overlaps (see its
+    // comment) because the base physical order need not match the reloc (virtual)
+    // order. registerRange is a no-op on non-stream sources (fs/range-source.js).
     const baseSource = baseInput.source;
+    const baseRanges = [];
     for (const e of entries) {
         if (e.isPatch) continue;
-        baseSource.registerRange(baseRomfsSecMeta.offset + e.physOffset, e.nextVirt - e.virtOffset);
+        baseRanges.push({ start: baseRomfsSecMeta.offset + e.physOffset, end: baseRomfsSecMeta.offset + e.physOffset + (e.nextVirt - e.virtOffset) });
     }
+    registerBaseRanges(baseSource, baseRanges);
 
     const baseCtr = new AesCtr(baseTitlekey, baseNonce);
     for (const e of entries) {
