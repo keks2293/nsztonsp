@@ -1,9 +1,9 @@
 import { AesCtr } from '../crypto/aes-ops.mjs';
 import { decryptNcaHeader } from './nca.js';
-import { BufferRangeSource, NczStreamSource } from './range-source.js';
+import { NczStreamSource } from './range-source.js';
 import { readLeU64, readLeU32, CHUNK_16MB } from './bytes.js';
 import { yieldToEventLoop } from './event-loop.js';
-import { decryptNcaHeaderBytes, fsHeaderAt, reversedSectionCtr, extractTitlekeyFromTik, deriveTitlekeyFromKeyArea, IVFC_LEVEL_HDR, IVFC_LEVELS_OFFSET, IVFC_MAX_LEVEL, FS_HDR, SECTION_FS_TYPE, SECTION_CRYPTO_TYPE, NCA_HEADER_SIZE } from './nca-utils.js';
+import { decryptNcaHeaderBytes, fsHeaderAt, reversedSectionCtr, extractTitlekeyFromTik, deriveTitlekeyFromKeyArea, IVFC_LEVEL_HDR, IVFC_LEVELS_OFFSET, IVFC_MAX_LEVEL, FS_HDR, SECTION_FS_TYPE, SECTION_CRYPTO_TYPE } from './nca-utils.js';
 import {
     parseBktrHeader,
     decryptBktrTableData,
@@ -15,16 +15,10 @@ import {
     lookupTitlekeyFromDatabase,
 } from './bktr.js';
 
-// Accept either a full NCA buffer (Uint8Array) or an NcaInput:
-// { headerRaw: Uint8Array(0xC00), source: RangeSource } where
-// source.read(offset, length) serves NCA ciphertext by absolute offset.
-function toNcaInput(nca) {
-    if (nca && typeof nca.subarray === 'function' && !nca.source) {
-        return { headerRaw: nca.subarray(0, NCA_HEADER_SIZE), source: new BufferRangeSource(nca) };
-    }
-    return nca;
-}
-
+// An NcaInput is { headerRaw: Uint8Array(0xC00), source: RangeSource } where
+// source.read(offset, length) serves NCA ciphertext by absolute offset. Callers
+// (update.js) always build one; mergeRomFS/scatterRomFS/resolveBktrMeta take it
+// as-is (no raw-buffer auto-wrap).
 const BKTR_MAGIC = 0x52544B42; // "BKTR"
 
 // Register the base romfs ranges on a source (possibly a sequential NczStreamSource).
@@ -61,9 +55,6 @@ async function resolveBktrMeta(baseNcaData, updateNcaData, options) {
     const { keys, baseTitlekey: providedBaseTitlekey, updateTitlekey: providedUpdateTitlekey, baseTik, updateTik, titlekeysFile } = options;
 
     if (!keys) throw new Error('BKTR: keys required');
-
-    baseNcaData = toNcaInput(baseNcaData);
-    updateNcaData = toNcaInput(updateNcaData);
 
     let baseHeader, updateHeader;
     try {
@@ -216,8 +207,6 @@ async function readPatchRun(updReader, updateRomfsSecOffset, subBlock, titlekey,
 // ── Virtual-order merge (default) ─────────────────────────────────────────────
 export async function mergeRomFS(baseNcaData, updateNcaData, options = {}) {
     const { keys, onChunk, onProgress } = options;
-    baseNcaData = toNcaInput(baseNcaData);
-    updateNcaData = toNcaInput(updateNcaData);
 
     const meta = await resolveBktrMeta(baseNcaData, updateNcaData, options);
     const { baseRomfsSecMeta, dataLevelOffset, dataLevelSize, relocBlock, subBlock,
