@@ -199,7 +199,7 @@ async function rebuildCnmtNca(baseMeta, updateMeta, keys, log, mergedProgram = n
 // re-decompression for each extra section (e.g. update BKTR + ExeFS). Returns
 // the raw section buffers in the same order as `ranges`. Callers are always NCZ
 // (the raw-container read path is covered by FileRangeSource).
-async function extractNcaSections(reader, ranges, keys, log) {
+async function extractNcaSections(reader, ranges, keys, log, onProgress = null) {
     const parsed = await parseNczSections(reader);
     const last = ranges[ranges.length - 1];
     const lastEnd = last.offset + last.size;
@@ -207,6 +207,9 @@ async function extractNcaSections(reader, ranges, keys, log) {
         throw new Error(`extractNcaSections: last section range [${last.offset}, ${lastEnd}) exceeds NCA size ${parsed.ncaSize}`);
     }
 
+    // Progress is measured by how many of the requested section bytes have been
+    // filled (monotonic; reaches exactly 1.0 when the last range is complete).
+    const totalBytes = ranges.reduce((s, r) => s + r.size, 0);
     const buffers = ranges.map(r => new Uint8Array(r.size));
     const filled = ranges.map(() => 0);
     const decomp = new NCZDecompressor(reader);
@@ -227,6 +230,10 @@ async function extractNcaSections(reader, ranges, keys, log) {
                     buffers[i].set(data, target);
                     filled[i] += data.length;
                 }
+                if (onProgress) {
+                    const done = filled.reduce((a, b) => a + b, 0);
+                    onProgress(Math.min(1, done / totalBytes));
+                }
             },
             parsed,
         );
@@ -239,6 +246,7 @@ async function extractNcaSections(reader, ranges, keys, log) {
             throw new Error(`extractNcaSections: incomplete section data (${filled[i]}/${ranges[i].size})`);
         }
     }
+    if (onProgress) onProgress(1);
     return buffers;
 }
 
@@ -615,7 +623,13 @@ export async function update(readers, output, options = {}) {
                 updRanges.push({ offset: updateExefsSec.offset, size: updateExefsSec.endOffset - updateExefsSec.offset });
                 log('info', `Extracting update NCZ sections in one pass: ${updRanges.map(r => `[0x${r.offset.toString(16)}..0x${(r.offset + r.size).toString(16)})`).join(', ')}...`);
                 await yieldToEventLoop();
-                const updData = await extractNcaSections(updateReader, updRanges, keys, log);
+                // Prep phase: this single-pass NCZ decompression is the long silent
+                // part of the pre-merge reads — report it as a labeled phase so the
+                // bar/status move while input sections are being read.
+                const sectionBytes = updRanges.reduce((s, r) => s + r.size, 0);
+                progress(0, 'Reading update sections...', sectionBytes);
+                const updData = await extractNcaSections(updateReader, updRanges, keys, log,
+                    (frac) => progress(frac, 'Reading update sections...', sectionBytes));
                 const updateSections = [];
                 let u = 0;
                 if (hasBktrRomfs && updateRomfsSec) updateSections.push({ offset: updateRomfsSec.offset, data: updData[u++] });
