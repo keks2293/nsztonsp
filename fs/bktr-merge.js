@@ -3,7 +3,7 @@ import { decryptNcaHeader } from './nca.js';
 import { BufferRangeSource, NczStreamSource } from './range-source.js';
 import { readLeU64, readLeU32, CHUNK_16MB } from './bytes.js';
 import { yieldToEventLoop } from './event-loop.js';
-import { decryptNcaHeaderBytes, fsHeaderAt, reversedSectionCtr, extractTitlekeyFromTik, deriveTitlekeyFromKeyArea, IVFC_LEVEL_HDR, IVFC_LEVELS_OFFSET, IVFC_MAX_LEVEL, FS_HDR, SECTION_FS_TYPE, SECTION_CRYPTO_TYPE } from './nca-utils.js';
+import { decryptNcaHeaderBytes, fsHeaderAt, reversedSectionCtr, extractTitlekeyFromTik, deriveTitlekeyFromKeyArea, IVFC_LEVEL_HDR, IVFC_LEVELS_OFFSET, IVFC_MAX_LEVEL, FS_HDR, SECTION_FS_TYPE, SECTION_CRYPTO_TYPE, NCA_HEADER_SIZE } from './nca-utils.js';
 import {
     parseBktrHeader,
     decryptBktrTableData,
@@ -94,13 +94,13 @@ async function resolveBktrMeta(baseNcaData, updateNcaData, options) {
     // Get titlekeys (prefer provided, then titlekeys database, then tik, then key_area)
     let updateTitlekey = providedUpdateTitlekey
         || (titlekeysMap ? lookupTitlekeyFromDatabase(updateHeader.rightsId, titlekeysMap) : null)
-        || (updateTik ? extractTitlekeyFromTik(updateTik, keys, updateHeader.rightsId) : null)
+        || (updateTik ? extractTitlekeyFromTik(updateTik, keys, updateHeader.rightsId, updateDecHeader) : null)
         || deriveTitlekeyFromKeyArea(updateDecHeader, keys);
     if (!updateTitlekey) throw new Error('BKTR: cannot get update titlekey (provide titlekeysFile or valid updateTik)');
 
     let baseTitlekey = providedBaseTitlekey
         || (titlekeysMap ? lookupTitlekeyFromDatabase(baseHeader.rightsId, titlekeysMap) : null)
-        || (baseTik ? extractTitlekeyFromTik(baseTik, keys, baseHeader.rightsId) : null)
+        || (baseTik ? extractTitlekeyFromTik(baseTik, keys, baseHeader.rightsId, baseDecHeader) : null)
         || deriveTitlekeyFromKeyArea(baseDecHeader, keys);
     if (!baseTitlekey) throw new Error('BKTR: cannot get base titlekey (provide titlekeysFile or valid baseTik)');
 

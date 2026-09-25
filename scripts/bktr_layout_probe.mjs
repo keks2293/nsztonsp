@@ -3,8 +3,8 @@ import { createHash } from 'crypto';
 import { KeysParser } from '../keys.js';
 import { decryptNcaHeader } from '../fs/nca.js';
 import { PFS0 } from '../fs/pfs0.js';
+import { extractTitlekeyFromTik } from '../fs/nca-utils.js';
 import { AesCtr, AesXts } from '../crypto/aes-ops.mjs';
-import { AesEcb } from '../crypto/aes128.js';
 
 const DIR = '/Users/rmitkov/Downloads/Stardew Valley [NSZ]';
 const keys = KeysParser.parse(fs.readFileSync('../static/prod.keys', 'utf8'));
@@ -15,13 +15,12 @@ async function getBaseDecryptedSection() {
     const entries = new PFS0(pfs0).getFiles();
     const tik = entries.find(t => t.name.toLowerCase().endsWith('.tik'));
     const tikData = pfs0.subarray(tik.offset, tik.offset + tik.size);
-    const bKek = Buffer.from(keys.titlekek_02, 'hex');
-    const bKey = new AesEcb(bKek).decrypt(Buffer.from(tikData.subarray(0x180, 0x190)));
     const prog = entries.find(e => e.name.toLowerCase().endsWith('.nca') && !e.name.toLowerCase().endsWith('.cnmt.nca'));
     const raw = pfs0.subarray(prog.offset, prog.offset + prog.size);
     const h = decryptNcaHeader(raw.subarray(0, 0xC00), keys);
     const xts = new AesXts(Buffer.isBuffer(keys.header_key) ? keys.header_key : Buffer.from(keys.header_key, 'hex'));
     const dec = Buffer.from(xts.decrypt(raw.subarray(0, 0xC00), 0));
+    const bKey = extractTitlekeyFromTik(tikData, keys, null, dec);
     const s = h.sections[1];
     const nonceRaw = dec.subarray(0x400 + 0x200 + 0x140, 0x400 + 0x200 + 0x148);
     const nonce = Buffer.alloc(8);

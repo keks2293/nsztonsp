@@ -4,19 +4,13 @@ import { KeysParser } from '../keys.js';
 import { PFS0 } from '../fs/pfs0.js';
 import { decryptNcaHeader } from '../fs/nca.js';
 import { mergeRomFS } from '../fs/bktr-merge.js';
-import { AesEcb } from '../crypto/aes128.js';
+import { extractTitlekeyFromTik, decryptNcaHeaderBytes } from '../fs/nca-utils.js';
 
 const DIR = '/Users/rmitkov/Downloads/Stardew Valley [NSZ]';
 const basePath = `${DIR}/Stardew Valley [0100E65002BB8000][v0] (0.87 GB).nsp`;
 const updatePath = `${DIR}/Stardew Valley [0100E65002BB8800][v1310720] (0.67 GB).nsp`;
 const keys = KeysParser.parse(fs.readFileSync('../static/prod.keys', 'utf8'));
 const sh = b => createHash('sha256').update(b).digest('hex');
-
-function extractTitlekeyFromTik(tikData, keys) {
-    const kekRaw = keys.titlekek_02 || keys.titlekek_source;
-    const kek = typeof kekRaw === 'string' ? Buffer.from(kekRaw, 'hex') : Buffer.from(kekRaw);
-    return new AesEcb(kek).decrypt(Buffer.from(tikData.subarray(0x180, 0x190)));
-}
 
 function members(path) {
     const d = fs.readFileSync(path);
@@ -37,8 +31,8 @@ const baseNca = getProgram(base.d, base.entries);
 const updNca = getProgram(upd.d, upd.entries);
 const baseTik = readTik(base.d, base.entries);
 const updTik = readTik(upd.d, upd.entries);
-const baseTitlekey = extractTitlekeyFromTik(baseTik, keys);
-const updateTitlekey = extractTitlekeyFromTik(updTik, keys);
+const baseTitlekey = extractTitlekeyFromTik(baseTik, keys, null, decryptNcaHeaderBytes(baseNca.subarray(0, 0xC00), keys));
+const updateTitlekey = extractTitlekeyFromTik(updTik, keys, null, decryptNcaHeaderBytes(updNca.subarray(0, 0xC00), keys));
 
 const { merged, mergedData, relocEntries, subsectionEntries } = await mergeRomFS(baseNca, updNca, { keys, baseTitlekey, updateTitlekey });
 const mergedBuf = Buffer.from(merged.buffer, merged.byteOffset, merged.length);

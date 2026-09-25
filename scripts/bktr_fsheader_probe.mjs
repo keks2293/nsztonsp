@@ -2,8 +2,8 @@ import fs from 'fs';
 import { KeysParser } from '../keys.js';
 import { decryptNcaHeader } from '../fs/nca.js';
 import { PFS0 } from '../fs/pfs0.js';
+import { extractTitlekeyFromTik } from '../fs/nca-utils.js';
 import { AesCtr, AesXts } from '../crypto/aes-ops.mjs';
-import { AesEcb } from '../crypto/aes128.js';
 
 const DIR = '/Users/rmitkov/Downloads/Stardew Valley [NSZ]';
 const basePath = `${DIR}/Stardew Valley [0100E65002BB8000][v0] (0.87 GB).nsp`;
@@ -110,9 +110,7 @@ for (const [label, path] of [['BASE', basePath], ['UPDATE', updatePath]]) {
             // titlekey
             let titlekey = null;
             if (tikData && tikData.length >= 0x190) {
-                const kekRaw = keys.titlekek_02 || keys.titlekek_source;
-                const kek = typeof kekRaw === 'string' ? Buffer.from(kekRaw, 'hex') : Buffer.from(kekRaw);
-                titlekey = new AesEcb(kek).decrypt(Buffer.from(tikData.subarray(0x180, 0x190)));
+                titlekey = extractTitlekeyFromTik(tikData, keys, null, dec);
             }
             console.log(`  base titlekey: ${titlekey ? titlekey.toString('hex') : 'N/A'}`);
 

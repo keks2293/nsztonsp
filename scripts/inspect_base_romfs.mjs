@@ -61,8 +61,6 @@ for (let i = 0; i < 4; i++) {
         const ctrRaw = fsHdr.subarray(0x140, 0x148);
         const ctrRev = new Uint8Array(8);
         for (let j = 0; j < 8; j++) ctrRev[j] = ctrRaw[7-j];
-        const titlekey = hexToBytes(keys.titlekek_02); // placeholder - we need actual titlekey
-        
         // Let's use tik to get titlekey
         const tikEntry = baseFiles.find(f => f.name.endsWith('.tik'));
         const tikData = baseNsp.subarray(tikEntry.offset, tikEntry.offset + tikEntry.size);

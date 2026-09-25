@@ -131,12 +131,33 @@ export function deriveTitlekeyFromKeyArea(decHeader, keys) {
     return unwrapped.subarray(0x20, 0x30);
 }
 
+// Select the titlekek for an NCA from its header crypto types, mirroring
+// hactool nca.c nca_process: crypto_type = max(crypto_type, crypto_type2); if
+// nonzero, index = crypto_type - 1. Like hactool there is NO fallback: without
+// a decrypted header (or when the computed titlekek_XX is absent from the keys)
+// this returns null so the caller surfaces the missing key instead of silently
+// decrypting with the wrong titlekek — the old titlekek_02 fallback masked
+// crypto_type2 > 3 NCAs (e.g. the Little Nightmares II update needs titlekek_0a).
+function titlekekFor(keys, decHeader) {
+    if (!decHeader) return null;
+    const maxCt = Math.max(decHeader[NCA_HDR.CRYPTO_TYPE], decHeader[NCA_HDR.CRYPTO_TYPE2]);
+    const idx = maxCt > 0 ? maxCt - 1 : 0;
+    const name = `titlekek_${idx.toString(16).padStart(2, '0')}`;
+    // Prefer the explicit keys-file entry (scene/prod titlekeks.txt lists all
+    // revisions); fall back to the master-key-derived array.
+    if (keys[name]) return keys[name];
+    if (keys.titleKeks && keys.titleKeks[idx]) return keys.titleKeks[idx];
+    return null;
+}
+
 // Extract titlekey from a .tik file (hactool: titlekek ECB-decrypt of bytes
-// [0x180, 0x190)). Scene/prod tickets carry the mk2 titlekey, so titlekek_02 is used.
-// Optionally verifies rights_id at 0x2A0 against expectedRightsId (32-char hex).
-export function extractTitlekeyFromTik(tikData, keys, expectedRightsId = null) {
+// [0x180, 0x190)). The titlekek is selected by the NCA header crypto types via
+// titlekekFor, so decHeader is required (without it there is no way to pick the
+// right titlekek — no fallback). Optionally verifies rights_id at 0x2A0 against
+// expectedRightsId (32-char hex). Returns null when no matching titlekek exists.
+export function extractTitlekeyFromTik(tikData, keys, expectedRightsId = null, decHeader = null) {
     if (!tikData || tikData.length < (expectedRightsId ? 0x2B0 : 0x190)) return null;
-    const titlekek = keys.titlekek_02;
+    const titlekek = titlekekFor(keys, decHeader);
     if (!titlekek) return null;
     if (expectedRightsId) {
         const rid = tikData.subarray(0x2A0, 0x2B0);
@@ -149,7 +170,7 @@ export function extractTitlekeyFromTik(tikData, keys, expectedRightsId = null) {
 // Resolve titlekey for an NCA: tik first (if provided), then key-area fallback.
 export function resolveTitlekey(tikData, decHeader, keys) {
     if (tikData) {
-        const tk = extractTitlekeyFromTik(tikData, keys);
+        const tk = extractTitlekeyFromTik(tikData, keys, null, decHeader);
         if (tk) return tk;
     }
     return deriveTitlekeyFromKeyArea(decHeader, keys);

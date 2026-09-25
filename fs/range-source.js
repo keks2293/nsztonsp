@@ -13,6 +13,7 @@
 // (decompress chunk-by-chunk, consume, never buffer the whole NCA).
 
 import { NCZDecompressor } from './ncz.js';
+import { NCA_HEADER_SIZE } from './nca-utils.js';
 
 // Lazy zero-copy "sparse NCA" view. Serves subarray() over [header @0, sections at
 // their original NCA offsets, zeros elsewhere] WITHOUT allocating an NCA-sized
@@ -47,8 +48,6 @@ export class SparseNcaView {
         throw new Error(`SparseNcaView: read [0x${start.toString(16)}, 0x${end.toString(16)}) is outside the header and any single section — whole-section/header ranges only`);
     }
 }
-
-const NCA_HEADER_SIZE = 0xC00;
 
 // Unified random-access range source. All three backends share the same
 // structure; the only difference is how data is fetched:
