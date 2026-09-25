@@ -20,14 +20,15 @@ import { yieldToEventLoop } from './event-loop.js';
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
-// Pad to 0x200 boundary
+// Pad to 0x200 boundary. NOTE: no bitwise & (32-bit Int32 truncation in JS) —
+// romfs sizes > 4 GiB would be silently wrapped (LN2 BKTR merge, 5.25 GiB).
 function pad200(n) {
-    return (n + 0x1FF) & ~0x1FF;
+    return Math.ceil(n / 0x200) * 0x200;
 }
 
-// Pad to 0x4000 boundary
+// Pad to 0x4000 boundary. Same Int32 caveat as pad200.
 function pad4000(n) {
-    return (n + 0x3FFF) & ~0x3FFF;
+    return Math.ceil(n / 0x4000) * 0x4000;
 }
 
 // ── NCA section constants (hacpack nca.h) ─────────────────────────────────────

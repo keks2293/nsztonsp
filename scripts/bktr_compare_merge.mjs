@@ -4,13 +4,7 @@ import { PFS0 } from '../fs/pfs0.js';
 import { decryptNcaHeader } from '../fs/nca.js';
 import { AesXts } from '../crypto/aes-ops.mjs';
 import { mergeRomFS } from '../fs/bktr-merge.js';
-import { AesEcb } from '../crypto/aes128.js';
-
-function extractTitlekeyFromTik(tikData, keys) {
-    const kekRaw = keys.titlekek_02 || keys.titlekek_source;
-    const kek = typeof kekRaw === 'string' ? Buffer.from(kekRaw, 'hex') : Buffer.from(kekRaw);
-    return new AesEcb(kek).decrypt(Buffer.from(tikData.subarray(0x180, 0x190)));
-}
+import { extractTitlekeyFromTik, decryptNcaHeaderBytes } from '../fs/nca-utils.js';
 
 const DIR = '/Users/rmitkov/Downloads/Stardew Valley [NSZ]';
 const keys = KeysParser.parse(fs.readFileSync('../static/prod.keys', 'utf8'));
@@ -36,8 +30,8 @@ const yanuNcaData = yanuNsp.buf.subarray(yanuNca.offset, yanuNca.offset + yanuNc
 const baseTik = baseNsp.files.find(t => t.name.endsWith('.tik'));
 const updateTik = updateNsp.files.find(t => t.name.endsWith('.tik'));
 
-const baseTitlekey = extractTitlekeyFromTik(baseNsp.buf.subarray(baseTik.offset, baseTik.offset + baseTik.size), keys);
-const updateTitlekey = extractTitlekeyFromTik(updateNsp.buf.subarray(updateTik.offset, updateTik.offset + updateTik.size), keys);
+const baseTitlekey = extractTitlekeyFromTik(baseNsp.buf.subarray(baseTik.offset, baseTik.offset + baseTik.size), keys, null, decryptNcaHeaderBytes(baseNcaData.subarray(0, 0xC00), keys));
+const updateTitlekey = extractTitlekeyFromTik(updateNsp.buf.subarray(updateTik.offset, updateTik.offset + updateTik.size), keys, null, decryptNcaHeaderBytes(updateNcaData.subarray(0, 0xC00), keys));
 
 console.log('baseTitlekey:', Buffer.from(baseTitlekey).toString('hex'));
 console.log('updateTitlekey:', Buffer.from(updateTitlekey).toString('hex'));

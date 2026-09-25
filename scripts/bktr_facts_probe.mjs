@@ -2,6 +2,7 @@
 import fs from 'fs';
 import { KeysParser } from '../keys.js';
 import { decryptNcaHeader } from '../fs/nca.js';
+import { extractTitlekeyFromTik, decryptNcaHeaderBytes } from '../fs/nca-utils.js';
 import { AesCtr, AesXts } from '../crypto/aes-ops.mjs';
 import { AesEcb } from '../crypto/aes128.js';
 
@@ -26,15 +27,11 @@ function members(path) {
     return out;
 }
 
-function titlekeyFromTik(tikData) {
-    const block = Buffer.from(tikData.subarray(0x180, 0x190));
-    const tk = Buffer.from(keys.titlekek_02, 'hex');
-    return { block, titlekey: Buffer.from(new AesEcb(tk).decrypt(block)) };
-}
-
 const updTik = members(updateNsp).find(m => m.name.toLowerCase().endsWith('.tik'));
-const { titlekey: updTitlekey } = titlekeyFromTik(updTik.data);
-console.log('update titlekey:', updTitlekey.toString('hex'));
+const updRawHeader = members(updateNsp).find(m => m.name.toLowerCase().endsWith('.nca'))?.data;
+const updDecHdr = updRawHeader ? decryptNcaHeaderBytes(updRawHeader.subarray(0, 0xC00), keys) : null;
+const updTitlekey = updTik && updDecHdr ? extractTitlekeyFromTik(updTik.data, keys, null, updDecHdr) : null;
+console.log('update titlekey:', updTitlekey ? Buffer.from(updTitlekey).toString('hex') : 'N/A');
 
 // base program nca
 const baseNca = members(baseNsp).find(m => m.name.toLowerCase().endsWith('.nca'));
@@ -83,7 +80,7 @@ for (let i = 0; i < 4; i++) entryKeys.push(decKA.subarray(i * 0x10, i * 0x10 + 0
 // base titlekey (its own ticket in base nsp if any)
 let baseTitlekey = null;
 const baseTik = members(baseNsp).find(m => m.name.toLowerCase().endsWith('.tik'));
-if (baseTik) baseTitlekey = titlekeyFromTik(baseTik.data).titlekey;
+if (baseTik) baseTitlekey = extractTitlekeyFromTik(baseTik.data, keys, null, decHdr);
 
 const off = sec.offset;
 let hit = await tryDec('titleKeyDec(kak2/zeros)', titleKeyDec, off);

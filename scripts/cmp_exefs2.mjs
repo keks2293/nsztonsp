@@ -3,7 +3,6 @@
 // Usage: node scripts/cmp_exefs2.mjs <our.nsp> <yanu.nsp> <update.nsz>
 import fs from 'node:fs';
 import { KeysParser } from '../keys.js';
-import { AesEcb } from '../crypto/aes128.js';
 import { PFS0 } from '../fs/pfs0.js';
 import { AesXts } from '../crypto/aes-ops.mjs';
 import { decryptNcaHeader } from '../fs/nca.js';
@@ -53,7 +52,6 @@ const uPfs0 = await PFS0.open(ur);
 const uTik = uPfs0.files.find(f => f.name.toLowerCase().endsWith('.tik'));
 const uProg = uPfs0.files.filter(f => /\.nca$|\.ncz$/i.test(f.name)).sort((a, b) => b.size - a.size)[0];
 const tikData = await ur.read(uTik.offset, uTik.size);
-const titlekek = typeof keys.titlekek_02 === 'string' ? (() => { const b = new Uint8Array(keys.titlekek_02.length / 2); for (let i = 0; i < b.length; i++) b[i] = parseInt(keys.titlekek_02.substr(i * 2, 2), 16); return b; })() : new Uint8Array(keys.titlekek_02);
 const nczReader = new AdapterNCZReader(ur, uProg.offset, uProg.size);
 const parsed = await parseNczSections(nczReader);
 const fullNca = new Uint8Array(parsed.ncaSize);

@@ -1,5 +1,5 @@
 import { AesXts, AesCtr } from '../crypto/aes-ops.mjs';
-import { AesEcb } from '../crypto/aes128.js';
+import { extractTitlekeyFromTik } from '../fs/nca-utils.js';
 import fs from 'fs';
 import { KeysParser } from '../keys.js';
 
@@ -43,8 +43,9 @@ async function main() {
     const basePfs0 = readPfs0(base);
     const tikEntry = basePfs0.entries.find(e => e.name.endsWith('.tik'));
     const tik = base.subarray(tikEntry.offset, tikEntry.offset + tikEntry.size);
-    const titlekek = hexToBytes(keys.titlekek_02);
-    const titlekey = new AesEcb(titlekek).decrypt(tik.subarray(0x180, 0x190));
+    const baseNcaEntry = basePfs0.entries.find(e => e.name.endsWith('.nca') && !e.name.endsWith('.cnmt.nca'));
+    const baseDecHeader = baseNcaEntry ? decryptNcaHeader(base.subarray(baseNcaEntry.offset, baseNcaEntry.offset + baseNcaEntry.size), keys) : null;
+    const titlekey = extractTitlekeyFromTik(tik, keys, null, baseDecHeader);
     console.log('Base titlekey:', Array.from(titlekey).map(b => b.toString(16).padStart(2, '0')).join(''));
 
     // yanu merged NCA
