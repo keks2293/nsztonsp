@@ -4,7 +4,7 @@ import { KeysParser } from '../keys.js';
 import { decryptNcaHeader } from '../fs/nca.js';
 import { PFS0 } from '../fs/pfs0.js';
 import { AesCtr, AesXts } from '../crypto/aes-ops.mjs';
-import { AesEcb } from '../crypto/aes128.js';
+import { extractTitlekeyFromTik, decryptNcaHeaderBytes } from '../fs/nca-utils.js';
 
 const DIR = '/Users/rmitkov/Downloads/Stardew Valley [NSZ]';
 const basePath = `${DIR}/Stardew Valley [0100E65002BB8000][v0] (0.87 GB).nsp`;
@@ -16,11 +16,6 @@ function members(path) {
     const d = fs.readFileSync(path);
     const pfs0 = new PFS0(d);
     return { d, entries: pfs0.getFiles() };
-}
-
-function titlekey(tikData) {
-    const block = Buffer.from(tikData.subarray(0x180, 0x190));
-    return Buffer.from(new AesEcb(Buffer.from(keys.titlekek_02, 'hex')).decrypt(block));
 }
 
 function hex(b, o, n) {
@@ -56,8 +51,8 @@ const updHdr = decryptNcaHeader(updProg.raw.subarray(0, 0xC00), keys);
 
 const baseTik = base.entries.find(t => t.name.toLowerCase().endsWith('.tik'));
 const updTik = upd.entries.find(t => t.name.toLowerCase().endsWith('.tik'));
-const baseTitlekey = titlekey(base.d.subarray(baseTik.offset, baseTik.offset + baseTik.size));
-const updTitlekey = titlekey(upd.d.subarray(updTik.offset, updTik.offset + updTik.size));
+const baseTitlekey = extractTitlekeyFromTik(base.d.subarray(baseTik.offset, baseTik.offset + baseTik.size), keys, null, decryptNcaHeaderBytes(baseProg.raw.subarray(0, 0xC00), keys));
+const updTitlekey = extractTitlekeyFromTik(upd.d.subarray(updTik.offset, updTik.offset + updTik.size), keys, null, decryptNcaHeaderBytes(updProg.raw.subarray(0, 0xC00), keys));
 
 const xts = new AesXts(hdrKey);
 const baseDec = Buffer.from(xts.decrypt(baseProg.raw.subarray(0, 0xC00), 0));

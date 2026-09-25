@@ -3,8 +3,8 @@
 import fs from 'fs';
 import { KeysParser } from '../keys.js';
 import { decryptNcaHeader } from '../fs/nca.js';
+import { extractTitlekeyFromTik } from '../fs/nca-utils.js';
 import { AesCtr, AesXts } from '../crypto/aes-ops.mjs';
-import { AesEcb } from '../crypto/aes128.js';
 
 const NCA = '/tmp/bktr_probe.nca';
 const NSZ = '/Users/rmitkov/Downloads/Stardew Valley [NSZ]/Stardew Valley [0100E65002BB8800][v1310720] (0.67 GB).nsz';
@@ -40,8 +40,7 @@ for (let i = 0; i < fc; i++) {
     const off = Number(nsz.readBigUInt64LE(0x10 + i * 0x18)) + hsz;
     const size = Number(nsz.readBigUInt64LE(0x10 + i * 0x18 + 8));
     const tik = nsz.subarray(off, off + size);
-    const kek = Buffer.from(keys.titlekek_02 || keys.titleKeks[2], 'hex');
-    titlekey = new AesEcb(kek).decrypt(Buffer.from(tik.subarray(0x180, 0x190)));
+    titlekey = extractTitlekeyFromTik(tik, keys, null, decHeader);
     break;
 }
 const nonce = new Uint8Array(fsHdr.subarray(0x140, 0x148)).reverse();

@@ -1,6 +1,6 @@
 import { AesXts } from '../crypto/aes-ops.mjs';
-import { AesEcb } from '../crypto/aes128.js';
 import { KeysParser } from '../keys.js';
+import { deriveTitlekeyFromKeyArea } from '../fs/nca-utils.js';
 import crypto from 'crypto';
 import fs from 'fs';
 const hex = b => (typeof b === 'number') ? b.toString(16) : Buffer.from(b).toString('hex');
@@ -20,10 +20,7 @@ console.log('sections:');
 for(let i=0;i<4;i++){ const b=0x240+i*0x10; console.log('  ['+i+']', hex(dec.subarray(b,b+0x10))); }
 console.log('secHashes:', hex(dec.subarray(0x280,0x2C0)));
 console.log('keyArea@0x100:', hex(dec.subarray(0x100,0x140)));
-const kak00 = Buffer.from(keys.key_area_key_application_00, 'hex');
-const area = dec.subarray(0x100,0x300);
-const key = new AesEcb(kak00).decrypt(area.subarray(0,0x20));
-console.log('keyArea[0] decrypted (titlekey):', hex(key));
+console.log('titlekey (key area slot 2):', hex(deriveTitlekeyFromKeyArea(dec, keys) ?? 'n/a'));
 const fsex = dec.subarray(0x400,0x600);
 console.log('ExeFS FsHeader[0..0x10]:', hex(fsex.subarray(0,0x10)));
 console.log('ExeFS 0x40-0x60:', hex(fsex.subarray(0x40,0x60)));

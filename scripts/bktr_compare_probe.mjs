@@ -3,7 +3,7 @@ import { KeysParser } from '../keys.js';
 import { decryptNcaHeader } from '../fs/nca.js';
 import { PFS0 } from '../fs/pfs0.js';
 import { AesCtr, AesXts } from '../crypto/aes-ops.mjs';
-import { AesEcb } from '../crypto/aes128.js';
+import { extractTitlekeyFromTik } from '../fs/nca-utils.js';
 
 const DIR = '/Users/rmitkov/Downloads/Stardew Valley [NSZ]';
 const basePath = `${DIR}/Stardew Valley [0100E65002BB8000][v0] (0.87 GB).nsp`;
@@ -20,13 +20,6 @@ function getTik(pfs0, entries) {
     return null;
 }
 
-function getTitlekey(tikData) {
-    if (!tikData || tikData.length < 0x190) return null;
-    const kekRaw = keys.titlekek_02 || keys.titlekek_source;
-    const kek = typeof kekRaw === 'string' ? Buffer.from(kekRaw, 'hex') : Buffer.from(kekRaw);
-    return new AesEcb(kek).decrypt(Buffer.from(tikData.subarray(0x180, 0x190)));
-}
-
 function ctrDecrypt(raw, titlekey, nonce, seek) {
     const c = new AesCtr(titlekey, nonce);
     c.seek(seek);
@@ -38,8 +31,6 @@ function ctrDecrypt(raw, titlekey, nonce, seek) {
     const pfs0 = fs.readFileSync(basePath);
     const entries = new PFS0(pfs0).getFiles();
     const tik = getTik(pfs0, entries);
-    const titlekey = getTitlekey(tik);
-    console.log(`base titlekey: ${titlekey ? titlekey.toString('hex') : 'N/A'}`);
 
     for (const e of entries) {
         if (!e.name.toLowerCase().endsWith('.nca') || e.name.toLowerCase().endsWith('.cnmt.nca')) continue;
@@ -48,13 +39,15 @@ function ctrDecrypt(raw, titlekey, nonce, seek) {
         try { h = decryptNcaHeader(raw.subarray(0, 0xC00), keys); } catch (_) { h = null; }
         if (!h || h.contentType !== 0) continue;
         console.log(`\n### BASE program ${e.name}`);
+        const decProg = new AesXts(Buffer.isBuffer(keys.header_key) ? keys.header_key : Buffer.from(keys.header_key, 'hex')).decrypt(raw.subarray(0, 0xC00), 0);
+        const titlekey = extractTitlekeyFromTik(tik, keys, null, decProg);
+        console.log(`base titlekey: ${titlekey ? Buffer.from(titlekey).toString('hex') : 'N/A'}`);
         for (let i = 0; i < 4; i++) {
             const s = h.sections[i];
             if (!s || s.size === 0) continue;
             const fh = new Uint8Array(h.fsHeader || raw.subarray(0, 0xC00));
             // get section ctr from raw decrypted header
-            const xts = new AesXts(Buffer.isBuffer(keys.header_key) ? keys.header_key : Buffer.from(keys.header_key, 'hex'));
-            const dec = xts.decrypt(raw.subarray(0, 0xC00), 0);
+            const dec = decProg;
             const nonceRaw = dec.subarray(0x400 + i * 0x200 + 0x140, 0x400 + i * 0x200 + 0x148);
             const nonce = Buffer.alloc(8);
             for (let j = 0; j < 8; j++) nonce[j] = nonceRaw[7 - j];

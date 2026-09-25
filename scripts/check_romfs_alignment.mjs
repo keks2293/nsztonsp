@@ -27,7 +27,7 @@ import { KeysParser } from '../keys.js';
 import { PFS0 } from '../fs/pfs0.js';
 import { AesXts, AesCtr } from '../crypto/aes-ops.mjs';
 import { NCZDecompressor, AdapterNCZReader, parseNczSections } from '../fs/ncz.js';
-import { extractTitlekeyFromTik, deriveTitlekeyFromKeyArea } from '../fs/bktr.js';
+import { extractTitlekeyFromTik, deriveTitlekeyFromKeyArea } from '../fs/nca-utils.js';
 
 const paths = process.argv.slice(2);
 if (!paths.length) {
@@ -118,7 +118,7 @@ for (const path of paths) {
 
         const rightsId = dec.subarray(0x230, 0x240).toString('hex');
         const tikData = tik;
-        const titlekey = (tikData && extractTitlekeyFromTik(tikData, keys, rightsId)) || deriveTitlekeyFromKeyArea(dec, keys);
+        const titlekey = (tikData && extractTitlekeyFromTik(tikData, keys, rightsId, dec)) || deriveTitlekeyFromKeyArea(dec, keys);
         if (!titlekey) { console.error('    cannot derive titlekey'); continue; }
         const raw = fh.subarray(0x140, 0x148);
         const nonce = new Uint8Array(8);

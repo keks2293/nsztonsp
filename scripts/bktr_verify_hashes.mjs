@@ -4,7 +4,7 @@ import { KeysParser } from '../keys.js';
 import { PFS0 } from '../fs/pfs0.js';
 import { AesXts } from '../crypto/aes-ops.mjs';
 import { mergeRomFS } from '../fs/bktr-merge.js';
-import { AesEcb } from '../crypto/aes128.js';
+import { extractTitlekeyFromTik, decryptNcaHeaderBytes } from '../fs/nca-utils.js';
 
 const DIR = '/Users/rmitkov/Downloads/Stardew Valley [NSZ]';
 const keys = KeysParser.parse(fs.readFileSync('../static/prod.keys', 'utf8'));
@@ -14,10 +14,10 @@ function readNsp(path) {
     const buf = fs.readFileSync(path);
     return { buf, files: new PFS0(buf).getFiles() };
 }
-function tikKey(nsp, keys) {
+function tikKey(nsp, keys, ncaData) {
     const tik = nsp.files.find(t => t.name.endsWith('.tik'));
-    const kek = Buffer.from(keys.titlekek_02, 'hex');
-    return new AesEcb(kek).decrypt(Buffer.from(nsp.buf.subarray(tik.offset, tik.offset + tik.size).subarray(0x180, 0x190)));
+    const decHeader = decryptNcaHeaderBytes(ncaData.subarray(0, 0xC00), keys);
+    return extractTitlekeyFromTik(nsp.buf.subarray(tik.offset, tik.offset + tik.size), keys, null, decHeader);
 }
 
 const baseNsp = readNsp(`${DIR}/Stardew Valley [0100E65002BB8000][v0] (0.87 GB).nsp`);
@@ -29,8 +29,8 @@ const updateNcaData = updateNsp.buf.subarray(uNca.offset, uNca.offset + uNca.siz
 
 const { merged } = await mergeRomFS(baseNcaData, updateNcaData, {
     keys,
-    baseTitlekey: tikKey(baseNsp, keys),
-    updateTitlekey: tikKey(updateNsp, keys),
+    baseTitlekey: tikKey(baseNsp, keys, baseNcaData),
+    updateTitlekey: tikKey(updateNsp, keys, updateNcaData),
 });
 
 const uHdr = Buffer.from(new AesXts(Buffer.from(keys.header_key, 'hex')).decrypt(updateNcaData.subarray(0, 0xC00), 0));

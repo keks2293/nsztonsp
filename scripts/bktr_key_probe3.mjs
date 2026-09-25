@@ -4,6 +4,7 @@
 import fs from 'fs';
 import { KeysParser } from '../keys.js';
 import { decryptNcaHeader } from '../fs/nca.js';
+import { extractTitlekeyFromTik } from '../fs/nca-utils.js';
 import { AesCtr, AesXts } from '../crypto/aes-ops.mjs';
 import { AesEcb } from '../crypto/aes128.js';
 
@@ -36,8 +37,7 @@ for (let i = 0; i < fileCount; i++) {
     const off = Number(nsz.readBigUInt64LE(0x10 + i * 0x18)) + headerSize;
     const size = Number(nsz.readBigUInt64LE(0x10 + i * 0x18 + 8));
     const tik = nsz.subarray(off, off + size);
-    const kek = Buffer.from(keys.titlekek_02 || keys.titleKeks[2], 'hex');
-    titlekey = new AesEcb(kek).decrypt(Buffer.from(tik.subarray(0x180, 0x190)));
+    titlekey = extractTitlekeyFromTik(tik, keys, null, decHeader);
     break;
 }
 const keyArea = data.subarray(0x300, 0x340);
