@@ -543,11 +543,14 @@ async function main() {
     }
 
     // Shared runner scaffolding: show progress/log, lock the button, reset stats.
+    // Set an immediate status so the label stops showing 'Ready' the moment a run
+    // starts — per-operation labeled progress overrides this as soon as it arrives.
     function beginRun() {
         progressContainer.classList.add('visible');
         logContainer.classList.add('visible');
         convertBtn.disabled = true;
         converting = true;
+        progressTitle.textContent = 'Preparing...';
         progressSpeed.textContent = '';
         progressTime.textContent = '';
         updateProgress(0);
@@ -690,7 +693,7 @@ async function main() {
         let writable = out.writable;
         if (!writable) writable = await swWritable(outputName);
 
-        const onProgress = (p) => { updateProgress(p); updateStats(p); };
+        const onProgress = (p, label) => { updateProgress(p); updateStats(p); if (label) progressTitle.textContent = label; };
 
         try {
             const result = await converter.mergeNSPs(files, {
