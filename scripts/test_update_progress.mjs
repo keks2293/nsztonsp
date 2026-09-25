@@ -5,8 +5,12 @@
 // never regress across phases. Write phases are continuous (program + tail form one
 // bar: two-pass = 'Computing contentId (1/2)' + 'Writing output (2/2)',
 // streaming = 'Writing output (1/1)', buffered = 'Computing contentId (1/2)' +
-// 'Writing output (2/2)'). Also re-verifies streaming ≡ two-pass ≡ buffered
-// byte-identity. In-memory outputs only (no disk writes).
+// 'Writing output (2/2)'). The NCZ two-pass/streaming flows first decompress the
+// update's sections in a silent prep pass — now reported as a labeled phase
+// ('Reading update sections...') with a per-byte fraction, so the status/bar move
+// while the input is being read (the buffered flow streams instead, no prep phase).
+// Also re-verifies streaming ≡ two-pass ≡ buffered byte-identity. In-memory outputs
+// only (no disk writes).
 import fs from 'fs';
 import crypto from 'node:crypto';
 import { KeysParser } from '../keys.js';
@@ -110,7 +114,7 @@ const sha = (b) => crypto.createHash('sha256').update(b).digest('hex');
   });
   base.reader.close(); upd.reader.close();
   const buf = new Uint8Array(await res.blob.arrayBuffer());
-  checkProtocol('streaming (memory, seekback)', events, ['Writing output (1/1)'], buf);
+  checkProtocol('streaming (memory, seekback)', events, ['Reading update sections...', 'Writing output (1/1)'], buf);
   globalThis.__refSha = sha(buf);
   globalThis.__refLen = buf.length;
 }
@@ -127,7 +131,7 @@ const sha = (b) => crypto.createHash('sha256').update(b).digest('hex');
   });
   base.reader.close(); upd.reader.close();
   const buf = sw.build();
-  checkProtocol('two-pass (sw-sim, appendOnly)', events, ['Computing contentId (1/2)', 'Writing output (2/2)'], buf);
+  checkProtocol('two-pass (sw-sim, appendOnly)', events, ['Reading update sections...', 'Computing contentId (1/2)', 'Writing output (2/2)'], buf);
 
   console.log(`\nstreaming sha256=${globalThis.__refSha} (${globalThis.__refLen})`);
   console.log(`two-pass  sha256=${sha(buf)} (${buf.length})`);
