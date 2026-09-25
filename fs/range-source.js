@@ -2,6 +2,7 @@
 //
 //   read(offset, length) -> Promise<Uint8Array>
 //   registerRange(offset, length)  -- optional pre-registration
+//   stream(consume) -> Promise  -- lockstep pass, no buffers
 //
 // Backends:
 //  - BufferRangeSource: over an already-buffered NCA (Uint8Array).
@@ -91,6 +92,11 @@ export function ViewRangeSource(view) {
 
 const STOP_PUMP = 'STOP_PUMP';
 
+// Sentinel for NczStreamSource.stream(): the consumer throws `new Error(STOP_STREAM)`
+// to stop the pass early (mirrors the private STOP_PUMP in _pump). Exported so
+// lockstep consumers can signal a clean stop.
+export const STOP_STREAM = 'STOP_STREAM';
+
 export class NczStreamSource {
     constructor(nczReader, parsed, log = () => {}, onProgress = null) {
         this._reader = nczReader;
@@ -171,9 +177,35 @@ export class NczStreamSource {
         return sub ? data.subarray(sub.off, sub.off + sub.len) : data;
     }
 
-    _pump() {
+    // Shared one-pass decompression driver for both access modes: create the
+    // decompressor, run one pass with the given chunk callback, and swallow the
+    // early-stop sentinel(s) (STOP_PUMP for the fill pass, STOP_STREAM for the
+    // lockstep pass) — anything else propagates. The chunk callback and the error
+    // policy (fire-and-forget state for _pump, rethrow for stream) stay with the
+    // caller; this owns only "one NCZ pass + stop-token handling".
+    _runPass(writeChunk, stopTokens) {
         const decomp = new NCZDecompressor(this._reader);
-        this._pumpPromise = decomp.decompress(() => {}, (chunk, offset) => {
+        return decomp.decompress(() => {}, writeChunk, this._parsed).catch(e => {
+            if (e && stopTokens.includes(e.message)) return; // normal early stop
+            throw e;
+        });
+    }
+
+    // Lockstep streaming mode: decompress the NCZ once and deliver each decrypted
+    // chunk to `consume(chunk, ncaOffset)` in physical (NCA offset) order. No range
+    // registration, no pre-allocated buffers — peak memory is one chunk plus whatever
+    // the consumer holds. `consume` is awaited, so the pump paces to the consumer
+    // (no fill-ahead). A consumer that throws `new Error(STOP_STREAM)` stops the pass
+    // at the last wanted byte (e.g. after the last needed section — mirrors _pump's
+    // STOP_PUMP). Use on a fresh source; it does not interact with registerRange.
+    async stream(consume) {
+        await this._runPass(async (chunk, offset) => {
+            await consume(chunk, offset);
+        }, [STOP_STREAM]);
+    }
+
+    _pump() {
+        this._pumpPromise = this._runPass((chunk, offset) => {
             const cStart = offset, cEnd = offset + chunk.length;
             // Optional progress: report the far-most decompressed absolute offset,
             // including the discarded prefix BEFORE the first registered range
@@ -206,8 +238,7 @@ export class NczStreamSource {
             if (this._nextRange >= this._ranges.length) {
                 throw new Error(STOP_PUMP);
             }
-        }, this._parsed).catch(e => {
-            if (e && e.message === STOP_PUMP) { return; } // normal early stop — all ranges filled
+        }, [STOP_PUMP]).catch(e => {
             this._pumpError = e;
             for (const r of this._ranges) {
                 if (r.reject) r.reject(e);
