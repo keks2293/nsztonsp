@@ -100,6 +100,7 @@ export class NczStreamSource {
         this._reached = 0; // far-most decompressed absolute offset (NW of each chunk)
         this._ranges = [];
         this._nextRange = 0;
+        this._readCursor = 0; // candidate index for read(); advances forward only
         this._pumpStarted = false;
         this._pumpError = null;
     }
@@ -123,21 +124,33 @@ export class NczStreamSource {
         if (offset < 0 || end > this._parsed.ncaSize) {
             throw new Error(`NczStreamSource: read [${offset}, ${end}) out of bounds (ncaSize ${this._parsed.ncaSize})`);
         }
-        // Find a registered range that exactly matches [offset, end), or one that
-        // CONTAINS it (a sub-range read returns a zero-copy view of the buffered
-        // range data — lets the caller read a large registered range in chunks).
-        let idx = this._ranges.findIndex(r => r.start === offset && r.end === end);
-        let sub = null;
-        if (idx < 0) {
-            idx = this._ranges.findIndex(r => r.start <= offset && end <= r.end);
+        // Find the registered range that CONTAINS [offset, end) (an exact match is
+        // just the case where sub == null; a sub-range read returns a zero-copy view
+        // of the buffered range data — lets the caller read a large registered range
+        // in chunks). Ranges are pre-registered up front in strictly-increasing,
+        // non-overlapping order, so at most one contains the read. Consumers that
+        // read monotonically (each offset >= the previous — e.g. scatter's Pass U
+        // walks patches in physical order) let a cursor advance forward: O(1)
+        // amortized instead of a linear scan from 0 on every read (LN2's base has
+        // ~2500 ranges). A backward/non-monotonic read (merge reads the base in
+        // virtual order) falls back to one full scan — still correct, and one scan
+        // instead of the old two (exact, then containing).
+        const ranges = this._ranges;
+        let idx = this._readCursor;
+        while (idx < ranges.length && ranges[idx].end <= offset) idx++; // offset is past this range
+        if (idx < ranges.length && ranges[idx].start <= offset && end <= ranges[idx].end) {
+            this._readCursor = idx; // advance (never retreat) for the next read
+        } else {
+            // Cursor overshot (backward read) or the offset is in a gap: the
+            // containing range, if any, is elsewhere — scan from 0. A read outside
+            // every range is a usage error, not lazy-fill.
+            idx = ranges.findIndex(r => r.start <= offset && end <= r.end);
             if (idx < 0) {
-                // All ranges are pre-registered up front (strictly increasing) by
-                // the caller — a read outside them is a usage error, not lazy-fill.
                 throw new Error(`NczStreamSource: read [0x${offset.toString(16)}, 0x${end.toString(16)}) has no registered range — register ranges up front (NCZ is sequential)`);
             }
-            sub = { off: offset - this._ranges[idx].start, len: length };
         }
-        const r = this._ranges[idx];
+        const r = ranges[idx];
+        const sub = (offset === r.start && end === r.end) ? null : { off: offset - r.start, len: length };
         // Fast path: the pump (unthrottled, runs ahead of a slow consumer) may
         // have filled this range before any read of it. r.ready was never
         // created, so awaiting it would deadlock — return the buffered data.
