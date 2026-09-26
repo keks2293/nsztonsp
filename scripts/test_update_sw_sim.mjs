@@ -36,8 +36,16 @@ const DIR = '/Users/rmitkov/Downloads/Stardew Valley [NSZ]';
 const basePath = process.env.BASE_PATH || `${DIR}/Stardew Valley [0100E65002BB8000][v0] (0.87 GB).nsz`;
 const updatePath = process.env.UPDATE_PATH || `${DIR}/Stardew Valley [0100E65002BB8800][v1310720] (0.67 GB).nsz`;
 const keys = KeysParser.parse(fs.readFileSync('../static/prod.keys', 'utf8'));
-const log = () => {};
 const progress = () => {};
+const logs = [];
+const log = (level, msg) => { logs.push(msg); };
+// Prove the lockstep base path is ACTUALLY taken per mode (not silently falling
+// back to registerRange + read). markMode(label) opens a fresh log window;
+// lockstepModes records whether 'Base lockstep' was logged in it.
+let windowStart = 0;
+const lockstepModes = {};
+const markMode = (label) => { windowStart = logs.length; lockstepModes[label] = false; };
+const markLockstep = (label) => { lockstepModes[label] = logs.slice(windowStart).some(m => /Base lockstep/.test(m)); };
 
 // FORCE_JS=1 runs the exact browser SHA-256 path (pure-JS streaming class);
 // default runs the native node:crypto streaming backend. Both must MATCH.
@@ -53,7 +61,9 @@ const updateReader = { name: 'update.nsz', reader: new FileReader(updatePath) };
 // Reference: seekable fd output (known-good)
 const refPath = '/tmp/update_sw_sim_ref.nsp';
 const refFd = fs.openSync(refPath, 'w+');
+markMode('ref');
 await update([baseReader, updateReader], { fd: refFd }, { keys, log, progress, bktrMerge: true });
+markLockstep('ref');
 fs.closeSync(refFd);
 baseReader.reader.close(); updateReader.reader.close();
 const ref = new Uint8Array(fs.readFileSync(refPath));
@@ -62,7 +72,9 @@ const ref = new Uint8Array(fs.readFileSync(refPath));
 const base2 = { name: 'base.nsp', reader: new FileReader(basePath) };
 const update2 = { name: 'update.nsz', reader: new FileReader(updatePath) };
 const sw = new SequentialWriter();
+markMode('sim');
 const result = await update([base2, update2], { writable: sw }, { keys, log, progress, bktrMerge: true });
+markLockstep('sim');
 base2.reader.close(); update2.reader.close();
 const sim = sw.build();
 
@@ -71,7 +83,9 @@ const base3 = { name: 'base.nsp', reader: new FileReader(basePath) };
 const update3 = { name: 'update.nsz', reader: new FileReader(updatePath) };
 const bufPath = '/tmp/update_sw_sim_buffered.nsp';
 const bufFd = fs.openSync(bufPath, 'w+');
+markMode('buffered');
 await update([base3, update3], { fd: bufFd }, { keys, log, progress, bktrMerge: true, updateMode: 'buffered' });
+markLockstep('buffered');
 fs.closeSync(bufFd);
 base3.reader.close(); update3.reader.close();
 const buf = new Uint8Array(fs.readFileSync(bufPath));
@@ -90,7 +104,9 @@ console.log('result.size        :', result.size);
 const base4 = { name: 'base.nsp', reader: new FileReader(basePath) };
 const update4 = { name: 'update.nsz', reader: new FileReader(updatePath) };
 const memOut = { memory: true };
+markMode('memory');
 const mem = await update([base4, update4], memOut, { keys, log, progress, bktrMerge: true });
+markLockstep('memory');
 base4.reader.close(); update4.reader.close();
 const memBuf = new Uint8Array(await mem.blob.arrayBuffer());
 const memSha = crypto.createHash('sha256').update(memBuf).digest('hex');
@@ -103,7 +119,9 @@ const base5 = { name: 'base.nsp', reader: new FileReader(basePath) };
 const update5 = { name: 'update.nsz', reader: new FileReader(updatePath) };
 const scatterPath = '/tmp/update_sw_sim_scatter.nsp';
 const scatterFd = fs.openSync(scatterPath, 'w+');
+markMode('scatter');
 await update([base5, update5], { fd: scatterFd }, { keys, log, progress, bktrMerge: true, updateMode: 'scatter' });
+markLockstep('scatter');
 fs.closeSync(scatterFd);
 base5.reader.close(); update5.reader.close();
 const scatter = new Uint8Array(fs.readFileSync(scatterPath));
@@ -117,7 +135,9 @@ console.log('scatter (fd)       :', scatter.length, 'sha256=' + scatterSha);
 const base8 = { name: 'base.nsp', reader: new FileReader(basePath) };
 const update8 = { name: 'update.nsz', reader: new FileReader(updatePath) };
 const memScatterOut = { memory: true };
+markMode('scatter-memory');
 const memScatter = await update([base8, update8], memScatterOut, { keys, log, progress, bktrMerge: true, updateMode: 'scatter' });
+markLockstep('scatter-memory');
 base8.reader.close(); update8.reader.close();
 const memScatterBuf = new Uint8Array(await memScatter.blob.arrayBuffer());
 const memScatterSha = crypto.createHash('sha256').update(memScatterBuf).digest('hex');
@@ -125,10 +145,14 @@ console.log('scatter (memory)    :', memScatterBuf.length, 'sha256=' + memScatte
 
 const tally = [refSha, simSha, bufSha, memSha, scatterSha, memScatterSha];
 const lens = [ref.length, sim.length, buf.length, memBuf.length, scatter.length, memScatterBuf.length];
-if (tally.every(s => s === refSha) && lens.every(n => n === ref.length)) {
-  console.log('MATCH — seekback ≡ two-pass ≡ buffered ≡ memory ≡ scatter(fd) ≡ scatter(memory), all byte-identical');
+console.log('lockstep base path taken: ' +
+  Object.entries(lockstepModes).map(([k, v]) => `${k}=${v ? 'yes' : 'NO'}`).join('  '));
+
+const allLockstep = Object.values(lockstepModes).every(Boolean);
+if (tally.every(s => s === refSha) && lens.every(n => n === ref.length) && allLockstep) {
+  console.log('MATCH — seekback ≡ two-pass ≡ buffered ≡ memory ≡ scatter(fd) ≡ scatter(memory), all byte-identical (lockstep base exercised in every mode)');
 } else {
-  console.log('MISMATCH');
+  console.log(tally.every(s => s === refSha) && lens.every(n => n === ref.length) ? 'MISMATCH (lockstep not taken in all modes)' : 'MISMATCH (bytes)');
   let i = 0; const n = Math.min(...lens);
   while (i < n && ref[i] === sim[i]) i++;
   console.log('first diff ref/sim at', i, '0x' + i.toString(16), 'len ref=' + lens.join(' '));
