@@ -1,6 +1,6 @@
 import { AesCtr } from '../crypto/aes-ops.mjs';
 import { decryptNcaHeader } from './nca.js';
-import { NczStreamSource } from './range-source.js';
+import { NczStreamSource, STOP_STREAM } from './range-source.js';
 import { readLeU64, readLeU32, CHUNK_16MB } from './bytes.js';
 import { yieldToEventLoop } from './event-loop.js';
 import { decryptNcaHeaderBytes, fsHeaderAt, reversedSectionCtr, extractTitlekeyFromTik, deriveTitlekeyFromKeyArea, IVFC_LEVEL_HDR, IVFC_LEVELS_OFFSET, IVFC_MAX_LEVEL, FS_HDR, SECTION_FS_TYPE, SECTION_CRYPTO_TYPE } from './nca-utils.js';
@@ -204,9 +204,157 @@ async function readPatchRun(updReader, updateRomfsSecOffset, subBlock, titlekey,
     }
 }
 
+// ── Lockstep base (monotonic bases only) ─────────────────────────────────────
+// Serves the base non-patch runs from ONE sequential NCZ pass instead of
+// pre-allocated range buffers, for bases whose runs are already in PHYSICAL
+// order in entry (virtual) order (no backward jump, no overlap — the
+// registerRange sort+merge is then unnecessary). The merge's base reads are
+// then a forward-only cursor (offsets non-decreasing), so a single background
+// decompression suffices: it appends ciphertext chunks to a bounded window;
+// read(offset, n) waits until [offset, offset+n) is buffered, returns it, and
+// trims the front — releasing memory and unblocking the pump (backpressure).
+// Peak memory is the window + one read, not the whole base.
+//
+// AES-CTR stays in readBaseRun — its seek() runs at 16 MiB granularity (phys =
+// baseRomfsSecMeta.offset + physOffset + done, done stepping by 16 MiB), the
+// same aligned path as the registerRange fallback. That keeps this reader free
+// of the failure modes the decrypt-in-stream form has: decoder chunks are NOT
+// 16-aligned (the node AesCtr seek requires it) and are small (~16 KiB with
+// node:zlib — per-chunk cipher setup would be ~1000× readBaseRun's). The
+// window is plain contiguous ciphertext at NCA offsets, and decrypt() returns
+// a fresh buffer, so the copies out of it are safe.
+//
+// Reads are byte-oriented, not run-oriented, so a run ending exactly at the
+// stream end (or a chunk boundary) needs no special case — read() simply gets
+// its bytes (or a "stream ended" error on a corrupt/truncated NCZ).
+const LOCKSTEP_WINDOW_BYTES = 4 * CHUNK_16MB; // pump-ahead cap (~64 MiB)
+
+class LockstepBaseReader {
+    constructor(source, totalEnd) {
+        this._src = source;
+        this._totalEnd = totalEnd; // last run's physEnd — stop the pass after it
+        this._max = LOCKSTEP_WINDOW_BYTES;
+        this._chunks = [];         // { data, start } ciphertext, NCA offset order
+        this._windowBytes = 0;     // bytes currently in _chunks
+        this._eof = false;         // the stream completed (or stopped cleanly)
+        this._err = null;          // stream error, if any
+        this._stopped = false;     // finish() — stop the pass (merge error path)
+        this._done = false;        // last byte served — stop the pass (clean path)
+        this._started = false;
+        this._readers = null;      // pending read() resolvers
+        this._pumpWaiter = null;   // pump backpressure resolver
+    }
+
+    _wake() {
+        if (this._readers) {
+            const ws = this._readers;
+            this._readers = null;
+            for (const r of ws) r();
+        }
+        if (this._pumpWaiter) {
+            const w = this._pumpWaiter;
+            this._pumpWaiter = null;
+            w();
+        }
+    }
+
+    // Start the background pass (idempotent; lazy — the first read() kicks it
+    // off, so a merge error before the first base read leaves no stream running).
+    start() {
+        if (this._started) return;
+        this._started = true;
+        this._src.stream(async (chunk, ncaPos) => {
+            // Backpressure: hold the pump while the window is over budget;
+            // read() trims as it consumes and wakes us here.
+            while (!this._stopped && !this._done && this._windowBytes > this._max) {
+                await new Promise(r => { this._pumpWaiter = r; });
+            }
+            if (this._stopped || this._done) throw new Error(STOP_STREAM);
+            this._chunks.push({ data: chunk, start: ncaPos });
+            this._windowBytes += chunk.length;
+            this._wake();
+        }).then(
+            () => { this._eof = true; this._wake(); },
+            (e) => { this._err = e; this._wake(); }
+        );
+    }
+
+    // Forward-only: offsets must be non-decreasing (the gate guarantees the base
+    // runs are physically monotonic in entry order, and readBaseRun walks each
+    // run in 16 MiB steps). Returns the CIPHERTEXT for [offset, offset+length);
+    // the caller (readBaseRun) CTR-decrypts it at its own 16 MiB-aligned seek.
+    async read(offset, length) {
+        this.start();
+        const end = offset + length;
+        for (;;) {
+            if (this._err) throw this._err;
+            if (this._stopped) throw new Error('BKTR lockstep: base pass stopped');
+            // Trim everything fully before `offset` (frees window memory and can
+            // release the pump from backpressure).
+            let trimmed = 0;
+            while (this._chunks.length > 0 && this._chunks[0].start + this._chunks[0].data.length <= offset) {
+                trimmed += this._chunks.shift().data.length;
+            }
+            if (trimmed > 0) { this._windowBytes -= trimmed; this._wake(); }
+            // Is [offset, end) fully buffered yet?
+            let have = 0;
+            for (const c of this._chunks) {
+                const cEnd = c.start + c.data.length;
+                if (cEnd <= offset) continue;
+                if (c.start >= end) break;
+                have += Math.min(end, cEnd) - Math.max(offset, c.start);
+            }
+            if (have >= length) {
+                const out = new Uint8Array(length);
+                let o = 0;
+                for (const c of this._chunks) {
+                    const cEnd = c.start + c.data.length;
+                    if (cEnd <= offset) continue;
+                    if (c.start >= end) break;
+                    const a = Math.max(offset, c.start) - c.start;
+                    const b = Math.min(end, cEnd) - c.start;
+                    out.set(c.data.subarray(a, b), o);
+                    o += b - a;
+                }
+                // Last run fully served — no more base bytes needed; let the
+                // pass stop (mirrors the fallback pump's STOP_PUMP).
+                if (end >= this._totalEnd) { this._done = true; this._wake(); }
+                return out;
+            }
+            if (this._eof) {
+                throw new Error(`BKTR lockstep: base stream ended before read [0x${offset.toString(16)}, 0x${end.toString(16)})`);
+            }
+            await new Promise(r => { (this._readers || (this._readers = [])).push(r); });
+        }
+    }
+
+    // Stop the background pass (idempotent — call from the merge's finally so a
+    // merge error halts the in-flight stream instead of decompressing on).
+    finish() {
+        if (this._stopped) return;
+        this._stopped = true;
+        this._wake();
+    }
+}
+
+// Gate: may the base be fed via lockstep? Requires a sequential NCZ source and
+// base runs already in physical order in entry order (no backward jump, no
+// overlap) — then the merge's base reads are a forward-only cursor and ONE
+// stream pass suffices. Returns the reader (or null — the caller takes the
+// registerRange fallback).
+function startLockstepIfMonotonic(baseSource, baseRuns, enabled) {
+    if (!enabled) return null;
+    if (!(baseSource instanceof NczStreamSource)) return null;
+    if (baseRuns.length === 0) return null;
+    const monotonic = baseRuns.every((r, i) => i === 0 || r.physStart >= baseRuns[i - 1].physEnd);
+    if (!monotonic) return null;
+    return new LockstepBaseReader(baseSource, baseRuns[baseRuns.length - 1].physEnd);
+}
+
 // ── Virtual-order merge (default) ─────────────────────────────────────────────
 export async function mergeRomFS(baseNcaData, updateNcaData, options = {}) {
     const { keys, onChunk, onProgress } = options;
+    const _log = typeof options.log === 'function' ? options.log : () => {};
 
     const meta = await resolveBktrMeta(baseNcaData, updateNcaData, options);
     const { baseRomfsSecMeta, dataLevelOffset, dataLevelSize, relocBlock, subBlock,
@@ -214,23 +362,42 @@ export async function mergeRomFS(baseNcaData, updateNcaData, options = {}) {
         = { ...meta, ...await readBktrTables(updateNcaData.source, meta) };
     const totalSize = relocBlock.totalSize;
 
-    // Pre-register the base romfs ranges so an NCZ stream source can serve them in
-    // ONE sequential decompression pass. The merge below READS them in virtual
-    // (entry) order — a read is a sub-range and maps to its range by physical
-    // offset, independent of registration order. registerBaseRanges sorts by
-    // physical offset and merges overlaps (see its comment) because the base
-    // physical order need not match the reloc (virtual) order.
-    const baseRanges = [];
+    // The base non-patch runs in ENTRY (virtual) order — what the merge reads.
+    // For a MONOTONIC base these are also in physical order (no backward jump,
+    // no overlap), which a single lockstep NCZ pass can feed directly with no
+    // range pre-allocation. For a non-monotonic base (e.g. LN2) they must be
+    // sort+merged and pre-registered instead (registerBaseRanges, see its
+    // comment): the merge reads them in virtual order, a read is a sub-range
+    // and maps to its range by physical offset.
+    const baseRuns = [];
     for (let i = 0; i < relocBlock.entries.length; i++) {
         const e = relocBlock.entries[i];
         if (e.isPatch) continue;
         const nextVirt = i + 1 < relocBlock.entries.length
             ? relocBlock.entries[i + 1].virtOffset : relocBlock.totalSize;
-        baseRanges.push({ start: baseRomfsSecMeta.offset + e.physOffset, end: baseRomfsSecMeta.offset + e.physOffset + (nextVirt - e.virtOffset) });
+        baseRuns.push({
+            virtStart: e.virtOffset,
+            physStart: baseRomfsSecMeta.offset + e.physOffset,
+            physEnd: baseRomfsSecMeta.offset + e.physOffset + (nextVirt - e.virtOffset),
+        });
     }
-    registerBaseRanges(baseNcaData.source, baseRanges);
 
     const baseCtr = new AesCtr(baseTitlekey, baseNonce);
+
+    // Lockstep gate (see startLockstepIfMonotonic): NCZ source + monotonic base
+    // → base runs are served by ONE bounded sequential stream (no range
+    // pre-allocation). Otherwise the registerRange + read path. Either way the
+    // merge reads the base through readBaseRun (aligned CTR at 16 MiB steps).
+    let lockstep = null;
+    if (options.lockstep !== false) {
+        lockstep = startLockstepIfMonotonic(baseNcaData.source, baseRuns, true);
+        if (lockstep) {
+            const baseBytes = baseRuns.reduce((s, r) => s + (r.physEnd - r.physStart), 0);
+            _log('info', `Base lockstep: ${baseRuns.length} run(s), ${baseBytes.toLocaleString()} bytes — one stream, no range pre-allocation`);
+        }
+    }
+    const baseReader = lockstep || baseNcaData.source;
+    if (!lockstep) registerBaseRanges(baseNcaData.source, baseRuns.map(r => ({ start: r.physStart, end: r.physEnd })));
 
     // Build merged RomFS (streaming or buffered) — see comments in the loop.
     const streaming = typeof onChunk === 'function';
@@ -254,27 +421,32 @@ export async function mergeRomFS(baseNcaData, updateNcaData, options = {}) {
         await yieldToEventLoop();
     };
 
-    while (pos < totalSize && entryIdx < relocBlock.entries.length) {
-        const entry = relocBlock.entries[entryIdx];
-        const nextVirt = entryIdx + 1 < relocBlock.entries.length
-            ? relocBlock.entries[entryIdx + 1].virtOffset
-            : totalSize;
-        const chunkEnd = Math.min(nextVirt, totalSize);
-        const readSize = chunkEnd - pos;
+    try {
+        while (pos < totalSize && entryIdx < relocBlock.entries.length) {
+            const entry = relocBlock.entries[entryIdx];
+            const nextVirt = entryIdx + 1 < relocBlock.entries.length
+                ? relocBlock.entries[entryIdx + 1].virtOffset
+                : totalSize;
+            const chunkEnd = Math.min(nextVirt, totalSize);
+            const readSize = chunkEnd - pos;
 
-        if (entry.isPatch) {
-            // Decrypt patch from update NCA using AesCtrEx (run at pos).
-            await readPatchRun(updateNcaData.source, updateRomfsSec.offset, subBlock,
-                updateTitlekey, secureValue,
-                entry.physOffset + (pos - entry.virtOffset), pos, readSize, emitChunk);
-        } else {
-            // Copy from base romfs (run at pos).
-            await readBaseRun(baseNcaData.source, baseRomfsSecMeta.offset, baseRomfsSecMeta.size, baseCtr,
-                entry.physOffset + (pos - entry.virtOffset), pos, readSize, emitChunk);
+            if (entry.isPatch) {
+                // Decrypt patch from update NCA using AesCtrEx (run at pos).
+                await readPatchRun(updateNcaData.source, updateRomfsSec.offset, subBlock,
+                    updateTitlekey, secureValue,
+                    entry.physOffset + (pos - entry.virtOffset), pos, readSize, emitChunk);
+            } else {
+                // Copy from base romfs (run at pos) — via the lockstep reader
+                // (monotonic NCZ base) or the range-registered source.
+                await readBaseRun(baseReader, baseRomfsSecMeta.offset, baseRomfsSecMeta.size, baseCtr,
+                    entry.physOffset + (pos - entry.virtOffset), pos, readSize, emitChunk);
+            }
+
+            pos = chunkEnd;
+            entryIdx++;
         }
-
-        pos = chunkEnd;
-        entryIdx++;
+    } finally {
+        if (lockstep) lockstep.finish();
     }
 
     return {
@@ -363,33 +535,57 @@ export async function scatterRomFS({ baseInput, updateCtx, options, writeFn, log
     // comment) because the base physical order need not match the reloc (virtual)
     // order. registerRange is a no-op on non-stream sources (fs/range-source.js).
     const baseSource = baseInput.source;
-    const baseRanges = [];
+    const baseRuns = [];
     for (const e of entries) {
         if (e.isPatch) continue;
-        baseRanges.push({ start: baseRomfsSecMeta.offset + e.physOffset, end: baseRomfsSecMeta.offset + e.physOffset + (e.nextVirt - e.virtOffset) });
+        baseRuns.push({
+            virtStart: e.virtOffset,
+            physStart: baseRomfsSecMeta.offset + e.physOffset,
+            physEnd: baseRomfsSecMeta.offset + e.physOffset + (e.nextVirt - e.virtOffset),
+        });
     }
-    registerBaseRanges(baseSource, baseRanges);
 
     const baseCtr = new AesCtr(baseTitlekey, baseNonce);
-    for (const e of entries) {
-        if (e.isPatch) continue;
-        await readBaseRun(baseSource, baseRomfsSecMeta.offset, baseRomfsSecMeta.size, baseCtr,
-            e.physOffset, e.virtOffset, e.nextVirt - e.virtOffset, scatterWrite);
+
+    // Lockstep gate (same as mergeRomFS): NCZ source + monotonic base → Pass B
+    // is fed by ONE bounded sequential stream instead of pre-allocated range
+    // buffers. Either way Pass B reads through readBaseRun.
+    let lockstep = null;
+    if (options?.lockstep !== false) {
+        lockstep = startLockstepIfMonotonic(baseSource, baseRuns, true);
+        if (lockstep) {
+            const baseBytes = baseRuns.reduce((s, r) => s + (r.physEnd - r.physStart), 0);
+            _log('info', `Base lockstep (scatter): ${baseRuns.length} run(s), ${baseBytes.toLocaleString()} bytes — one stream, no range pre-allocation`);
+        }
     }
+    const baseReader = lockstep || baseSource;
+    if (!lockstep) registerBaseRanges(baseSource, baseRuns.map(r => ({ start: r.physStart, end: r.physEnd })));
 
-    // ── Pass U: patch regions, physical order ──────────────────────────────
-    const patchEntries = entries
-        .filter(e => e.isPatch)
-        .map(e => ({ e, runLen: e.nextVirt - e.virtOffset, abs: updateRomfsSec.offset + e.physOffset }))
-        .sort((a, b) => a.abs - b.abs);
+    try {
+        for (const e of entries) {
+            if (e.isPatch) continue;
+            // Base run via the lockstep reader (monotonic NCZ base) or the
+            // range-registered source — readBaseRun does the aligned CTR.
+            await readBaseRun(baseReader, baseRomfsSecMeta.offset, baseRomfsSecMeta.size, baseCtr,
+                e.physOffset, e.virtOffset, e.nextVirt - e.virtOffset, scatterWrite);
+        }
 
-    const updReader = makeUpdateSource(
-        patchEntries.map(r => ({ off: r.abs, len: r.runLen })));
+        // ── Pass U: patch regions, physical order ──────────────────────────
+        const patchEntries = entries
+            .filter(e => e.isPatch)
+            .map(e => ({ e, runLen: e.nextVirt - e.virtOffset, abs: updateRomfsSec.offset + e.physOffset }))
+            .sort((a, b) => a.abs - b.abs);
 
-    for (const r of patchEntries) {
-        await readPatchRun(updReader, updateRomfsSec.offset, subBlock,
-            updateTitlekey, secureValue,
-            r.e.physOffset, r.e.virtOffset, r.runLen, scatterWrite);
+        const updReader = makeUpdateSource(
+            patchEntries.map(r => ({ off: r.abs, len: r.runLen })));
+
+        for (const r of patchEntries) {
+            await readPatchRun(updReader, updateRomfsSec.offset, subBlock,
+                updateTitlekey, secureValue,
+                r.e.physOffset, r.e.virtOffset, r.runLen, scatterWrite);
+        }
+    } finally {
+        if (lockstep) lockstep.finish();
     }
 
     return { dataLevelOffset, dataLevelSize, relocEntries: entries.length, subsectionEntries: subBlock.entries.length };

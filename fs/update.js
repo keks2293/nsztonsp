@@ -678,7 +678,8 @@ export async function update(readers, output, options = {}) {
                     : baseInput;
                 log('info', '[makeStreamRomfs] mergeRomFS starting...');
                 await mergeRomFS(freshBase, updateInput, {
-                    keys, baseTik: baseTikData, updateTik: updateTikData,
+                    keys, baseTik: baseTikData, updateTik: updateTikData, log,
+                    lockstep: options.lockstep,
                     // Await emit: a fire-and-forget onChunk lets the merge
                     // run ahead of the output, queueing hundreds of MB of
                     // pending writes in a slow (FSA) stream and making
@@ -737,7 +738,7 @@ export async function update(readers, output, options = {}) {
                         : baseInput;
                     await scatterRomFS({
                         baseInput: freshBase, updateCtx,
-                        options: { keys, baseTik: baseTikData, updateTik: updateTikData },
+                        options: { keys, baseTik: baseTikData, updateTik: updateTikData, lockstep: options.lockstep },
                         writeFn,
                         log,
                         // No onProgress here: packProgramNcaStream's writeFn rep() already
@@ -840,7 +841,7 @@ export async function update(readers, output, options = {}) {
             : baseInput;
         const mergeResult = await scatterRomFS({
             baseInput: freshBase, updateCtx,
-            options: { keys, baseTik: baseTikData, updateTik: updateTikData },
+            options: { keys, baseTik: baseTikData, updateTik: updateTikData, lockstep: options.lockstep },
             // The merged RomFS accumulates at its final NCA offset — the same
             // scatter-style buffer, only here it is written to the output forward
             // (buffered tail) instead of via seek-back.
