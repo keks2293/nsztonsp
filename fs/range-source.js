@@ -93,10 +93,12 @@ export function ViewRangeSource(view) {
 const STOP_PUMP = 'STOP_PUMP';
 
 export class NczStreamSource {
-    constructor(nczReader, parsed, log = () => {}) {
+    constructor(nczReader, parsed, log = () => {}, onProgress = null) {
         this._reader = nczReader;
         this._parsed = parsed;
         this._log = log;
+        this._onProgress = typeof onProgress === 'function' ? onProgress : null;
+        this._reached = 0; // far-most decompressed absolute offset (NW of each chunk)
         this._ranges = [];
         this._nextRange = 0;
         this._pumpStarted = false;
@@ -161,6 +163,14 @@ export class NczStreamSource {
         const decomp = new NCZDecompressor(this._reader);
         this._pumpPromise = decomp.decompress(() => {}, (chunk, offset) => {
             const cStart = offset, cEnd = offset + chunk.length;
+            // Optional progress: report the far-most decompressed absolute offset,
+            // including the discarded prefix BEFORE the first registered range
+            // (for sequential NCZ sources that is the whole work of reaching a
+            // table/run deep in the file — e.g. own-BKTR's reloc/sub tables).
+            if (this._onProgress && cEnd > this._reached) {
+                this._reached = cEnd;
+                this._onProgress(cEnd);
+            }
             while (this._nextRange < this._ranges.length) {
                 const r = this._ranges[this._nextRange];
                 if (cEnd <= r.start) {
