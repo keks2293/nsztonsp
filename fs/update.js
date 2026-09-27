@@ -8,7 +8,7 @@ import { sha256 } from '../crypto/sha256.js';
 import { mergeRomFS, scatterRomFS } from './bktr-merge.js';
 import { FileRangeSource, NczStreamSource, ViewRangeSource, SparseNcaView } from './range-source.js';
 import { preparePlaintextProgramNca, preparePlaintextProgramNcaInPlace, writePlaintextProgramNca, packProgramNcaStream, computeProgramNcaContentId, writeProgramNcaTwoPass, extractExefsStream, extractRomfsStream, createExefsAcidFilter, packMetaNca, computeProgramNcaLayout } from './nca-pack.js';
-import { computeOwnBktrContentId, writeOwnBktrProgramNca } from './bktr-pack.js';
+import { computeOwnBktrContentId, resolveOwnBktrLayout, writeOwnBktrProgramNca, writeOwnBktrProgramNcaSinglePass } from './bktr-pack.js';
 import { hexToBytes, writeU64LE, writeU32LE, readLeU64 } from './bytes.js';
 import { fsHeaderAt, FS_HDR, NCA_HEADER_SIZE, decryptNcaHeaderBytes, findRomfsFsHeader, findExefsFsHeader, SECTION_FS_TYPE, SECTION_CRYPTO_TYPE } from './nca-utils.js';
 import { writeFromReader } from './convert-common.js';
@@ -835,16 +835,36 @@ export async function update(readers, output, options = {}) {
             let contentId, meta, computedSize;
             const ownBktr = segmentedActive;
             if (ownBktr) {
-                log('info', 'Two-pass own-BKTR: self-contained Program NCA (own reloc/sub tables, data region = merged RomFS)...');
-                ({ size: computedSize, contentId, meta } = await computeOwnBktrContentId({
-                    baseNcaData: { headerRaw: baseHeaderRaw },
-                    updateNcaData: { headerRaw: updateHeaderRaw },
-                    makeUpdateSource: makeOwnUpdateSource, makeBaseSource: makeOwnBaseSource,
-                    keys, baseTik: baseTikData, updateTik: updateTikData,
-                    titleId: base.cnmt.titleId, exefsSize, romfsDataSize,
-                    streamExefs: makeStreamExefs(), log,
-                    progress: (p, label) => progress(p, label || 'Computing contentId (1/2)', pass1Bytes),
-                }));
+                if (!appendOnly) {
+                    // Seekable (FSA/memory): the NCA is written FIRST and the
+                    // 272-B PFS0 header only overwrites offset 0 at the very end,
+                    // so the contentId is needed AFTER the NCA bytes — the single
+                    // write pass (writeOwnBktrProgramNcaSinglePass) hashes its own
+                    // bytes inline. No Pass-1 data walk: update reads 3×→2×, base
+                    // 2×→1× (the walk is pure decompress+AES cost, see
+                    // scripts/bench_own_bktr_phases.mjs).
+                    log('info', 'Single-pass own-BKTR (seekable): layout resolved in Pass 1, NCA written + hashed in Pass 2...');
+                    ({ size: computedSize, meta } = await resolveOwnBktrLayout({
+                        baseNcaData: { headerRaw: baseHeaderRaw },
+                        updateNcaData: { headerRaw: updateHeaderRaw },
+                        makeUpdateSource: makeOwnUpdateSource, makeBaseSource: makeOwnBaseSource,
+                        keys, baseTik: baseTikData, updateTik: updateTikData,
+                        titleId: base.cnmt.titleId, exefsSize, romfsDataSize,
+                        streamExefs: makeStreamExefs(), log,
+                        progress: (p, label) => progress(p, label || 'Resolving layout (1/2)', pass1Bytes),
+                    }));
+                } else {
+                    log('info', 'Two-pass own-BKTR: self-contained Program NCA (own reloc/sub tables, data region = merged RomFS)...');
+                    ({ size: computedSize, contentId, meta } = await computeOwnBktrContentId({
+                        baseNcaData: { headerRaw: baseHeaderRaw },
+                        updateNcaData: { headerRaw: updateHeaderRaw },
+                        makeUpdateSource: makeOwnUpdateSource, makeBaseSource: makeOwnBaseSource,
+                        keys, baseTik: baseTikData, updateTik: updateTikData,
+                        titleId: base.cnmt.titleId, exefsSize, romfsDataSize,
+                        streamExefs: makeStreamExefs(), log,
+                        progress: (p, label) => progress(p, label || 'Computing contentId (1/2)', pass1Bytes),
+                    }));
+                }
             } else {
                 ({ size: computedSize, contentId, meta } = await computeProgramNcaContentId({
                     exefsSize, romfsDataSize, titleId: base.cnmt.titleId, keys,
@@ -854,9 +874,11 @@ export async function update(readers, output, options = {}) {
                 }));
             }
             log('info', `[timing] Pass 1 (contentId): ${((performance.now() - t0) / 1000).toFixed(1)}s`);
-            log('info', contentId
-                ? `ContentId: ${contentId} (${computedSize} bytes)`
-                : `Program NCA: ${computedSize} bytes (contentId computed in Pass 2)`);
+            log('info', ownBktr && !appendOnly
+                ? `Program NCA: ${computedSize} bytes (contentId computed during the write pass)`
+                : contentId
+                    ? `ContentId: ${contentId} (${computedSize} bytes)`
+                    : `Program NCA: ${computedSize} bytes (contentId computed in Pass 2)`);
 
             baseSource = null;
             updateSource = null;
@@ -867,7 +889,7 @@ export async function update(readers, output, options = {}) {
                 programSize: computedSize, meta, makeStreamExefs, makeStreamRomfs,
                 contentId, appendOnly,
                 ...(ownBktr ? {
-                    writeNca: writeOwnBktrProgramNca,
+                    writeNca: appendOnly ? writeOwnBktrProgramNca : writeOwnBktrProgramNcaSinglePass,
                     ncaExtra: { makeUpdateSource: makeOwnUpdateSource, makeBaseSource: makeOwnBaseSource },
                 } : {}),
             });
