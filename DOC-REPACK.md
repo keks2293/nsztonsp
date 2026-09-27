@@ -766,6 +766,7 @@ This anomaly is present **identically in both** the original update and yanu's r
 - `test_update_e2e.mjs` — full E2E test on Stardew Valley v0+v1310720
 - `test_update_sw_sim.mjs` — fd/seekback ≡ SW-sim/two-pass ≡ fd/buffered, one sha256 for all three modes
 - `test_twopass_sw_sim.mjs` — two-pass on a detaching vs copying sequential writer (browser SW transfer semantics); merge-level verification (the SW output is now a self-contained own-BKTR NCA, `fs/bktr-pack.js`)
+- `test_twopass_fsa_sim.mjs` — two-pass through a seek + positioned-write FSA writable (no read); merge-level verification (the FSA output is now a self-contained own-BKTR NCA, `fs/bktr-pack.js`)
 - `verify_updated_output.mjs` — compare output NSP vs yanu reference (member-wise hash match)
 - `bktr_verify_merged.mjs` — verify merged RomFS against yanu's output
 - `cmp_exefs.mjs` — compare two output NSPs' Program-ExeFS PFS0s against the original update NCA's ExeFS
