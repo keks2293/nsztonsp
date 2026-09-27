@@ -1,0 +1,473 @@
+// Own-BKTR Program NCA writer for sequential (SW) outputs with an NCZ BKTR update.
+//
+// Why this exists: on an append-only (SW) output with an NCZ BKTR update, the
+// two-pass path previously merged the RomFS by relying on the update's sparse
+// view. For updates whose BKTR section is a single run
+// larger than the platform ArrayBuffer ceiling (~2 GiB, e.g. LOLLIPOP CHAINSAW
+// RePOP), holding or slicing that section is impossible. This writer instead
+// EMITS a self-contained BKTR NCA whose section-1 layout is entirely ours:
+//
+//   sec1 = [ dataRegion ][ relocTable ][ subTable ][ pad ]
+//
+//   dataRegion = ALL merged RomFS bytes in a fresh physical layout
+//                (patch union intervals in physical-asc order, then base
+//                union intervals) — every run is copied (patches re-CRT'd from
+//                the update, base runs CTR-decrypted from the base and
+//                re-encrypted), so the resulting NCA needs NO base or update
+//                at read time.
+//   relocTable = our own bucket tree: every entry isPatch=1 and maps the
+//                ORIGINAL virtual offsets onto our data region.
+//   subTable   = one subsection [0, dataRegionSize) with ctrVal=0, encrypted
+//                with our own FsHeader section_ctr (gen=1,secv=2).
+//
+// mergeRomFS(base, ours) then reproduces byte-identical merged RomFS output
+// without ever touching the base source, and the writer itself only streams
+// (no section-sized ArrayBuffer anywhere).
+//
+// Discipline mirrors the rest of the two-pass path:
+//   Pass 1 (computeOwnBktrContentId): hashes the final NCA bytes in FILE order
+//     (encHeader | exe htable | exefs | exePad | dataRegion | relocEnc | subEnc
+//     | romPad). The data region is hashed WHILE it is produced, in physical
+//     order — the same single read pass feeds both the AesCtr and the hash.
+//   Pass 2 (writeOwnBktrProgramNca): re-reads the same patch + base runs with
+//     FRESH sources and a FRESH AesCtr (seek(sec1Start), same nonce), so the
+//     ciphertext is deterministic between the passes, then writes sequentially.
+//
+// Sources: compute/write take closures makeUpdateSource(ranges) and
+// makeBaseSource() (see update.js) so a fresh sequential base/update source can
+// be created per pass (an NczStreamSource with the pre-registered ranges).
+
+import { AesCtr } from '../crypto/aes-ops.mjs';
+import { createStreamingSHA256 } from '../crypto/sha256.js';
+import { readLeU32, readLeU64, writeU32LE, writeU64LE } from './bytes.js';
+import { decryptNcaHeader } from './nca.js';
+import {
+    NCA_HEADER_SIZE, NCA_HDR, FS_HDR, NCA_CONTENT_TYPE,
+    SECTION_FS_TYPE, SECTION_CRYPTO_TYPE,
+    decryptNcaHeaderBytes, fsHeaderAt, reversedSectionCtr,
+} from './nca-utils.js';
+import { decryptBktrTableData } from './bktr.js';
+import { resolveBktrMeta, readBktrTables, readPatchRun, readBaseRun, registerBaseRanges } from './bktr-merge.js';
+import {
+    buildNcaHeader, buildPfs0FsHeader, fillPfs0Superblock, fillSectionHashes,
+    encryptNcaHeader, StreamingPfs0Hasher, pad200, PFS0_EXEFS_HASH_BLOCK_SIZE, CRYPT,
+} from './nca-pack.js';
+
+const BKTR_MAGIC = 0x52544B42; // "BKTR"
+const BUCKET_SIZE = 0x4000;
+const RELOC_ENTRIES_PER_BUCKET = 818;  // 0x3FF0 / 0x14
+const RELOC_ENTRY_SIZE = 0x14;         // virt u64 | phys u64 | isPatch u32
+const SUB_ENTRIES_PER_BUCKET = 1023;   // 0x3FF0 / 0x10
+const SUB_ENTRY_SIZE = 0x10;           // offset u64 | _0x8 u32 | ctr_val u32
+const GENERATION = 1;                  // ours — any value ≥ real update's gen works for the reader
+const SECURE_VALUE = 2;                // matches the base/update secure value (AesCtrUpperIv)
+// Our data region is one AES-CTR(-EX) stream with counter head
+// [secv_BE ‖ ctrVal_BE] = [00 00 00 02 00 00 00 00], starting at sec1Start.
+const OWN_DATA_NONCE = new Uint8Array([0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00]);
+
+function ceil16(n) { return Math.ceil(n / 16) * 16; }
+function numBucketsOf(n, per) { return Math.max(1, Math.ceil(n / per)); }
+
+// Sort runs by start, merge overlapping/nesting runs into their union (includes
+// a defensive copy so caller arrays are never mutated).
+function unionIntervals(runs) {
+    const sorted = [...runs].sort((a, b) => a.start - b.start);
+    const merged = [];
+    for (const r of sorted) {
+        const last = merged[merged.length - 1];
+        if (last && r.start <= last.end) last.end = Math.max(last.end, r.end);
+        else merged.push({ start: r.start, end: r.end });
+    }
+    return merged.map((m) => ({ start: m.start, end: m.end, len: m.end - m.start }));
+}
+
+// Binary search: last interval with interval.start <= start (intervals sorted
+// asc, disjoint). Returns the interval or null.
+function findInterval(ivs, start) {
+    let lo = 0, hi = ivs.length - 1, ans = -1;
+    while (lo <= hi) {
+        const mid = (lo + hi) >> 1;
+        if (ivs[mid].start <= start) { ans = mid; lo = mid + 1; }
+        else hi = mid - 1;
+    }
+    return ans < 0 ? null : ivs[ans];
+}
+
+// ── Own layout ───────────────────────────────────────────────────────────────
+export function buildOwnBktrLayout(exefsSize, dataRegionSize, nReloc, nSub) {
+    const exeHtableSize = pad200(Math.ceil(exefsSize / PFS0_EXEFS_HASH_BLOCK_SIZE) * 0x20);
+    const exeSectionSize = pad200(exeHtableSize + exefsSize);
+    const sec0Start = NCA_HEADER_SIZE;
+    const sec0DataOff = sec0Start + exeHtableSize;
+    const sec0End = sec0Start + exeSectionSize;
+    const sec1Start = sec0End;
+    const relocBlockSize = BUCKET_SIZE + numBucketsOf(nReloc, RELOC_ENTRIES_PER_BUCKET) * BUCKET_SIZE;
+    const subBlockSize = BUCKET_SIZE + numBucketsOf(nSub, SUB_ENTRIES_PER_BUCKET) * BUCKET_SIZE;
+    const relocOff = dataRegionSize;
+    const subOff = relocOff + relocBlockSize;
+    const romSectionSize = pad200(subOff + subBlockSize);
+    const sec1End = sec1Start + romSectionSize;
+    const ncaSize = sec1End;
+    return {
+        exeHtableSize, exeSectionSize, sec0Start, sec0End, sec0DataOff,
+        sec1Start, sec1End, relocOff, subOff, relocBlockSize, subBlockSize,
+        romSectionSize, ncaSize, exefsSize,
+        exePaddingSize: exeSectionSize - (exeHtableSize + exefsSize),
+        romPaddingSize: romSectionSize - (subOff + subBlockSize),
+    };
+}
+
+// ── Table buffers (plaintext; encrypted later with our own section_ctr) ──────
+// Relocation block layout (hactool bktr.h, verified against real updates):
+//   _0x0 u32 = 0, num_buckets u32, total_size u64,
+//   bucket_virtual_offsets[num_buckets] u64 @0x10,
+//   bucket[b] @ 0x4000 + b*0x4000: idx u32, n_entries u32, bucket_end u64,
+//   entries @ +0x10 (virt u64 | phys u64 | is_patch u32).
+function buildRelocationBlock(entries, totalSize) {
+    const numBuckets = numBucketsOf(entries.length, RELOC_ENTRIES_PER_BUCKET);
+    const block = new Uint8Array(BUCKET_SIZE + numBuckets * BUCKET_SIZE);
+    writeU32LE(block, 0x00, 0);
+    writeU32LE(block, 0x04, numBuckets);
+    writeU64LE(block, 0x08, totalSize);
+    for (let b = 0; b < numBuckets; b++) {
+        const first = b * RELOC_ENTRIES_PER_BUCKET;
+        writeU64LE(block, 0x10 + b * 8, entries[first].virtOffset);
+        const bOff = BUCKET_SIZE + b * BUCKET_SIZE;
+        const n = Math.min(RELOC_ENTRIES_PER_BUCKET, entries.length - first);
+        writeU32LE(block, bOff, b);
+        writeU32LE(block, bOff + 4, n);
+        const nextFirst = first + n;
+        const end = nextFirst < entries.length ? entries[nextFirst].virtOffset : totalSize;
+        writeU64LE(block, bOff + 8, end);
+        let e = bOff + 0x10;
+        for (let i = 0; i < n; i++) {
+            const en = entries[first + i];
+            writeU64LE(block, e, en.virtOffset);
+            writeU64LE(block, e + 8, en.physOffset);
+            writeU32LE(block, e + 0x10, en.isPatch ? 1 : 0);
+            e += RELOC_ENTRY_SIZE;
+        }
+    }
+    return block;
+}
+
+// Subsection block: same bucket structure; entries are
+//   offset u64 | _0x8 u32=0 | ctr_val u32.
+function buildSubsectionBlock(entries, totalSize) {
+    const numBuckets = numBucketsOf(entries.length, SUB_ENTRIES_PER_BUCKET);
+    const block = new Uint8Array(BUCKET_SIZE + numBuckets * BUCKET_SIZE);
+    writeU32LE(block, 0x00, 0);
+    writeU32LE(block, 0x04, numBuckets);
+    writeU64LE(block, 0x08, totalSize);
+    for (let b = 0; b < numBuckets; b++) {
+        const first = b * SUB_ENTRIES_PER_BUCKET;
+        writeU64LE(block, 0x10 + b * 8, entries[first].offset); // bucket_physical_offsets
+        const bOff = BUCKET_SIZE + b * BUCKET_SIZE;
+        const n = Math.min(SUB_ENTRIES_PER_BUCKET, entries.length - first);
+        writeU32LE(block, bOff, b);
+        writeU32LE(block, bOff + 4, n);
+        const nextFirst = first + n;
+        const end = nextFirst < entries.length ? entries[nextFirst].offset : totalSize;
+        writeU64LE(block, bOff + 8, end);
+        let e = bOff + 0x10;
+        for (let i = 0; i < n; i++) {
+            const en = entries[first + i];
+            writeU64LE(block, e, en.offset);
+            writeU32LE(block, e + 8, 0);
+            writeU32LE(block, e + 12, en.ctrVal);
+            e += SUB_ENTRY_SIZE;
+        }
+    }
+    return block;
+}
+
+// ── Section-1 FsHeader + full NCA header ─────────────────────────────────────
+// fs_type/hash_type/crypt_type bytes batch a real BKTR update (fs_header
+// [0x02]=0x00, [0x03]=0x03, [0x04]=0x04). The IVFC superblock [0x08:0xE8) is
+// copied verbatim from the update so the reader sees the same merged-data
+// window. PatchInfo slots carry our table placement (section-relative).
+function buildOwnBktrFsHeader({ updateFsHdr, relocOff, relocSize, subOff, subSize, nReloc, nSub }) {
+    const fh = new Uint8Array(0x200);
+    const v = new DataView(fh.buffer);
+    v.setUint16(0, 2, true);
+    fh[0x02] = 0x00;      // fs_type ROMFS (pack domain)
+    fh[0x03] = 0x03;      // hash_type ROMFS — parse-domain section fsType
+    fh[0x04] = 0x04;      // crypt_type BKTR
+    fh.set(updateFsHdr.subarray(0x08, 0xE8), 0x08); // superblock verbatim copy
+    fillPatchInfo(fh, FS_HDR.PATCH_INFO, relocOff, relocSize, nReloc);
+    fillPatchInfo(fh, FS_HDR.PATCH_INFO_AESCTREX, subOff, subSize, nSub);
+    writeU32LE(fh, FS_HDR.SECURE_VALUE - 4, GENERATION); // generation @0x140
+    writeU32LE(fh, FS_HDR.SECURE_VALUE, SECURE_VALUE);   // secure_value @0x144
+    return fh;
+}
+
+function fillPatchInfo(fh, off, blockOff, blockSize, nEntries) {
+    writeU64LE(fh, off, blockOff);
+    writeU64LE(fh, off + 8, blockSize);
+    writeU32LE(fh, off + 0x10, BKTR_MAGIC);
+    writeU32LE(fh, off + 0x14, 1);
+    writeU64LE(fh, off + 0x18, nEntries);
+}
+
+function buildOwnBktrNcaHeader({ titleId, keys, ourTitlekey, L, exeHash, ownFsHdr }) {
+    const header = buildNcaHeader(titleId, [
+        { offset: L.sec0Start, endOffset: L.sec0End, size: L.exeSectionSize },
+        { offset: L.sec1Start, endOffset: L.sec1End, size: L.romSectionSize },
+    ], keys, NCA_CONTENT_TYPE.PROGRAM, { keyAreaSlot2: ourTitlekey });
+    // Section 0: ExeFS (PFS0, CRYPT_NONE) with its standard superblock.
+    const exeFsHdr = buildPfs0FsHeader(CRYPT.NONE);
+    fillPfs0Superblock(exeFsHdr, exeHash.masterHash, {
+        blockSize: PFS0_EXEFS_HASH_BLOCK_SIZE,
+        hashTableSize: exeHash.rawHashSize,
+        pfs0Offset: L.exeHtableSize,
+        pfs0Size: L.exefsSize,
+    });
+    header.set(exeFsHdr, NCA_HDR.FS_HEADERS);
+    header.set(ownFsHdr, NCA_HDR.FS_HEADERS + NCA_HDR.FS_HEADER_SIZE);
+    fillSectionHashes(header);
+    writeU64LE(header, NCA_HDR.SIZE, L.ncaSize);
+    return encryptNcaHeader(header, keys);
+}
+
+// ── Data region: one sequential stream per pass ──────────────────────────────
+// Re-read the patch union intervals (asc) then the base union intervals (asc),
+// decrypt each from its source, re-encrypt with a fresh AesCtr over our own
+// layout, and hand the ciphertext to onChunk(cipher, dataRegionOffset).
+async function walkDataRegion({ L, meta, makeUpdateSource, makeBaseSource, onChunk }) {
+    const baseCtr = new AesCtr(meta.baseTitlekey, meta.baseNonce);
+    const patchSource = makeUpdateSource(meta.patchAbsRanges);
+    const baseSource = makeBaseSource();
+    // Base runs come sorted by physical offset already; registerBaseRanges
+    // sort+merges defensively and is a no-op for random-access sources.
+    registerBaseRanges(baseSource, meta.baseAbsRanges.map((r) => ({ start: r.start, end: r.start + r.len })));
+
+    const ownCtr = new AesCtr(meta.ourTitlekey, OWN_DATA_NONCE);
+    ownCtr.seek(L.sec1Start);
+
+    let placed = 0;
+    for (const iv of meta.patchIntervals) {
+        await readPatchRun(
+            patchSource, meta.updateRomfsSecOffset, meta.updateSubBlock,
+            meta.updateTitlekey, meta.secureValue,
+            iv.start, iv.place, iv.len,
+            async (chunk) => {
+                const cp = await ownCtr.encrypt(chunk);
+                placed += cp.length;
+                await onChunk(cp, placed - cp.length);
+            }
+        );
+    }
+    for (const iv of meta.baseIntervals) {
+        await readBaseRun(
+            baseSource, meta.baseRomfsSecMeta.offset, meta.baseRomfsSecMeta.size, baseCtr,
+            iv.start, iv.place, iv.len,
+            async (chunk) => {
+                const cp = await ownCtr.encrypt(chunk);
+                placed += cp.length;
+                await onChunk(cp, placed - cp.length);
+            }
+        );
+    }
+    if (placed !== L.relocOff) {
+        throw new Error(`own-BKTR: data region mismatch — placed 0x${placed.toString(16)} bytes, layout expects 0x${L.relocOff.toString(16)}`);
+    }
+}
+
+// ── Pass 1: compute layout + contentId ───────────────────────────────────────
+// streamExefs must be re-callable (a fresh factory result, one ExeFS extract
+// stream per call): once for the PFS0 hash table, once for the contentId hash.
+export async function computeOwnBktrContentId({
+    baseNcaData, updateNcaData,
+    makeUpdateSource, makeBaseSource,
+    keys, baseTik, updateTik, baseTitlekey, updateTitlekey,
+    titleId, exefsSize, romfsDataSize,
+    streamExefs,
+    log, progress,
+}) {
+    const _log = typeof log === 'function' ? log : () => {};
+    const _prog = typeof progress === 'function' ? progress : () => {};
+
+    _log('info', '  Two-pass own-BKTR: computing own NCA layout + contentId (Pass 1)...');
+    const t0 = performance.now();
+
+    // Preamble: resolve BKTR parameters from the REAL update (titlekeys, table
+    // absolute offsets) and grab its section-1 FsHeader for the superblock copy.
+    const metaB = await resolveBktrMeta(baseNcaData, updateNcaData, { keys, baseTik, updateTik, baseTitlekey, updateTitlekey });
+    _log('info', `  BKTR: romfsSec offset=0x${metaB.updateRomfsSec.offset.toString(16)}, reloc@0x${metaB.relocAbsOffset.toString(16)}+0x${metaB.relocHeader.size.toString(16)}, sub@0x${metaB.subAbsOffset.toString(16)}+0x${metaB.subHeader.size.toString(16)}`);
+
+    const updateHeader = decryptNcaHeader(updateNcaData.headerRaw, keys);
+    const updIdx = updateHeader.sections.findIndex(s => s.fsType === SECTION_FS_TYPE.ROMFS && s.cryptoType === SECTION_CRYPTO_TYPE.BKTR);
+    if (updIdx < 0) throw new Error('own-BKTR: update has no BKTR romfs section');
+    const updateDecHeader = decryptNcaHeaderBytes(updateNcaData.headerRaw, keys);
+    const updateFsHdr = fsHeaderAt(updateDecHeader, updIdx);
+
+    // Parse the real tables. Reaching them means a sequential NCZ pass over the
+    // whole prefix up to the last table (reloc/sub sit deep in the file) — that
+    // prefix decompression was previously invisible to the progress bar. Fold it
+    // in as its own phase: the table source reports the far-most decompressed
+    // absolute offset through the new onProgress hook.
+    const tableRanges = [
+        { off: metaB.relocAbsOffset, len: metaB.relocHeader.size },
+        { off: metaB.subAbsOffset, len: metaB.subHeader.size },
+    ].sort((a, b) => a.off - b.off);
+    const tableReadEnd = tableRanges[tableRanges.length - 1].off + tableRanges[tableRanges.length - 1].len;
+    // Table phase + compute phase (2×exefs + data region) share one bar;
+    // estimate the compute denominator with romfsDataSize (≈ dataRegionSize,
+    // refined below once the tables are read).
+    const pass1Estimate = tableReadEnd + 2 * exefsSize + (romfsDataSize || 0);
+    const tableSource = makeUpdateSource(tableRanges, (reached) => {
+        _prog(Math.min(1, reached / pass1Estimate), 'Reading BKTR tables...');
+    });
+    const { relocBlock, subBlock } = await readBktrTables(tableSource, metaB);
+
+    // Entry run lengths in VIRTUAL order.
+    const entries = [];
+    for (let i = 0; i < relocBlock.entries.length; i++) {
+        const e = relocBlock.entries[i];
+        const nextVirt = i + 1 < relocBlock.entries.length ? relocBlock.entries[i + 1].virtOffset : relocBlock.totalSize;
+        const len = nextVirt - e.virtOffset;
+        if (len <= 0) throw new Error(`own-BKTR: zero-length relocation run at virt=0x${e.virtOffset.toString(16)}`);
+        if (len % 16 !== 0) throw new Error(`own-BKTR: non-16-aligned run len 0x${len.toString(16)} — cannot build own layout`);
+        entries.push({ virtOffset: e.virtOffset, physOffset: e.physOffset, isPatch: !!e.isPatch, len });
+    }
+    const totalVirtSize = relocBlock.totalSize;
+
+    // Physical runs in the SOURCE data regions → union intervals (asc), placed
+    // physically: patch first, then base copies.
+    const patchRuns = [], baseRuns = [];
+    for (const e of entries) (e.isPatch ? patchRuns : baseRuns).push({ start: e.physOffset, end: e.physOffset + e.len });
+    const patchIntervals = unionIntervals(patchRuns);
+    const baseIntervals = unionIntervals(baseRuns);
+    if (patchIntervals.length === 0 && baseIntervals.length === 0) {
+        throw new Error('own-BKTR: no patch or base runs to pack');
+    }
+    let cursor = 0;
+    for (const iv of patchIntervals) {
+        if (iv.len % 16 !== 0) throw new Error(`own-BKTR: non-16-aligned patch interval len 0x${iv.len.toString(16)}`);
+        iv.place = cursor;
+        cursor += ceil16(iv.len);
+    }
+    for (const iv of baseIntervals) {
+        if (iv.len % 16 !== 0) throw new Error(`own-BKTR: non-16-aligned base interval len 0x${iv.len.toString(16)}`);
+        iv.place = cursor;
+        cursor += ceil16(iv.len);
+    }
+    const dataRegionSize = cursor;
+    _log('info', `  own-BKTR: reloc=${entries.length} entries (patch=${patchRuns.length}, base=${baseRuns.length}), patch intervals=${patchIntervals.length}, base intervals=${baseIntervals.length}, data region=0x${dataRegionSize.toString(16)}`);
+
+    // Map every run into our data region; every outgoing entry stays isPatch=1.
+    const ownEntries = entries.map((e) => {
+        const ivs = e.isPatch ? patchIntervals : baseIntervals;
+        const iv = findInterval(ivs, e.physOffset);
+        if (!iv || e.physOffset + e.len > iv.end) {
+            throw new Error(`own-BKTR: run (${e.isPatch ? 'patch' : 'base'} phys=0x${e.physOffset.toString(16)} len=0x${e.len.toString(16)}) not covered by its union intervals`);
+        }
+        return { virtOffset: e.virtOffset, physOffset: iv.place + (e.physOffset - iv.start), isPatch: true };
+    });
+
+    const nReloc = ownEntries.length;
+    const nSub = 2;
+    const L = buildOwnBktrLayout(exefsSize, dataRegionSize, nReloc, nSub);
+    _log('info', `  own-BKTR layout: exeSection=0x${L.exeSectionSize.toString(16)}, sec1Start=0x${L.sec1Start.toString(16)}, reloc@0x${L.relocOff.toString(16)}+0x${L.relocBlockSize.toString(16)}, sub@0x${L.subOff.toString(16)}+0x${L.subBlockSize.toString(16)}, ncaSize=0x${L.ncaSize.toString(16)}`);
+
+    // Plaintext tables.
+    const relocPlain = buildRelocationBlock(ownEntries, totalVirtSize);
+    const subEntries = [
+        { offset: 0, ctrVal: 0 },
+        { offset: dataRegionSize, ctrVal: 1 }, // sentinel (boundary marker)
+    ];
+    const subPlain = buildSubsectionBlock(subEntries, dataRegionSize);
+
+    // ExeFS PFS0 hash table (pass A).
+    let done = 0;
+    // Exact denominator: table prefix + 2×exefs + data region. The table-phase
+    // fraction (≈ tableReadEnd/pass1Estimate) is already booked on the bar; the
+    // compute phase continues from there and lands exactly on 1.0.
+    const pass1Total = tableReadEnd + 2 * exefsSize + dataRegionSize;
+    const rep = (n) => {
+        done += n;
+        _prog(Math.min(1, (tableReadEnd + done) / pass1Total), 'Computing contentId (1/2)');
+    };
+    const pfs0 = new StreamingPfs0Hasher(PFS0_EXEFS_HASH_BLOCK_SIZE);
+    await streamExefs(async (chunk) => { pfs0.update(chunk, true); rep(chunk.length); });
+    const exeHash = await pfs0.finalize();
+
+    // Header + encrypted tables.
+    const ownFsHdr = buildOwnBktrFsHeader({
+        updateFsHdr, relocOff: L.relocOff, relocSize: L.relocBlockSize,
+        subOff: L.subOff, subSize: L.subBlockSize, nReloc, nSub,
+    });
+    const encHeader = buildOwnBktrNcaHeader({ titleId, keys, ourTitlekey: metaB.updateTitlekey, L, exeHash, ownFsHdr });
+    const ownTableNonce = reversedSectionCtr(ownFsHdr); // [00 00 00 02 00 00 00 01]
+    const relocEnc = await decryptBktrTableData(relocPlain, metaB.updateTitlekey, ownTableNonce, L.sec1Start + L.relocOff);
+    const subEnc = await decryptBktrTableData(subPlain, metaB.updateTitlekey, ownTableNonce, L.sec1Start + L.subOff);
+
+    // Meta handed to Pass 2 (sources re-created fresh per pass).
+    const meta = {
+        L, encHeader, exeHash, ourTitlekey: metaB.updateTitlekey,
+        patchIntervals, baseIntervals,
+        patchAbsRanges: patchIntervals.map((iv) => ({ off: metaB.updateRomfsSec.offset + iv.start, len: iv.len })),
+        baseAbsRanges: baseIntervals.map((iv) => ({ start: metaB.baseRomfsSecMeta.offset + iv.start, len: iv.len })),
+        updateRomfsSecOffset: metaB.updateRomfsSec.offset,
+        baseRomfsSecMeta: metaB.baseRomfsSecMeta,
+        updateSubBlock: subBlock,
+        updateTitlekey: metaB.updateTitlekey, secureValue: metaB.secureValue,
+        baseTitlekey: metaB.baseTitlekey, baseNonce: metaB.baseNonce,
+        relocEnc, subEnc,
+    };
+
+    // ContentId = sha256 over the NCA in file order.
+    const sha = createStreamingSHA256();
+    sha.update(encHeader);
+    sha.update(exeHash.hashTable);
+    await streamExefs(async (chunk) => { sha.update(chunk); rep(chunk.length); });
+    if (L.exePaddingSize > 0) sha.update(new Uint8Array(L.exePaddingSize));
+    await walkDataRegion({ L, meta, makeUpdateSource, makeBaseSource, onChunk: async (cp) => { sha.update(cp); rep(cp.length); } });
+    sha.update(relocEnc);
+    sha.update(subEnc);
+    if (L.romPaddingSize > 0) sha.update(new Uint8Array(L.romPaddingSize));
+    const contentId = sha.hex();
+
+    _log('info', `  Two-pass own-BKTR contentId (Pass 1): ${contentId} (${L.ncaSize} bytes NCA)`);
+    return { size: L.ncaSize, contentId, meta };
+}
+
+// ── Pass 2: write the same bytes sequentially ────────────────────────────────
+export async function writeOwnBktrProgramNca({ meta, adapter, ncaOffset, contentId, streamExefs, makeUpdateSource, makeBaseSource, log, progress }) {
+    const _log = typeof log === 'function' ? log : () => {};
+    const _prog = typeof progress === 'function' ? progress : () => {};
+    const { L, encHeader, exeHash, relocEnc, subEnc } = meta;
+
+    let expected = ncaOffset;
+    let done = 0;
+    const w = async (pos, data) => {
+        if (pos !== expected) {
+            throw new Error(`writeOwnBktrProgramNca: non-sequential write at 0x${pos.toString(16)} (expected 0x${expected.toString(16)})`);
+        }
+        const n = data.byteLength;
+        expected += n;
+        done += n;
+        if (_prog) _prog(Math.min(1, done / L.ncaSize));
+        return await adapter.write(pos, data);
+    };
+
+    _log('info', '  Pass 2: writing own-BKTR NCA sequentially...');
+    await w(ncaOffset, encHeader);
+    await w(ncaOffset + L.sec0Start, exeHash.hashTable);
+    await streamExefs(async (chunk, off) => {
+        await w(ncaOffset + L.sec0DataOff + off, chunk);
+    });
+    if (L.exePaddingSize > 0) {
+        await w(ncaOffset + L.sec0DataOff + L.exefsSize, new Uint8Array(L.exePaddingSize));
+    }
+    await walkDataRegion({ L, meta, makeUpdateSource, makeBaseSource, onChunk: async (cp, placed) => {
+        await w(ncaOffset + L.sec1Start + placed, cp);
+    } });
+    await w(ncaOffset + L.sec1Start + L.relocOff, relocEnc);
+    await w(ncaOffset + L.sec1Start + L.subOff, subEnc);
+    if (L.romPaddingSize > 0) {
+        await w(ncaOffset + L.sec1Start + L.subOff + L.subBlockSize, new Uint8Array(L.romPaddingSize));
+    }
+    if (_prog) _prog(1);
+    return contentId;
+}

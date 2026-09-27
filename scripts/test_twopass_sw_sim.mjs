@@ -1,11 +1,31 @@
 // Simulates the browser SW download adapter (sequential append + zero gap-fill)
 // and runs the full two-pass BKTR update on the real Stardew NSZ files.
-// Verifies the output is byte-identical to the yanu reference.
+//
+// The sequential-output two-pass path now emits a SELF-CONTAINED own-BKTR
+// Program NCA (fs/bktr-pack.js): the whole BKTR section is rewritten with our
+// own data region + reloc/sub tables, so the produced NSP can no longer be
+// byte-compared to the yanu plaintext-merge reference. Verification therefore
+// happens at the MERGE level:
+//   - the SW stream must stay append-only (no gap-fills, no backward writes);
+//   - the PFS0 header must be 272 bytes (fixed name lengths);
+//   - the produced Program NCA must merge byte-identically to the real update:
+//     mergeRomFS(base, producedNCA) == scatter-merge of the real update;
+//   - the PFS0 program name must embed sha256(produced NCA) — the Pass-1
+//     contentId equals the Pass-2 written bytes exactly.
 //
 // Run: node scripts/test_twopass_sw_sim.mjs
 import fs from 'fs';
+import { createHash } from 'crypto';
 import { KeysParser } from '../keys.js';
 import { update } from '../fs/update.js';
+import { PFS0 } from '../fs/pfs0.js';
+import { openContainer } from '../fs/container.js';
+import { decryptNcaHeader } from '../fs/nca.js';
+import { BufferRangeSource, NczStreamSource } from '../fs/range-source.js';
+import { AdapterNCZReader, parseNczSections } from '../fs/ncz.js';
+import { decryptNcaHeaderBytes, fsHeaderAt, SECTION_FS_TYPE, SECTION_CRYPTO_TYPE } from '../fs/nca-utils.js';
+import { resolveBktrMeta, readBktrTables, mergeRomFS, scatterRomFS } from '../fs/bktr-merge.js';
+import { readLeU64 } from '../fs/bytes.js';
 
 class FileReader {
   constructor(path) {
@@ -68,95 +88,70 @@ class SwSim {
   close() { fs.closeSync(this.fd); }
 }
 
-function compareFiles(a, b) {
-  const sizeA = fs.statSync(a).size;
-  const sizeB = fs.statSync(b).size;
-  if (sizeA !== sizeB) return { same: false, firstDiff: -1, sizeA, sizeB };
-  const fdA = fs.openSync(a, 'r');
-  const fdB = fs.openSync(b, 'r');
-  const CHUNK = 16 * 1024 * 1024;
-  let off = 0;
-  let firstDiff = -1;
-  while (off < sizeA && firstDiff === -1) {
-    const n = Math.min(CHUNK, sizeA - off);
-    const ba = Buffer.alloc(n);
-    const bb = Buffer.alloc(n);
-    fs.readSync(fdA, ba, 0, n, off);
-    fs.readSync(fdB, bb, 0, n, off);
-    if (!ba.equals(bb)) {
-      for (let i = 0; i < n; i++) if (ba[i] !== bb[i]) { firstDiff = off + i; break; }
-    }
-    off += n;
-  }
-  fs.closeSync(fdA);
-  fs.closeSync(fdB);
-  return { same: firstDiff === -1 && sizeA === sizeB, firstDiff, sizeA, sizeB };
-}
-
 const DIR = '/Users/rmitkov/Downloads/Stardew Valley [NSZ]';
 const basePath = process.env.BASE_PATH || `${DIR}/Stardew Valley [0100E65002BB8000][v0] (0.87 GB).nsz`;
 const updatePath = process.env.UPDATE_PATH || `${DIR}/Stardew Valley [0100E65002BB8800][v1310720] (0.67 GB).nsz`;
-// Reference = our verified output (sha 3bae0bac…, 272-byte PFS0 header,
-// 0x10-aligned, matches yanu/Nintendo) — same format as the new output, so the
-// comparison is a plain byte-for-byte match (shift 0).
-const refPath = process.env.REF_PATH || `${DIR}/Stardew Valley [0100E65002BB8000][v0] (0.87 GB)_updated.nsp`;
-const refHeaderSize = process.env.REF_HDR ? Number(process.env.REF_HDR) : 272;
-const yanuPath = process.env.YANU_PATH || '/Users/rmitkov/Downloads/Stardew Valley [0100E65002BB8000][v0] (0.87 GB) updated in yanu.nsp';
 
 const keys = KeysParser.parse(fs.readFileSync(new URL('../static/prod.keys', import.meta.url), 'utf8'));
 const log = (level, msg) => { if (!process.env.QUIET) console.log(`[${level.toUpperCase()}] ${msg}`); };
 const progress = () => {};
+const sha256 = (b) => createHash('sha256').update(Buffer.from(b.buffer, b.byteOffset, b.length)).digest('hex');
+
+const baseReader = new FileReader(basePath);
+const updateReader = new FileReader(updatePath);
+const baseC = await openContainer({ reader: baseReader, name: 'base' });
+const updC = await openContainer({ reader: updateReader, name: 'update' });
+const pickProg = (c) => c.entries.filter(e => /\.ncz$/i.test(e.name) && !/\.cnmt\.ncz$/i.test(e.name)).sort((a, b) => b.size - a.size)[0];
+const pickTik = async (c, r) => { const t = c.entries.find(e => e.name.toLowerCase().endsWith('.tik')); return t ? await r.read(t.offset, t.size) : null; };
+const baseProg = pickProg(baseC);
+const updProg = pickProg(updC);
+const baseHeaderRaw = await baseReader.read(baseProg.offset, Math.min(baseProg.size, 0xC00));
+const updateHeaderRaw = await updateReader.read(updProg.offset, Math.min(updProg.size, 0xC00));
+const baseTik = await pickTik(baseC, baseReader);
+const updateTik = await pickTik(updC, updateReader);
+// Member-window readers: parseNczSections offsets are relative to the .ncz
+// MEMBER, so every NczStreamSource must read through the same window (a whole-
+// file reader would decompress at wrong absolute offsets → registered ranges
+// never fill → "NCA data ended before registered range").
+const baseNcz = new AdapterNCZReader(baseReader, baseProg.offset, baseProg.size);
+const updateNcz = new AdapterNCZReader(updateReader, updProg.offset, updProg.size);
+const baseParsed = await parseNczSections(baseNcz);
+const updateParsed = await parseNczSections(updateNcz);
+
+const updateHdr = decryptNcaHeader(updateHeaderRaw, keys);
+const bk = updateHdr.sections.findIndex(s => s.fsType === SECTION_FS_TYPE.ROMFS && s.cryptoType === SECTION_CRYPTO_TYPE.BKTR);
+if (bk < 0) throw new Error('update has no BKTR romfs section');
+const updFh = fsHeaderAt(decryptNcaHeaderBytes(updateHeaderRaw, keys), bk);
+const dataLevelSize = readLeU64(updFh, 0x18 + 5 * 0x18 + 8);
 
 async function runSwSim(runOutPath, detach) {
   const sw = new SwSim(runOutPath, { detach });
   const readers = [
-    { name: 'base.nsz', reader: new FileReader(basePath) },
-    { name: 'update.nsz', reader: new FileReader(updatePath) },
+    { name: 'base.nsz', reader: baseReader },
+    { name: 'update.nsz', reader: updateReader },
   ];
-  const result = await update(readers, { writable: sw }, { keys, log, progress });
+  await update(readers, { writable: sw }, { keys, log, progress });
   sw.close();
-  for (const r of readers) r.reader.close();
-  return { sw, result };
+  return sw;
 }
 
-// Run 1 (detach=true): the STRICT case — mimics the OLD SWDownloader whose
-// postMessage transfer detached the caller's buffers (zeroing .length after
-// the write). Passes only if the pipeline never touches a buffer post-write.
-// Run 2 (detach=false): the FIXED SWDownloader behavior (always posts a copy).
-const runs = [];
-for (const detach of [true, false]) {
-  console.log(`\n===== SwSim run: detach=${detach} =====`);
-  const p = `/tmp/twopass_sw_sim_${detach ? 'detach' : 'copy'}.nsp`;
-  runs.push({ detach, path: p, ...await runSwSim(p, detach) });
-}
+// Reference merged data (physical-order scatter of the real update).
+const mergedRef = new Uint8Array(dataLevelSize);
+await scatterRomFS({
+  baseInput: { headerRaw: baseHeaderRaw, source: new NczStreamSource(baseNcz, baseParsed, log) },
+  updateCtx: { headerRaw: updateHeaderRaw, source: null, reader: updateNcz, parsed: updateParsed, streamable: true },
+  options: { keys, baseTik, updateTik },
+  writeFn: (off, chunk) => { mergedRef.set(chunk, off); },
+  log,
+});
+const realMeta = await resolveBktrMeta({ headerRaw: baseHeaderRaw }, { headerRaw: updateHeaderRaw }, { keys, baseTik, updateTik });
+const tr = [
+  { off: realMeta.relocAbsOffset, len: realMeta.relocHeader.size },
+  { off: realMeta.subAbsOffset, len: realMeta.subHeader.size },
+].sort((a, b) => a.off - b.off);
+const { relocBlock } = await readBktrTables((() => { const s = new NczStreamSource(updateNcz, updateParsed, log); for (const r of tr) s.registerRange(r.off, r.len); return s; })(), realMeta);
+log('info', `reference: reloc=${relocBlock.entries.length}, merged=${dataLevelSize} bytes`);
 
-function compareShifted(outPath, refPath, outHdr, refHdr) {
-  // Compare out[outHdr..] with ref[refHdr..] — content after the PFS0 header.
-  const sizeA = fs.statSync(outPath).size - outHdr;
-  const sizeB = fs.statSync(refPath).size - refHdr;
-  if (sizeA !== sizeB) return { same: false, firstDiff: -1, sizeA, sizeB };
-  const fdA = fs.openSync(outPath, 'r');
-  const fdB = fs.openSync(refPath, 'r');
-  const CHUNK = 16 * 1024 * 1024;
-  let off = 0;
-  let firstDiff = -1;
-  while (off < sizeA && firstDiff === -1) {
-    const n = Math.min(CHUNK, sizeA - off);
-    const ba = Buffer.alloc(n);
-    const bb = Buffer.alloc(n);
-    fs.readSync(fdA, ba, 0, n, off + outHdr);
-    fs.readSync(fdB, bb, 0, n, off + refHdr);
-    if (!ba.equals(bb)) {
-      for (let i = 0; i < n; i++) if (ba[i] !== bb[i]) { firstDiff = off + i; break; }
-    }
-    off += n;
-  }
-  fs.closeSync(fdA);
-  fs.closeSync(fdB);
-  return { same: firstDiff === -1, firstDiff, sizeA, sizeB };
-}
-
-// New output must have a 0x10-aligned (272-byte) PFS0 header and yanu's total size.
 function hdrSizeOf(path) {
   const fd = fs.openSync(path, 'r');
   const head = Buffer.alloc(16);
@@ -165,37 +160,77 @@ function hdrSizeOf(path) {
   return 0x10 + head.readUInt32LE(4) * 0x18 + head.readUInt32LE(8);
 }
 
-const yanuSize = fs.statSync(yanuPath).size;
+async function mergeCompares(name, sw) {
+  // Extract the produced Program NCA from the SW output file.
+  const all = fs.readFileSync(sw.outPath);
+  const entries = new PFS0(all).getFiles();
+  const prog = entries.filter(e => /\.nca$/i.test(e.name) && !/\.cnmt\.nca$/i.test(e.name)).sort((a, b) => b.size - a.size)[0];
+  if (!prog) throw new Error(`${name}: no program NCA`);
+  const nca = all.subarray(prog.offset, prog.offset + prog.size);
+  const psha = sha256(nca);
+  // Pass-1 contentId must match Pass-2 bytes.
+  if (!prog.name.toLowerCase().startsWith(psha.slice(0, 32))) {
+    throw new Error(`${name}: program name ${prog.name.slice(0, 32)} != sha256-of-written ${psha.slice(0, 32)}`);
+  }
+  const ours = await mergeRomFS(
+    { headerRaw: baseHeaderRaw, source: { read: async () => new Uint8Array(0) } },
+    { headerRaw: nca.subarray(0, 0xC00), source: BufferRangeSource(nca) },
+    { keys, log }
+  );
+  if (ours.dataLevelSize !== dataLevelSize) throw new Error(`${name}: merged size mismatch`);
+  for (let i = 0; i < dataLevelSize; i++) {
+    if (ours.mergedData[i] !== mergedRef[i]) throw new Error(`${name}: merged byte diff at 0x${i.toString(16)}`);
+  }
+  console.log(`${name}: merge byte-identical (${dataLevelSize.toLocaleString()} bytes), contentId = sha of written NCA`);
+  return prog;
+}
+
+// Run 1 (detach=true): the STRICT case — mimics the OLD SWDownloader whose
+// postMessage transfer detached the caller's buffers (zeroing .length after
+// the write). Passes only if the pipeline never touches a buffer post-write.
+// Run 2 (detach=false): the FIXED SWDownloader behavior (always posts a copy).
+const runs = [];
+for (const detach of [true, false]) {
+  const p = `/tmp/twopass_sw_ownbktr_${detach ? 'detach' : 'copy'}.nsp`;
+  console.log(`\n===== SwSim run: detach=${detach} =====`);
+  runs.push({ detach, path: p, sw: await runSwSim(p, detach) });
+}
+
 let ok = true;
 for (const run of runs) {
-  console.log(`\n=== RESULT (detach=${run.detach}) ===`);
-  const hdr = hdrSizeOf(run.path);
-  const size = fs.statSync(run.path).size;
+  const { detach, sw, path } = run;
+  console.log(`\n=== RESULT (detach=${detach}) ===`);
+  const hdr = hdrSizeOf(path);
+  const size = fs.statSync(path).size;
   console.log(`header: ${hdr} (0x${hdr.toString(16)})  [expect 272 (0x110)]`);
-  console.log(`size: ${size}  yanu: ${yanuSize}`);
-  console.log(`SW sim: gapFills(>=0x1000)=${run.sw.gapFills.length}  backward=${run.sw.backward.length}`);
-  for (const g of run.sw.gapFills) console.log(`  gap at pos=0x${g.at.toString(16)} size=${g.size} (streamPos=0x${g.streamPos.toString(16)})`);
-  for (const b of run.sw.backward.slice(0, 10)) console.log(`  backward at pos=0x${b.at.toString(16)} len=${b.len} delta=${b.delta}`);
+  console.log(`size: ${size.toLocaleString()}`);
+  console.log(`SW sim: gapFills(>=0x1000)=${sw.gapFills.length}  backward=${sw.backward.length}`);
+  for (const g of sw.gapFills) console.log(`  gap at pos=0x${g.at.toString(16)} size=${g.size}`);
+  for (const b of sw.backward.slice(0, 10)) console.log(`  backward at pos=0x${b.at.toString(16)} len=${b.len} delta=${b.delta}`);
 
   if (hdr !== 272) { console.log(`FAIL: PFS0 header is ${hdr}, expected 272`); ok = false; }
-  if (size !== yanuSize) { console.log(`FAIL: total size ${size} != yanu ${yanuSize}`); ok = false; }
-  if (run.sw.gapFills.length || run.sw.backward.length) { console.log(`FAIL: SW sim detected non-sequential writes`); ok = false; }
-
-  const cmp = compareShifted(run.path, refPath, hdr, refHeaderSize);
-  if (cmp.same) {
-    console.log(`content after header: byte-identical to verified blob output (shifted by ${refHeaderSize - hdr} B)`);
-  } else {
-    console.log(`FAIL: content diff at offset 0x${cmp.firstDiff === -1 ? 'size-mismatch' : cmp.firstDiff.toString(16)} (post-header relative)`);
+  if (sw.gapFills.length || sw.backward.length) { console.log('FAIL: SW sim detected non-sequential writes'); ok = false; }
+  try {
+    run.progName = (await mergeCompares(`run(detach=${detach})`, sw)).name;
+  } catch (e) {
+    console.log(`FAIL: ${e.message}`);
     ok = false;
   }
 }
 
-// Both runs must be byte-identical to each other.
-if (runs[0].path !== runs[1].path) {
-  const both = compareShifted(runs[0].path, runs[1].path, 0, 0);
-  if (both.same) console.log('\ndetach run ≡ copy run: byte-identical');
-  else { console.log(`\nFAIL: detach vs copy run differ at 0x${both.firstDiff === -1 ? 'size' : both.firstDiff.toString(16)}`); ok = false; }
+// Both runs must produce the same contentId (files are unlinked only after this).
+if (runs[0] && runs[1]) {
+  const a = runs[0].progName, b = runs[1].progName;
+  if (!a || !b || a !== b) {
+    console.log(`FAIL: detach and copy runs produced different contentIds (${a ? a.slice(0, 32) : '?'} vs ${b ? b.slice(0, 32) : '?'})`); ok = false;
+  } else {
+    console.log(`\ndetach ≡ copy run: same contentId (${a.slice(0, 32)})`);
+  }
 }
 
-if (ok) console.log('\nPASS: all checks');
+for (const r of runs) { try { fs.unlinkSync(r.path); } catch { /* already gone */ } }
+
+baseReader.close();
+updateReader.close();
+if (ok) console.log('\nPASS: SW two-pass (own-BKTR) — sequential discipline, header, merge equality, determinism.');
 else process.exit(1);

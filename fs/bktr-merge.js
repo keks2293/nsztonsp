@@ -32,7 +32,7 @@ const BKTR_MAGIC = 0x52544B42; // "BKTR"
 // independent of registration order. File/buffer sources ignore registration (no-op),
 // so this is a no-op for them.
 //   ranges: [{ start, end }] absolute NCA offsets of each base run.
-function registerBaseRanges(source, ranges) {
+export function registerBaseRanges(source, ranges) {
     ranges.sort((a, b) => a.start - b.start);
     const merged = [];
     for (const r of ranges) {
@@ -51,7 +51,7 @@ function registerBaseRanges(source, ranges) {
 // Purely header-based — does NOT read the update source. Returns the crypto
 // parameters plus the absolute table offsets, so the caller can pre-register the
 // table ranges on a streaming source BEFORE reading them (step 2).
-async function resolveBktrMeta(baseNcaData, updateNcaData, options) {
+export async function resolveBktrMeta(baseNcaData, updateNcaData, options) {
     const { keys, baseTitlekey: providedBaseTitlekey, updateTitlekey: providedUpdateTitlekey, baseTik, updateTik, titlekeysFile } = options;
 
     if (!keys) throw new Error('BKTR: keys required');
@@ -139,7 +139,7 @@ async function resolveBktrMeta(baseNcaData, updateNcaData, options) {
 // Shared BKTR preamble, step 2: decrypt + parse the relocation and subsection
 // tables from a given update source (read reloc + sub ranges by absolute offset).
 // For a streaming source the caller must already have registered those ranges.
-async function readBktrTables(updateSource, meta) {
+export async function readBktrTables(updateSource, meta) {
     const relocTableBuf = await decryptBktrTableData(
         await updateSource.read(meta.relocAbsOffset, meta.relocHeader.size),
         meta.updateTitlekey, meta.updateNonce, meta.relocAbsOffset
@@ -167,7 +167,7 @@ const SCRATCH_CHUNK = CHUNK_16MB; // 16 MB
 
 // Copy a contiguous virtual run of a non-patch entry from the base source
 // (CTR-decrypted), feeding each chunk to sink.
-async function readBaseRun(baseSource, baseRomfsSecMetaOffset, baseRomfsSecSize, baseCtr, physOffset, virtOffset, runLen, sink) {
+export async function readBaseRun(baseSource, baseRomfsSecMetaOffset, baseRomfsSecSize, baseCtr, physOffset, virtOffset, runLen, sink) {
     if (physOffset + runLen > baseRomfsSecSize) {
         throw new Error(`BKTR: base read OOB at 0x${physOffset.toString(16)}`);
     }
@@ -185,7 +185,7 @@ async function readBaseRun(baseSource, baseRomfsSecMetaOffset, baseRomfsSecSize,
 
 // Decrypt a contiguous virtual run of a patch entry from the update source,
 // subsection-by-subsection, feeding each chunk to sink.
-async function readPatchRun(updReader, updateRomfsSecOffset, subBlock, titlekey, secureValue, physOffset, virtOffset, runLen, sink) {
+export async function readPatchRun(updReader, updateRomfsSecOffset, subBlock, titlekey, secureValue, physOffset, virtOffset, runLen, sink) {
     let writePos = 0;
     while (writePos < runLen) {
         const phys = physOffset + writePos;
@@ -357,9 +357,9 @@ export async function mergeRomFS(baseNcaData, updateNcaData, options = {}) {
     const _log = typeof options.log === 'function' ? options.log : () => {};
 
     const meta = await resolveBktrMeta(baseNcaData, updateNcaData, options);
-    const { baseRomfsSecMeta, dataLevelOffset, dataLevelSize, relocBlock, subBlock,
-            updateRomfsSec, updateTitlekey, updateNonce, secureValue, baseTitlekey, baseNonce }
-        = { ...meta, ...await readBktrTables(updateNcaData.source, meta) };
+    const { relocBlock, subBlock } = await readBktrTables(updateNcaData.source, meta);
+    const { baseRomfsSecMeta, dataLevelOffset, dataLevelSize,
+            updateRomfsSec, updateTitlekey, updateNonce, secureValue, baseTitlekey, baseNonce } = meta;
     const totalSize = relocBlock.totalSize;
 
     // The base non-patch runs in ENTRY (virtual) order — what the merge reads.
@@ -399,6 +399,8 @@ export async function mergeRomFS(baseNcaData, updateNcaData, options = {}) {
     const baseReader = lockstep || baseNcaData.source;
     if (!lockstep) registerBaseRanges(baseNcaData.source, baseRuns.map(r => ({ start: r.physStart, end: r.physEnd })));
 
+    const patchSource = updateNcaData.source;
+
     // Build merged RomFS (streaming or buffered) — see comments in the loop.
     const streaming = typeof onChunk === 'function';
     const merged = streaming ? null : new Uint8Array(totalSize);
@@ -432,7 +434,7 @@ export async function mergeRomFS(baseNcaData, updateNcaData, options = {}) {
 
             if (entry.isPatch) {
                 // Decrypt patch from update NCA using AesCtrEx (run at pos).
-                await readPatchRun(updateNcaData.source, updateRomfsSec.offset, subBlock,
+                await readPatchRun(patchSource, updateRomfsSec.offset, subBlock,
                     updateTitlekey, secureValue,
                     entry.physOffset + (pos - entry.virtOffset), pos, readSize, emitChunk);
             } else {

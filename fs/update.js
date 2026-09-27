@@ -8,6 +8,7 @@ import { sha256 } from '../crypto/sha256.js';
 import { mergeRomFS, scatterRomFS } from './bktr-merge.js';
 import { FileRangeSource, NczStreamSource, ViewRangeSource, SparseNcaView } from './range-source.js';
 import { preparePlaintextProgramNca, preparePlaintextProgramNcaInPlace, writePlaintextProgramNca, packProgramNcaStream, computeProgramNcaContentId, writeProgramNcaTwoPass, extractExefsStream, extractRomfsStream, createExefsAcidFilter, packMetaNca, computeProgramNcaLayout } from './nca-pack.js';
+import { computeOwnBktrContentId, writeOwnBktrProgramNca } from './bktr-pack.js';
 import { hexToBytes, writeU64LE, writeU32LE, readLeU64 } from './bytes.js';
 import { fsHeaderAt, FS_HDR, NCA_HEADER_SIZE, decryptNcaHeaderBytes, findRomfsFsHeader, findExefsFsHeader, SECTION_FS_TYPE, SECTION_CRYPTO_TYPE } from './nca-utils.js';
 import { writeFromReader } from './convert-common.js';
@@ -387,7 +388,7 @@ async function finalizeNspTail(adapter, { pw, pfs0Header, otherNcas, totalData, 
 //   seekable (FSA / memory): the NCA is written first (the adapter zero-fills
 //     [0..programNcaPfs0Offset)), then the real header overwrites offset 0.
 //     contentId piggybacks on the Pass 2 write. 2× romfs reads.
-async function writeTwoPassProgramAndFinish({ adapter, base, update, keys, log, progress, output, programSize, meta, makeStreamExefs, makeStreamRomfs, contentId, appendOnly }) {
+async function writeTwoPassProgramAndFinish({ adapter, base, update, keys, log, progress, output, programSize, meta, makeStreamExefs, makeStreamRomfs, contentId, appendOnly, writeNca = writeProgramNcaTwoPass, ncaExtra = {} }) {
     const otherNcas = collectOtherNcas(update);
     // Pass 2 is the write phase: Program NCA + other NCAs are one continuous
     // bar (the NCA is scaled into [0, programSize/phaseTotal], the tail picks
@@ -411,10 +412,11 @@ async function writeTwoPassProgramAndFinish({ adapter, base, update, keys, log, 
         programNcaPfs0Offset = programPfs0Offset(otherNcas);
     }
     t0 = performance.now();
-    const id = await writeProgramNcaTwoPass({
+    const id = await writeNca({
         meta, adapter, ncaOffset: programNcaPfs0Offset, contentId,
         streamExefs: makeStreamExefs(), streamRomfs: makeStreamRomfs(), log,
         progress: pass2Progress,
+        ...ncaExtra,
     });
     if (!appendOnly) log('info', `ContentId: ${id} (${programSize} bytes)`);
     log('info', `[timing] Pass 2 (Program NCA write): ${((performance.now() - t0) / 1000).toFixed(1)}s`);
@@ -616,6 +618,22 @@ export async function update(readers, output, options = {}) {
                 // inside resolveBktrMergeTables (U1) and scatterRomFS Pass U (U2).
                 updateSource = new NczStreamSource(updateReader, updateParsed, log);
                 updateSource.registerRange(updateExefsSec.offset, updateExefsSec.endOffset - updateExefsSec.offset);
+            } else if (hasBktrRomfs && outRead === null && updateMode !== 'buffered') {
+                // Two-pass on a sequential (SW) output: the update is NEVER
+                // buffered. The two-pass branch below routes this case to the
+                // own-BKTR writer (fs/bktr-pack.js): the whole BKTR section is
+                // rewritten as a self-contained Program NCA (own data region +
+                // reloc/sub tables) streamed in two passes — no whole-section
+                // buffer, no temp file. Here we only set up the ONE-SHOT ExeFS
+                // stream (read strictly sequentially on its single NCZ pass);
+                // tables + patch/base runs get their own fresh sources inside
+                // the own-BKTR compute/write passes. This replaces
+                // extractNcaSections' whole-section buffer, which exceeded the
+                // browser's ~2 GiB ArrayBuffer ceiling on 2 GiB+ sections
+                // (LOLLIPOP CHAINSAW RePOP).
+                log('info', `Update .nsz (two-pass, sequential output): no update buffer — ExeFS streamed, BKTR section rewritten as own-BKTR NCA (fs/bktr-pack.js)...`);
+                updateSource = new NczStreamSource(updateReader, updateParsed, log);
+                updateSource.registerRange(updateExefsSec.offset, updateExefsSec.endOffset - updateExefsSec.offset);
             } else {
                 const updRanges = [];
                 if (hasBktrRomfs && updateRomfsSec) {
@@ -647,6 +665,9 @@ export async function update(readers, output, options = {}) {
         // Update context for the streaming merge consumers:
         //  - makeExefsStream reads the ExeFS section from `source` (random access).
         //  - resolveBktrMergeTables (U1) + scatterRomFS Pass U (U2) stream the NCZ.
+        //  - the SW two-pass branch (segmentedActive) routes to the own-BKTR
+        //    writer (fs/bktr-pack.js), which builds its patch/base sources from
+        //    updateCtx's reader/parsed/streamable (makeOwnUpdateSource).
         const updateInput = { headerRaw: updateHeaderRaw, source: updateSource };
         const updateCtx = (updateKind === 'ncz')
             ? { headerRaw: updateHeaderRaw, reader: updateReader, parsed: updateParsed, streamable: true }
@@ -667,6 +688,7 @@ export async function update(readers, output, options = {}) {
         // stream factories shared by the streaming and two-pass paths. Each call
         // returns a fresh stream (new acidFilter / fresh base source) so repeated
         // passes get clean state.
+        const segmentedActive = updateKind === 'ncz' && hasBktrRomfs && outRead === null && updateMode !== 'buffered';
         const makeStreamExefs = () => makeExefsStream(updateInput, keys, updateTikData, options, log);
         const _baseReaderRef = baseReader;
         const _baseParsedRef = baseParsed;
@@ -794,12 +816,43 @@ export async function update(readers, output, options = {}) {
             // mirroring pass1Total in computeProgramNcaContentId.
             const pass1Bytes = (appendOnly ? 2 : 1) * (exefsSize + (romfsDataSize || 1));
             const t0 = performance.now();
-            const { size: computedSize, contentId, meta } = await computeProgramNcaContentId({
-                exefsSize, romfsDataSize, titleId: base.cnmt.titleId, keys,
-                streamExefs: makeStreamExefs(), streamRomfs: makeStreamRomfs(), log,
-                progress: (p) => progress(p, 'Computing contentId (1/2)', pass1Bytes),
-                contentIdInPass1: appendOnly,
-            });
+
+            // Own-BKTR source factories: every pass (two passes in compute, one in
+            // the write) needs a FRESH sequential source. Patch runs / tables come
+            // from the update NCZ (pre-registered ranges), base runs from the base
+            // NCZ (registered via registerBaseRanges inside walkDataRegion);
+            // random-access inputs just get their shared source back.
+            const makeOwnUpdateSource = (ranges, onProgress) => {
+                if (!updateCtx.streamable) return updateCtx.source;
+                const src = new NczStreamSource(updateCtx.reader, updateCtx.parsed, log, onProgress);
+                for (const r of ranges) src.registerRange(r.off, r.len);
+                return src;
+            };
+            const makeOwnBaseSource = () => baseKind === 'ncz'
+                ? new NczStreamSource(_baseReaderRef, _baseParsedRef, log)
+                : baseInput.source;
+
+            let contentId, meta, computedSize;
+            const ownBktr = segmentedActive;
+            if (ownBktr) {
+                log('info', 'Two-pass own-BKTR: self-contained Program NCA (own reloc/sub tables, data region = merged RomFS)...');
+                ({ size: computedSize, contentId, meta } = await computeOwnBktrContentId({
+                    baseNcaData: { headerRaw: baseHeaderRaw },
+                    updateNcaData: { headerRaw: updateHeaderRaw },
+                    makeUpdateSource: makeOwnUpdateSource, makeBaseSource: makeOwnBaseSource,
+                    keys, baseTik: baseTikData, updateTik: updateTikData,
+                    titleId: base.cnmt.titleId, exefsSize, romfsDataSize,
+                    streamExefs: makeStreamExefs(), log,
+                    progress: (p, label) => progress(p, label || 'Computing contentId (1/2)', pass1Bytes),
+                }));
+            } else {
+                ({ size: computedSize, contentId, meta } = await computeProgramNcaContentId({
+                    exefsSize, romfsDataSize, titleId: base.cnmt.titleId, keys,
+                    streamExefs: makeStreamExefs(), streamRomfs: makeStreamRomfs(), log,
+                    progress: (p) => progress(p, 'Computing contentId (1/2)', pass1Bytes),
+                    contentIdInPass1: appendOnly,
+                }));
+            }
             log('info', `[timing] Pass 1 (contentId): ${((performance.now() - t0) / 1000).toFixed(1)}s`);
             log('info', contentId
                 ? `ContentId: ${contentId} (${computedSize} bytes)`
@@ -811,8 +864,12 @@ export async function update(readers, output, options = {}) {
 
             return await writeTwoPassProgramAndFinish({
                 adapter, base, update, keys, log, progress, output,
-                programSize, meta, makeStreamExefs, makeStreamRomfs,
+                programSize: computedSize, meta, makeStreamExefs, makeStreamRomfs,
                 contentId, appendOnly,
+                ...(ownBktr ? {
+                    writeNca: writeOwnBktrProgramNca,
+                    ncaExtra: { makeUpdateSource: makeOwnUpdateSource, makeBaseSource: makeOwnBaseSource },
+                } : {}),
             });
         }
 
