@@ -22,7 +22,7 @@ import { yieldToEventLoop } from './event-loop.js';
 
 // Pad to 0x200 boundary. NOTE: no bitwise & (32-bit Int32 truncation in JS) —
 // romfs sizes > 4 GiB would be silently wrapped (LN2 BKTR merge, 5.25 GiB).
-function pad200(n) {
+export function pad200(n) {
     return Math.ceil(n / 0x200) * 0x200;
 }
 
@@ -33,12 +33,12 @@ function pad4000(n) {
 
 // ── NCA section constants (hacpack nca.h) ─────────────────────────────────────
 // fs_type / hash_type / crypt_type for the fs_headers[] entries.
-const FS_TYPE = { ROMFS: 0x00, PFS0: 0x01 };
-const HASH_TYPE = { PFS0: 0x02, ROMFS: 0x03 };
-const CRYPT = { NONE: 0x01, CTR: 0x03 };
+export const FS_TYPE = { ROMFS: 0x00, PFS0: 0x01 };
+export const HASH_TYPE = { PFS0: 0x02, ROMFS: 0x03 };
+export const CRYPT = { NONE: 0x01, CTR: 0x03 };
 
 // ── PFS0 constants (hacpack pfs0.h) ───────────────────────────────────────────
-const PFS0_EXEFS_HASH_BLOCK_SIZE = 0x10000;
+export const PFS0_EXEFS_HASH_BLOCK_SIZE = 0x10000;
 const PFS0_META_HASH_BLOCK_SIZE = 0x1000;
 
 // ── NCA keygen constants (hacpack settings) ───────────────────────────────────
@@ -373,7 +373,7 @@ function buildFsHeader(fsType, hashType, cryptType) {
     return fh;
 }
 
-function buildPfs0FsHeader(cryptType) { return buildFsHeader(FS_TYPE.PFS0, HASH_TYPE.PFS0, cryptType); }
+export function buildPfs0FsHeader(cryptType) { return buildFsHeader(FS_TYPE.PFS0, HASH_TYPE.PFS0, cryptType); }
 function buildRomfsFsHeader(cryptType) { return buildFsHeader(FS_TYPE.ROMFS, HASH_TYPE.ROMFS, cryptType); }
 
 // ── Shared NCA header helpers ────────────────────────────────────────────────
@@ -381,7 +381,7 @@ function buildRomfsFsHeader(cryptType) { return buildFsHeader(FS_TYPE.ROMFS, HAS
 // Fill PFS0 superblock fields in an ExeFS/RomFS FsHeader.
 // Offsets: FS_HDR.HASH_DATA=master_hash, 0x28=block_size, 0x2C=always_2,
 // 0x38=hash_table_size, FS_HDR.PFS0_OFFSET=pfs0_offset, FS_HDR.PFS0_SIZE=pfs0_size.
-function fillPfs0Superblock(fh, masterHash, { blockSize, hashTableSize, pfs0Offset, pfs0Size }) {
+export function fillPfs0Superblock(fh, masterHash, { blockSize, hashTableSize, pfs0Offset, pfs0Size }) {
     const ev = new DataView(fh.buffer);
     fh.set(masterHash, FS_HDR.HASH_DATA);
     ev.setUint32(0x28, blockSize, true);
@@ -392,13 +392,13 @@ function fillPfs0Superblock(fh, masterHash, { blockSize, hashTableSize, pfs0Offs
 }
 
 // Compute section hashes (sha256 of each 0x200-byte FsHeader) and place in NCA header.
-function fillSectionHashes(header) {
+export function fillSectionHashes(header) {
     header.set(digest32(header.subarray(NCA_HDR.FS_HEADERS, NCA_HDR.FS_HEADERS + NCA_HDR.FS_HEADER_SIZE)), NCA_HDR.SECTION_HASHES);
     header.set(digest32(header.subarray(NCA_HDR.FS_HEADERS + NCA_HDR.FS_HEADER_SIZE, NCA_HDR.FS_HEADERS + 2 * NCA_HDR.FS_HEADER_SIZE)), NCA_HDR.SECTION_HASHES + 0x20);
 }
 
 // XTS-encrypt the NCA header with header_key.
-function encryptNcaHeader(header, keys) {
+export function encryptNcaHeader(header, keys) {
     return new AesXts(toKeyBytes(keys.header_key)).encrypt(header);
 }
 
@@ -446,7 +446,7 @@ function encryptNcaHeader(header, keys) {
 // visible statement of the zero-sig decision. Other zero regions (padding,
 // rights_id, unused section hashes) rely on the fresh allocation.
 
-function buildNcaHeader(titleId, sections, keys, contentType = NCA_CONTENT_TYPE.PROGRAM) {
+export function buildNcaHeader(titleId, sections, keys, contentType = NCA_CONTENT_TYPE.PROGRAM, options = {}) {
     const header = new Uint8Array(NCA_HEADER_SIZE);
 
     // fixed_key_sig + npdm_key_sig = all zeros (The-4n/hacPack default)
@@ -484,9 +484,11 @@ function buildNcaHeader(titleId, sections, keys, contentType = NCA_CONTENT_TYPE.
     // writes slots 0/1 later; slots 2/3 remain zero (fresh buffer).
 
     // Key area: encrypted_keys[4][0x10]
-    // Default: [0, 0, KEYAREAKEY, 0]
+    // Default: [0, 0, KEYAREAKEY, 0]. With options.keyAreaSlot2 the caller
+    // replaces slot 2 with its own titlekey (own-BKTR: our output's titlekey so
+    // deriveTitlekeyFromKeyArea() extracts it back on read).
     const keyBlock = new Uint8Array(0x40);
-    keyBlock.set(KEYAREAKEY, 0x20); // slot 2 = keyareakey
+    keyBlock.set(options.keyAreaSlot2 || KEYAREAKEY, 0x20); // slot 2
 
     // ECB-encrypt entire key block with key_area_key_application_00
     const ecb = new AesEcb(toKeyBytes(keys.key_area_key_application_00));
