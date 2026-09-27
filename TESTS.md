@@ -124,6 +124,22 @@ Reference `Little Nightmares II` (5.02 GiB NCZ): ~684 MB/s best-of-3 on the Node
 
 ---
 
+### bench_own_bktr_phases.mjs (Node.js — Real-pipeline phase baseline)
+**Location:** `scripts/bench_own_bktr_phases.mjs`
+**Purpose:** Per-phase timing of the own-BKTR two-pass path (`fs/bktr-pack.js`) on the real Stardew NSZ, seekable-no-read (FSA-shaped) output. Uses the `setBktrPhaseHook` instrumentation hook added to `bktr-pack.js` (no-op unless set). **Mode-aware:** detects whether the seekable branch emits the Tier-1 single-pass layout (no Pass-1 sha phases — current, since #138) or the old two-walk layout, and prints a comparison against the committed #137 baseline. Unlike `test_twopass_fsa_sim.mjs` it does no byte-compare and uses a preallocated-doubling writable (the test's `FsaSim` regrows per write — O(n²) — inflating Pass 2: ~88–94 s vs ~10.2 s here). Output is an in-memory throwaway (never written to disk).
+**Measures (best-of-N, `node scripts/bench_own_bktr_phases.mjs [runs]`):**
+- Single-pass layout (current): Pass 1 phases `resolve`, `tables` (update decompress to the reloc/sub tail), `build` (exefs PFS0 hash + header/table AES) — no contentId hash walk; Pass 2 phases `hdr-write`, `walk-write-hash` (merged decrypt+AES+write+inline sha, write wall via `cpuMs`), `tl-write`; e2e.
+- Two-pass layout (pre-#138): Pass 1 adds `sha-head`, `walk-hash`, `sha-tail`; Pass 2 reports `walk-write`.
+
+**How to run:**
+```bash
+node scripts/bench_own_bktr_phases.mjs 3
+```
+
+Reference (Stardew, best-of-3, Tier-1 single-pass): e2e 13.6 s = Pass 1 3.4 s (resolve/tables/build only) + Pass 2 10.2 s (merged walk 10.1 s; write+sha wall 0.5 s ⇒ decompress+AES ≈ 9.6 s). Two-pass baseline (pre-#138): e2e 24.8 s = Pass 1 14.2 s + Pass 2 10.6 s → Tier 1 is −45% e2e.
+
+---
+
 ### bench_aes.mjs (Node.js — Benchmark)
 **Location:** `scripts/bench_aes.mjs`
 **Purpose:** AES-CTR throughput benchmark
