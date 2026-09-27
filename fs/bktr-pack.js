@@ -94,6 +94,17 @@ function findInterval(ivs, start) {
 }
 
 // ── Own layout ───────────────────────────────────────────────────────────────
+// ── Optional phase instrumentation (benchmarks) ───────────────────────────────
+// No-op unless setBktrPhaseHook() is called. Reports { name, bytes, ms, cpuMs }
+// when a phase ends; cpuMs carries a wall-time charge for the phase's inner hot
+// op (sha.update in pass 1, adapter.write in pass 2) so benchmark scripts can
+// attribute walk time to decompress+AES vs hash/write.
+let _phaseHook = null;
+export function setBktrPhaseHook(fn) { _phaseHook = fn; }
+function repPhase(name, bytes, t0, cpuMs = 0) {
+    if (_phaseHook) _phaseHook({ name, bytes, ms: performance.now() - t0, cpuMs });
+}
+
 export function buildOwnBktrLayout(exefsSize, dataRegionSize, nReloc, nSub) {
     const exeHtableSize = pad200(Math.ceil(exefsSize / PFS0_EXEFS_HASH_BLOCK_SIZE) * 0x20);
     const exeSectionSize = pad200(exeHtableSize + exefsSize);
@@ -276,6 +287,165 @@ async function walkDataRegion({ L, meta, makeUpdateSource, makeBaseSource, onChu
 // ── Pass 1: compute layout + contentId ───────────────────────────────────────
 // streamExefs must be re-callable (a fresh factory result, one ExeFS extract
 // stream per call): once for the PFS0 hash table, once for the contentId hash.
+// ── Pass 1 (seekable variant): resolve layout + header, NO data walk ─────────
+// The seekable (FSA/memory) two-pass branch has no Pass-1 hash walk: the NCA is
+// written FIRST and the 272-B PFS0 header only overwrites offset 0 at the very
+// end (writeTwoPassProgramAndFinish), so the contentId is needed only AFTER the
+// NCA bytes exist. The combined write pass (writeOwnBktrProgramNcaSinglePass)
+// hashes the bytes as it writes them; this function only builds the
+// layout/header/tables (tables pass + exefs PFS0 hash + encHeader + relocEnc/
+// subEnc). The data walk — and with it the second update+base decompression +
+// AES pass — is gone: update reads 3×→2×, base 2×→1× on this branch.
+// NOTE: this is the layout-only half of computeOwnBktrContentId below (same
+// tables/build work, no sha stream, no walkDataRegion). Keep them in sync.
+export async function resolveOwnBktrLayout({
+    baseNcaData, updateNcaData,
+    makeUpdateSource, makeBaseSource,
+    keys, baseTik, updateTik, baseTitlekey, updateTitlekey,
+    titleId, exefsSize, romfsDataSize,
+    streamExefs,
+    log, progress,
+}) {
+    const _log = typeof log === 'function' ? log : () => {};
+    const _prog = typeof progress === 'function' ? progress : () => {};
+
+    _log('info', '  Single-pass own-BKTR (seekable): resolving own NCA layout (tables + header), contentId computed during the write...');
+    let ph0 = performance.now();
+
+    // Preamble: resolve BKTR parameters from the REAL update (titlekeys, table
+    // absolute offsets) and grab its section-1 FsHeader for the superblock copy.
+    const metaB = await resolveBktrMeta(baseNcaData, updateNcaData, { keys, baseTik, updateTik, baseTitlekey, updateTitlekey });
+    _log('info', `  BKTR: romfsSec offset=0x${metaB.updateRomfsSec.offset.toString(16)}, reloc@0x${metaB.relocAbsOffset.toString(16)}+0x${metaB.relocHeader.size.toString(16)}, sub@0x${metaB.subAbsOffset.toString(16)}+0x${metaB.subHeader.size.toString(16)}`);
+
+    const updateHeader = decryptNcaHeader(updateNcaData.headerRaw, keys);
+    const updIdx = updateHeader.sections.findIndex(s => s.fsType === SECTION_FS_TYPE.ROMFS && s.cryptoType === SECTION_CRYPTO_TYPE.BKTR);
+    if (updIdx < 0) throw new Error('own-BKTR: update has no BKTR romfs section');
+    const updateDecHeader = decryptNcaHeaderBytes(updateNcaData.headerRaw, keys);
+    const updateFsHdr = fsHeaderAt(updateDecHeader, updIdx);
+    repPhase('resolve', 0, ph0);
+    ph0 = performance.now();
+
+    // Parse the real tables. Reaching them means a sequential NCZ pass over the
+    // whole prefix up to the last table (reloc/sub sit deep in the file) — that
+    // prefix decompression was previously invisible to the progress bar. Fold it
+    // in as its own phase: the table source reports the far-most decompressed
+    // absolute offset through the new onProgress hook.
+    const tableRanges = [
+        { off: metaB.relocAbsOffset, len: metaB.relocHeader.size },
+        { off: metaB.subAbsOffset, len: metaB.subHeader.size },
+    ].sort((a, b) => a.off - b.off);
+    const tableReadEnd = tableRanges[tableRanges.length - 1].off + tableRanges[tableRanges.length - 1].len;
+    // Pass 1 here does the table prefix + ONE exefs pass (the PFS0 hash table
+    // → exeHash → encHeader); there is no data walk — the write pass owns it.
+    const pass1Estimate = tableReadEnd + exefsSize + (romfsDataSize || 0);
+    const tableSource = makeUpdateSource(tableRanges, (reached) => {
+        _prog(Math.min(1, reached / pass1Estimate), 'Reading BKTR tables...');
+    });
+    const { relocBlock, subBlock } = await readBktrTables(tableSource, metaB);
+    repPhase('tables', tableReadEnd, ph0);
+    ph0 = performance.now();
+
+    // Entry run lengths in VIRTUAL order.
+    const entries = [];
+    for (let i = 0; i < relocBlock.entries.length; i++) {
+        const e = relocBlock.entries[i];
+        const nextVirt = i + 1 < relocBlock.entries.length ? relocBlock.entries[i + 1].virtOffset : relocBlock.totalSize;
+        const len = nextVirt - e.virtOffset;
+        if (len <= 0) throw new Error(`own-BKTR: zero-length relocation run at virt=0x${e.virtOffset.toString(16)}`);
+        if (len % 16 !== 0) throw new Error(`own-BKTR: non-16-aligned run len 0x${len.toString(16)} — cannot build own layout`);
+        entries.push({ virtOffset: e.virtOffset, physOffset: e.physOffset, isPatch: !!e.isPatch, len });
+    }
+    const totalVirtSize = relocBlock.totalSize;
+
+    // Physical runs in the SOURCE data regions → union intervals (asc), placed
+    // physically: patch first, then base copies.
+    const patchRuns = [], baseRuns = [];
+    for (const e of entries) (e.isPatch ? patchRuns : baseRuns).push({ start: e.physOffset, end: e.physOffset + e.len });
+    const patchIntervals = unionIntervals(patchRuns);
+    const baseIntervals = unionIntervals(baseRuns);
+    if (patchIntervals.length === 0 && baseIntervals.length === 0) {
+        throw new Error('own-BKTR: no patch or base runs to pack');
+    }
+    let cursor = 0;
+    for (const iv of patchIntervals) {
+        if (iv.len % 16 !== 0) throw new Error(`own-BKTR: non-16-aligned patch interval len 0x${iv.len.toString(16)}`);
+        iv.place = cursor;
+        cursor += ceil16(iv.len);
+    }
+    for (const iv of baseIntervals) {
+        if (iv.len % 16 !== 0) throw new Error(`own-BKTR: non-16-aligned base interval len 0x${iv.len.toString(16)}`);
+        iv.place = cursor;
+        cursor += ceil16(iv.len);
+    }
+    const dataRegionSize = cursor;
+    _log('info', `  own-BKTR: reloc=${entries.length} entries (patch=${patchRuns.length}, base=${baseRuns.length}), patch intervals=${patchIntervals.length}, base intervals=${baseIntervals.length}, data region=0x${dataRegionSize.toString(16)}`);
+
+    // Map every run into our data region; every outgoing entry stays isPatch=1.
+    const ownEntries = entries.map((e) => {
+        const ivs = e.isPatch ? patchIntervals : baseIntervals;
+        const iv = findInterval(ivs, e.physOffset);
+        if (!iv || e.physOffset + e.len > iv.end) {
+            throw new Error(`own-BKTR: run (${e.isPatch ? 'patch' : 'base'} phys=0x${e.physOffset.toString(16)} len=0x${e.len.toString(16)}) not covered by its union intervals`);
+        }
+        return { virtOffset: e.virtOffset, physOffset: iv.place + (e.physOffset - iv.start), isPatch: true };
+    });
+
+    const nReloc = ownEntries.length;
+    const nSub = 2;
+    const L = buildOwnBktrLayout(exefsSize, dataRegionSize, nReloc, nSub);
+    _log('info', `  own-BKTR layout: exeSection=0x${L.exeSectionSize.toString(16)}, sec1Start=0x${L.sec1Start.toString(16)}, reloc@0x${L.relocOff.toString(16)}+0x${L.relocBlockSize.toString(16)}, sub@0x${L.subOff.toString(16)}+0x${L.subBlockSize.toString(16)}, ncaSize=0x${L.ncaSize.toString(16)}`);
+
+    // Plaintext tables.
+    const relocPlain = buildRelocationBlock(ownEntries, totalVirtSize);
+    const subEntries = [
+        { offset: 0, ctrVal: 0 },
+        { offset: dataRegionSize, ctrVal: 1 }, // sentinel (boundary marker)
+    ];
+    const subPlain = buildSubsectionBlock(subEntries, dataRegionSize);
+
+    // ExeFS PFS0 hash table (feeds exeHash → encHeader).
+    let done = 0;
+    // Exact denominator: table prefix + the single exefs pass. The table-phase
+    // fraction (≈ tableReadEnd/pass1Estimate) is already booked on the bar; the
+    // exefs pass continues from there and lands exactly on 1.0.
+    const pass1Total = tableReadEnd + exefsSize;
+    const rep = (n) => {
+        done += n;
+        _prog(Math.min(1, (tableReadEnd + done) / pass1Total), 'Resolving layout (1/2)');
+    };
+    const pfs0 = new StreamingPfs0Hasher(PFS0_EXEFS_HASH_BLOCK_SIZE);
+    await streamExefs(async (chunk) => { pfs0.update(chunk, true); rep(chunk.length); });
+    const exeHash = await pfs0.finalize();
+
+    // Header + encrypted tables.
+    const ownFsHdr = buildOwnBktrFsHeader({
+        updateFsHdr, relocOff: L.relocOff, relocSize: L.relocBlockSize,
+        subOff: L.subOff, subSize: L.subBlockSize, nReloc, nSub,
+    });
+    const encHeader = buildOwnBktrNcaHeader({ titleId, keys, ourTitlekey: metaB.updateTitlekey, L, exeHash, ownFsHdr });
+    const ownTableNonce = reversedSectionCtr(ownFsHdr); // [00 00 00 02 00 00 00 01]
+    const relocEnc = await decryptBktrTableData(relocPlain, metaB.updateTitlekey, ownTableNonce, L.sec1Start + L.relocOff);
+    const subEnc = await decryptBktrTableData(subPlain, metaB.updateTitlekey, ownTableNonce, L.sec1Start + L.subOff);
+    repPhase('build', exefsSize, ph0);
+    ph0 = performance.now();
+
+    // Meta handed to the single write+hash pass (sources re-created fresh).
+    const meta = {
+        L, encHeader, exeHash, ourTitlekey: metaB.updateTitlekey,
+        patchIntervals, baseIntervals,
+        patchAbsRanges: patchIntervals.map((iv) => ({ off: metaB.updateRomfsSec.offset + iv.start, len: iv.len })),
+        baseAbsRanges: baseIntervals.map((iv) => ({ start: metaB.baseRomfsSecMeta.offset + iv.start, len: iv.len })),
+        updateRomfsSecOffset: metaB.updateRomfsSec.offset,
+        baseRomfsSecMeta: metaB.baseRomfsSecMeta,
+        updateSubBlock: subBlock,
+        updateTitlekey: metaB.updateTitlekey, secureValue: metaB.secureValue,
+        baseTitlekey: metaB.baseTitlekey, baseNonce: metaB.baseNonce,
+        relocEnc, subEnc,
+    };
+
+    return { size: L.ncaSize, meta };
+}
+
 export async function computeOwnBktrContentId({
     baseNcaData, updateNcaData,
     makeUpdateSource, makeBaseSource,
@@ -289,6 +459,7 @@ export async function computeOwnBktrContentId({
 
     _log('info', '  Two-pass own-BKTR: computing own NCA layout + contentId (Pass 1)...');
     const t0 = performance.now();
+    let ph0 = performance.now();
 
     // Preamble: resolve BKTR parameters from the REAL update (titlekeys, table
     // absolute offsets) and grab its section-1 FsHeader for the superblock copy.
@@ -300,6 +471,8 @@ export async function computeOwnBktrContentId({
     if (updIdx < 0) throw new Error('own-BKTR: update has no BKTR romfs section');
     const updateDecHeader = decryptNcaHeaderBytes(updateNcaData.headerRaw, keys);
     const updateFsHdr = fsHeaderAt(updateDecHeader, updIdx);
+    repPhase('resolve', 0, ph0);
+    ph0 = performance.now();
 
     // Parse the real tables. Reaching them means a sequential NCZ pass over the
     // whole prefix up to the last table (reloc/sub sit deep in the file) — that
@@ -319,6 +492,8 @@ export async function computeOwnBktrContentId({
         _prog(Math.min(1, reached / pass1Estimate), 'Reading BKTR tables...');
     });
     const { relocBlock, subBlock } = await readBktrTables(tableSource, metaB);
+    repPhase('tables', tableReadEnd, ph0);
+    ph0 = performance.now();
 
     // Entry run lengths in VIRTUAL order.
     const entries = [];
@@ -401,6 +576,8 @@ export async function computeOwnBktrContentId({
     const ownTableNonce = reversedSectionCtr(ownFsHdr); // [00 00 00 02 00 00 00 01]
     const relocEnc = await decryptBktrTableData(relocPlain, metaB.updateTitlekey, ownTableNonce, L.sec1Start + L.relocOff);
     const subEnc = await decryptBktrTableData(subPlain, metaB.updateTitlekey, ownTableNonce, L.sec1Start + L.subOff);
+    repPhase('build', exefsSize, ph0);
+    ph0 = performance.now();
 
     // Meta handed to Pass 2 (sources re-created fresh per pass).
     const meta = {
@@ -420,13 +597,20 @@ export async function computeOwnBktrContentId({
     const sha = createStreamingSHA256();
     sha.update(encHeader);
     sha.update(exeHash.hashTable);
-    await streamExefs(async (chunk) => { sha.update(chunk); rep(chunk.length); });
+    let shaMs = 0;
+    await streamExefs(async (chunk) => { const st = performance.now(); sha.update(chunk); shaMs += performance.now() - st; rep(chunk.length); });
     if (L.exePaddingSize > 0) sha.update(new Uint8Array(L.exePaddingSize));
-    await walkDataRegion({ L, meta, makeUpdateSource, makeBaseSource, onChunk: async (cp) => { sha.update(cp); rep(cp.length); } });
+    repPhase('sha-head', exefsSize, ph0, shaMs);
+    shaMs = 0;
+    ph0 = performance.now();
+    await walkDataRegion({ L, meta, makeUpdateSource, makeBaseSource, onChunk: async (cp) => { const st = performance.now(); sha.update(cp); shaMs += performance.now() - st; rep(cp.length); } });
+    repPhase('walk-hash', dataRegionSize, ph0, shaMs);
+    ph0 = performance.now();
     sha.update(relocEnc);
     sha.update(subEnc);
     if (L.romPaddingSize > 0) sha.update(new Uint8Array(L.romPaddingSize));
     const contentId = sha.hex();
+    repPhase('sha-tail', 0, ph0);
 
     _log('info', `  Two-pass own-BKTR contentId (Pass 1): ${contentId} (${L.ncaSize} bytes NCA)`);
     return { size: L.ncaSize, contentId, meta };
@@ -452,6 +636,7 @@ export async function writeOwnBktrProgramNca({ meta, adapter, ncaOffset, content
     };
 
     _log('info', '  Pass 2: writing own-BKTR NCA sequentially...');
+    let ph0 = performance.now();
     await w(ncaOffset, encHeader);
     await w(ncaOffset + L.sec0Start, exeHash.hashTable);
     await streamExefs(async (chunk, off) => {
@@ -460,14 +645,87 @@ export async function writeOwnBktrProgramNca({ meta, adapter, ncaOffset, content
     if (L.exePaddingSize > 0) {
         await w(ncaOffset + L.sec0DataOff + L.exefsSize, new Uint8Array(L.exePaddingSize));
     }
+    repPhase('hdr-write', L.sec0Start + L.sec0End - L.sec0DataOff, ph0);
+    ph0 = performance.now();
+    let writeMs = 0;
     await walkDataRegion({ L, meta, makeUpdateSource, makeBaseSource, onChunk: async (cp, placed) => {
+        const wt = performance.now();
         await w(ncaOffset + L.sec1Start + placed, cp);
+        writeMs += performance.now() - wt;
     } });
+    repPhase('walk-write', L.relocOff, ph0, writeMs);
+    ph0 = performance.now();
     await w(ncaOffset + L.sec1Start + L.relocOff, relocEnc);
     await w(ncaOffset + L.sec1Start + L.subOff, subEnc);
     if (L.romPaddingSize > 0) {
         await w(ncaOffset + L.sec1Start + L.subOff + L.subBlockSize, new Uint8Array(L.romPaddingSize));
     }
+    repPhase('tl-write', L.relocBlockSize + L.subBlockSize, ph0);
     if (_prog) _prog(1);
     return contentId;
+}
+
+// ── Single-pass (seekable): write + hash inline ──────────────────────────────
+// For seekable (FSA/memory) outputs the NCA is written FIRST (the contentId is
+// only needed for the trailing 272-B PFS0 header that overwrites offset 0), so
+// the Pass-1 hash walk and the Pass-2 write walk merge into ONE walk: every
+// chunk is decrypt→AES-re-encrypt→sha.update→adapter.write in NCA file order.
+// The returned id IS sha256 of the written bytes — byte-identical to the old
+// Pass-1 contentId, because the walk's ciphertext is deterministic (same union
+// intervals, same AesCtr key/nonce and seek(sec1Start)). This removes the
+// second full update+base decompression + AES pass (update reads 3×→2×, base
+// 2×→1× on the seekable branch); SW/appendOnly keeps the two-pass writers.
+export async function writeOwnBktrProgramNcaSinglePass({ meta, adapter, ncaOffset, contentId, streamExefs, makeUpdateSource, makeBaseSource, log, progress }) {
+    const _log = typeof log === 'function' ? log : () => {};
+    const _prog = typeof progress === 'function' ? progress : () => {};
+    const { L, encHeader, exeHash, relocEnc, subEnc } = meta;
+
+    let expected = ncaOffset;
+    let done = 0;
+    const sha = createStreamingSHA256();
+    const w = async (pos, data) => {
+        if (pos !== expected) {
+            throw new Error(`writeOwnBktrProgramNcaSinglePass: non-sequential write at 0x${pos.toString(16)} (expected 0x${expected.toString(16)})`);
+        }
+        const n = data.byteLength;
+        expected += n;
+        done += n;
+        if (_prog) _prog(Math.min(1, done / L.ncaSize));
+        sha.update(data);
+        return await adapter.write(pos, data);
+    };
+
+    _log('info', '  Single-pass: writing own-BKTR NCA + hashing inline...');
+    let ph0 = performance.now();
+    await w(ncaOffset, encHeader);
+    await w(ncaOffset + L.sec0Start, exeHash.hashTable);
+    let writeMs = 0;
+    await streamExefs(async (chunk, off) => {
+        const wt = performance.now();
+        await w(ncaOffset + L.sec0DataOff + off, chunk);
+        writeMs += performance.now() - wt;
+    });
+    if (L.exePaddingSize > 0) {
+        await w(ncaOffset + L.sec0DataOff + L.exefsSize, new Uint8Array(L.exePaddingSize));
+    }
+    repPhase('hdr-write', L.sec0Start + L.sec0End - L.sec0DataOff, ph0, writeMs);
+    ph0 = performance.now();
+    let walkMs = 0;
+    await walkDataRegion({ L, meta, makeUpdateSource, makeBaseSource, onChunk: async (cp, placed) => {
+        const wt = performance.now();
+        await w(ncaOffset + L.sec1Start + placed, cp);
+        walkMs += performance.now() - wt;
+    } });
+    repPhase('walk-write-hash', L.relocOff, ph0, walkMs);
+    ph0 = performance.now();
+    await w(ncaOffset + L.sec1Start + L.relocOff, relocEnc);
+    await w(ncaOffset + L.sec1Start + L.subOff, subEnc);
+    if (L.romPaddingSize > 0) {
+        await w(ncaOffset + L.sec1Start + L.subOff + L.subBlockSize, new Uint8Array(L.romPaddingSize));
+    }
+    repPhase('tl-write', L.relocBlockSize + L.subBlockSize, ph0);
+    if (_prog) _prog(1);
+    const id = sha.hex();
+    _log('info', `  Single-pass own-BKTR contentId (sha of written bytes): ${id}`);
+    return id;
 }
