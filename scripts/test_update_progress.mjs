@@ -2,9 +2,9 @@
 // Progress protocol test for the update pipeline (real Stardew base + update NSZ):
 // each path reports per-phase fractions (p in [0,1], stable phase label, phase byte
 // total), monotonic within a phase, each phase ends at exactly 1.0 — so the bar can
-// never regress across phases. Phases: two-pass (own-BKTR) = 'Reading BKTR tables...'
+// never regress across phases. Phases: two-pass (own-BKTR) = 'Reading BKTR tables... (1/3)'
 // (own denominator: the prefix decompression to the tables) + 'Computing contentId
-// (1/2)' (2×exefs + data region) + 'Writing output (2/2)',
+// (2/3)' (2×exefs + data region) + 'Writing output (3/3)',
 // streaming = 'Reading update sections...' + 'Writing output (1/1)', buffered =
 // 'Computing contentId (1/2)' + 'Writing output (2/2)'). The NCZ streaming flow first
 // decompresses the update's sections in a prep pass — reported as a labeled phase
@@ -88,7 +88,7 @@ function checkProtocol(name, events, expectedLabels, buf) {
     assert(evs.every(e => typeof e.phaseBytes === 'number' && e.phaseBytes > 0), `${s.label}: phaseBytes reported`);
     assert(new Set(evs.map(e => e.phaseBytes)).size === 1, `${s.label}: phaseBytes constant within phase`);
     const bytes = evs[0].phaseBytes;
-    if (s.label === 'Writing output (2/2)') {
+    if (s.label === 'Writing output (2/2)' || s.label === 'Writing output (3/3)') {
       assert(bytes === program.size + tailExpected, `${s.label}: phaseBytes (${bytes}) == Program NCA (${program.size}) + tail (${tailExpected})`);
     } else if (s.label === 'Writing output (1/1)') {
       // streaming phase = exefs + romfs writes + full-NCA re-read + tail
@@ -138,7 +138,7 @@ const sha = (b) => crypto.createHash('sha256').update(b).digest('hex');
   // (update.js:621 streams ExeFS one-shot instead of extractNcaSections); its
   // Pass 1 opens with the tables phase — own denominator (tableReadEnd), ends
   // at exactly 1.0 — then the compute phase starts at 0 on its own scale.
-  checkProtocol('two-pass (sw-sim, appendOnly)', events, ['Reading BKTR tables...', 'Computing contentId (1/2)', 'Writing output (2/2)'], buf);
+  checkProtocol('two-pass (sw-sim, appendOnly)', events, ['Reading BKTR tables... (1/3)', 'Computing contentId (2/3)', 'Writing output (3/3)'], buf);
 
   console.log(`\nstreaming sha256=${globalThis.__refSha} (${globalThis.__refLen})`);
   console.log(`two-pass  sha256=${sha(buf)} (${buf.length})`);

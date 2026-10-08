@@ -388,14 +388,17 @@ async function finalizeNspTail(adapter, { pw, pfs0Header, otherNcas, totalData, 
 //   seekable (FSA / memory): the NCA is written first (the adapter zero-fills
 //     [0..programNcaPfs0Offset)), then the real header overwrites offset 0.
 //     contentId piggybacks on the Pass 2 write. 2× romfs reads.
-async function writeTwoPassProgramAndFinish({ adapter, base, update, keys, log, progress, output, programSize, meta, makeStreamExefs, makeStreamRomfs, contentId, appendOnly, writeNca = writeProgramNcaTwoPass, ncaExtra = {} }) {
+async function writeTwoPassProgramAndFinish({ adapter, base, update, keys, log, progress, output, programSize, meta, makeStreamExefs, makeStreamRomfs, contentId, appendOnly, writeNca = writeProgramNcaTwoPass, ncaExtra = {}, writeLabel = 'Writing output (2/2)' }) {
     const otherNcas = collectOtherNcas(update);
     // Pass 2 is the write phase: Program NCA + other NCAs are one continuous
     // bar (the NCA is scaled into [0, programSize/phaseTotal], the tail picks
-    // up at programSize/phaseTotal and runs to 1).
+    // up at programSize/phaseTotal and runs to 1). writeLabel is the STAGE
+    // number of this run: own-BKTR runs are 3 stages (tables → compute →
+    // write), so the caller passes (3/3); the non-own two-pass is 2 stages
+    // (compute → write) and keeps the (2/2) default.
     const tailBytes = otherNcas.reduce((s, m) => s + m.outLen, 0);
     const phaseTotal = programSize + tailBytes;
-    const pass2Progress = (p) => progress(p * programSize / phaseTotal, 'Writing output (2/2)', phaseTotal);
+    const pass2Progress = (p) => progress(p * programSize / phaseTotal, writeLabel, phaseTotal);
 
     // Header and NCA write differ only in order. appendOnly: contentId is final
     // after Pass 1 → real PFS0 header first, then the NCA (and the header's
@@ -425,7 +428,7 @@ async function writeTwoPassProgramAndFinish({ adapter, base, update, keys, log, 
         ({ pw, pfs0Header, totalData, rebuilt } = await writeFinalPfs0Header({ adapter, contentId: id, programSize, otherNcas, base, update, keys, log }));
         log('info', `[timing] CNMT + PFS0 header: ${((performance.now() - t0) / 1000).toFixed(1)}s`);
     }
-    return finalizeNspTail(adapter, { pw, pfs0Header, otherNcas, totalData, rebuilt, output, log, progress, phaseLabel: 'Writing output (2/2)', phaseBaseDone: programSize, phaseTotal });
+    return finalizeNspTail(adapter, { pw, pfs0Header, otherNcas, totalData, rebuilt, output, log, progress, phaseLabel: writeLabel, phaseBaseDone: programSize, phaseTotal });
 }
 
 // Factory for a streaming ExeFS extractor with NPDM ACID filtering applied.
@@ -858,7 +861,7 @@ export async function update(readers, output, options = {}) {
                         keys, baseTik: baseTikData, updateTik: updateTikData,
                         titleId: base.cnmt.titleId, exefsSize, romfsDataSize,
                         streamExefs: makeStreamExefs(), log,
-                        progress: (p, label, bytes) => progress(p, label || 'Resolving layout (1/2)', bytes || pass1Bytes),
+                        progress: (p, label, bytes) => progress(p, label || 'Resolving layout (2/3)', bytes || pass1Bytes),
                     }));
                 } else {
                     log('info', 'Two-pass own-BKTR: self-contained Program NCA (own reloc/sub tables, data region = merged RomFS)...');
@@ -869,7 +872,7 @@ export async function update(readers, output, options = {}) {
                         keys, baseTik: baseTikData, updateTik: updateTikData,
                         titleId: base.cnmt.titleId, exefsSize, romfsDataSize,
                         streamExefs: makeStreamExefs(), log,
-                        progress: (p, label, bytes) => progress(p, label || 'Computing contentId (1/2)', bytes || pass1Bytes),
+                        progress: (p, label, bytes) => progress(p, label || 'Computing contentId (2/3)', bytes || pass1Bytes),
                     }));
                 }
             } else {
@@ -895,6 +898,9 @@ export async function update(readers, output, options = {}) {
                 adapter, base, update, keys, log, progress, output,
                 programSize: computedSize, meta, makeStreamExefs, makeStreamRomfs,
                 contentId, appendOnly,
+                // Stage numbering: own-BKTR = 3 stages (tables/compute/resolve →
+                // write), non-own two-pass = 2 stages (compute → write).
+                writeLabel: ownBktr ? 'Writing output (3/3)' : 'Writing output (2/2)',
                 ...(ownBktr ? {
                     writeNca: appendOnly ? writeOwnBktrProgramNca : writeOwnBktrProgramNcaSinglePass,
                     ncaExtra: { makeUpdateSource: makeOwnUpdateSource, makeBaseSource: makeOwnBaseSource },

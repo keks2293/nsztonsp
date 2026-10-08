@@ -372,17 +372,18 @@ export async function resolveOwnBktrLayout({
     const tableReadEnd = tableRanges[tableRanges.length - 1].off + tableRanges[tableRanges.length - 1].len;
     // Pass 1 here does the table prefix + ONE exefs pass (the PFS0 hash table
     // → exeHash → encHeader); there is no data walk — the write pass owns it.
-    // Phase protocol (#71): 'Reading BKTR tables...' is its OWN phase with its
-    // own denominator — the sequential prefix decompression to the tables
-    // (tableReadEnd bytes) fills the bar 0→1, then the next phase starts at 0.
+    // Phase protocol (#71): 'Reading BKTR tables... (1/3)' is stage 1 of the 3-stage
+    // own-BKTR run (tables → resolve → write) with its OWN denominator — the
+    // sequential prefix decompression to the tables (tableReadEnd bytes) fills
+    // the bar 0→1, then the next stage starts at 0.
     let tablesDone = false;
     const tableSource = makeUpdateSource(tableRanges, (reached) => {
         if (tablesDone) return; // late pump event — phase already ended at 1.0
-        _prog(Math.min(1, reached / tableReadEnd), 'Reading BKTR tables...', tableReadEnd);
+        _prog(Math.min(1, reached / tableReadEnd), 'Reading BKTR tables... (1/3)', tableReadEnd);
     });
     const { relocBlock, subBlock } = await readBktrTables(tableSource, metaB);
     tablesDone = true;
-    _prog(1, 'Reading BKTR tables...', tableReadEnd); // phase ends at exactly 1.0
+    _prog(1, 'Reading BKTR tables... (1/3)', tableReadEnd); // phase ends at exactly 1.0
     repPhase('tables', tableReadEnd, ph0);
     ph0 = performance.now();
 
@@ -451,7 +452,7 @@ export async function resolveOwnBktrLayout({
     // and lands exactly on 1.0.
     const rep = (n) => {
         done += n;
-        _prog(Math.min(1, done / exefsSize), 'Resolving layout (1/2)', exefsSize);
+        _prog(Math.min(1, done / exefsSize), 'Resolving layout (2/3)', exefsSize);
     };
     const pfs0 = new StreamingPfs0Hasher(PFS0_EXEFS_HASH_BLOCK_SIZE);
     await streamExefs(async (chunk) => { pfs0.update(chunk, true); rep(chunk.length); });
@@ -524,19 +525,20 @@ export async function computeOwnBktrContentId({
         { off: metaB.subAbsOffset, len: metaB.subHeader.size },
     ].sort((a, b) => a.off - b.off);
     const tableReadEnd = tableRanges[tableRanges.length - 1].off + tableRanges[tableRanges.length - 1].len;
-    // Phase protocol (#71): 'Reading BKTR tables...' is its OWN phase with its
-    // own denominator — the sequential prefix decompression to the tables
-    // (tableReadEnd bytes, the zstd/AES pass that physically must decode the
-    // whole RomFS prefix to reach the tables at its tail) fills the bar 0→1;
-    // the compute phase that follows starts fresh at 0 with its own scale.
+    // Phase protocol (#71): 'Reading BKTR tables... (1/3)' is stage 1 of the 3-stage
+    // own-BKTR run (tables → compute → write) with its own denominator — the
+    // sequential prefix decompression to the tables (tableReadEnd bytes, the
+    // zstd/AES pass that physically must decode the whole RomFS prefix to reach
+    // the tables at its tail) fills the bar 0→1; the compute stage (2/3) that
+    // follows starts fresh at 0 with its own scale.
     let tablesDone = false;
     const tableSource = makeUpdateSource(tableRanges, (reached) => {
         if (tablesDone) return; // late pump event — phase already ended at 1.0
-        _prog(Math.min(1, reached / tableReadEnd), 'Reading BKTR tables...', tableReadEnd);
+        _prog(Math.min(1, reached / tableReadEnd), 'Reading BKTR tables... (1/3)', tableReadEnd);
     });
     const { relocBlock, subBlock } = await readBktrTables(tableSource, metaB);
     tablesDone = true;
-    _prog(1, 'Reading BKTR tables...', tableReadEnd); // phase ends at exactly 1.0
+    _prog(1, 'Reading BKTR tables... (1/3)', tableReadEnd); // phase ends at exactly 1.0
     repPhase('tables', tableReadEnd, ph0);
     ph0 = performance.now();
 
@@ -606,7 +608,7 @@ export async function computeOwnBktrContentId({
     const computeTotal = 2 * exefsSize + dataRegionSize;
     const rep = (n) => {
         done += n;
-        _prog(Math.min(1, done / computeTotal), 'Computing contentId (1/2)', computeTotal);
+        _prog(Math.min(1, done / computeTotal), 'Computing contentId (2/3)', computeTotal);
     };
     const pfs0 = new StreamingPfs0Hasher(PFS0_EXEFS_HASH_BLOCK_SIZE);
     await streamExefs(async (chunk) => { pfs0.update(chunk, true); rep(chunk.length); });
