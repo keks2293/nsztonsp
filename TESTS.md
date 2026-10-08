@@ -289,6 +289,7 @@ Test data: `/Users/rmitkov/Downloads/Stardew Valley [NSZ]/` (base `.nsz` v0 + up
 | `scripts/test_own_bktr_pack.mjs` | **own-BKTR packer** on Stardew NSZ: direct packer (Pass-1 contentId == sha256(Pass-2 NCA), FsHeader/table/section structure, `mergeRomFS(base, own-NCA)` byte-identical to the real update's scatter merge — 606,401,864 B) + full `update()` SW run (no gaps, produced NCA merges byte-identical, determinism across passes). All in RAM, no disk | `scripts/` — `node test_own_bktr_pack.mjs` |
 | `scripts/test_own_bktr_pack_ln2.mjs` | **own-BKTR structural** on the >2 GiB crash case (LN2): reloc/sub tables, bucket count, `totalSize` + virtual window preserved, all `isPatch=1`, phys offsets inside the data region & 16-aligned, sub = single `{0,0}` subsection, emit window covered; counting adapter proves no section-sized buffer is ever allocated | `scripts/` — `node test_own_bktr_pack_ln2.mjs` |
 | `scripts/test_sw_chunk.mjs` | `sw-downloader.js` unit test (FakeSW with ack mocking): byte-for-byte stream equality for the 14-write buffered sequence (scaled), wasm-subarray safety (no detached transfer), small-write zero-copy, gap-fill correctness | `scripts/` — `node test_sw_chunk.mjs` |
+| `scripts/test_truncated_container.mjs` | truncated-container diagnostics (synthetic PFS0, self-contained): valid PFS0 still opens; an entry past EOF is rejected by `openContainer` with the file/member/sizes in the message (the real 40 %-downloaded LOLLIPOP base `.nsz` case, which used to surface as `bad magic ''`); readers without a usable `length` skip the check; `decryptNcaHeader` reports empty/0x400 reads as short instead of a magic error, while full-size garbage keeps `bad magic` | repo root — `node scripts/test_truncated_container.mjs` |
 | `scripts/test_update_progress.mjs` | update **progress protocol** (real pair, in-memory, no disk): per-phase fraction (0–1), stable phase labels in order (two-pass: `Computing contentId (1/2)` → `Writing output (2/2)`; streaming: single `Writing output (1/1)`), writes continuous across program+tail (monotonic within the write phase), each phase ends at exactly 1.0, write-phase `phaseBytes` == Program NCA + tail (two-pass) / > Program NCA + tail (streaming, contentId re-read), streaming ≡ two-pass sha | `scripts/` — `node test_update_progress.mjs` |
 | `scripts/verify_ln2_update_nsz.mjs` | **LN2 two-pass update on the `.nsz` (NCZ) base** — the path the `.nsp` harness (`verify_ln2_update.mjs`) can't reach, because a `FileRangeSource` base's `registerRange()` is a no-op and never exercises the NCZ base-range registration. LN2's base `physOffset`s are a non-monotonic, overlapping permutation in reloc order (see `diag_ln2_reloc.mjs`), which used to throw `NczStreamSource: ranges must be strictly increasing`. Hash-only append-only writer; checks the Program-NCA contentId (`067f1c50…`) + declared size (5,326,224,720) against the known-good values. Needs the real LN2 `.nsz` pair (`/Users/rmitkov/Downloads/Little Nightmares 2 [NSZ]/`); ~110 s, ~5 GB RAM | `scripts/` — `node verify_ln2_update_nsz.mjs` |
 
@@ -370,6 +371,9 @@ node test_aes_manual.cjs
 
 # NCZ component tests (skips file-dependent tests)
 node scripts/test-ncz.mjs
+
+# Truncated-container diagnostics (synthetic PFS0 + short NCA-header reads)
+node scripts/test_truncated_container.mjs
 ```
 
 ### Require NSZ file input:
