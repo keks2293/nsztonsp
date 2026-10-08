@@ -372,11 +372,17 @@ export async function resolveOwnBktrLayout({
     const tableReadEnd = tableRanges[tableRanges.length - 1].off + tableRanges[tableRanges.length - 1].len;
     // Pass 1 here does the table prefix + ONE exefs pass (the PFS0 hash table
     // → exeHash → encHeader); there is no data walk — the write pass owns it.
-    const pass1Estimate = tableReadEnd + exefsSize + (romfsDataSize || 0);
+    // Phase protocol (#71): 'Reading BKTR tables...' is its OWN phase with its
+    // own denominator — the sequential prefix decompression to the tables
+    // (tableReadEnd bytes) fills the bar 0→1, then the next phase starts at 0.
+    let tablesDone = false;
     const tableSource = makeUpdateSource(tableRanges, (reached) => {
-        _prog(Math.min(1, reached / pass1Estimate), 'Reading BKTR tables...');
+        if (tablesDone) return; // late pump event — phase already ended at 1.0
+        _prog(Math.min(1, reached / tableReadEnd), 'Reading BKTR tables...', tableReadEnd);
     });
     const { relocBlock, subBlock } = await readBktrTables(tableSource, metaB);
+    tablesDone = true;
+    _prog(1, 'Reading BKTR tables...', tableReadEnd); // phase ends at exactly 1.0
     repPhase('tables', tableReadEnd, ph0);
     ph0 = performance.now();
 
@@ -440,13 +446,12 @@ export async function resolveOwnBktrLayout({
 
     // ExeFS PFS0 hash table (feeds exeHash → encHeader).
     let done = 0;
-    // Exact denominator: table prefix + the single exefs pass. The table-phase
-    // fraction (≈ tableReadEnd/pass1Estimate) is already booked on the bar; the
-    // exefs pass continues from there and lands exactly on 1.0.
-    const pass1Total = tableReadEnd + exefsSize;
+    // Own denominator for this phase (the table prefix was the previous phase,
+    // already shown 0→100% on its own scale): the single exefs pass fills 0→1
+    // and lands exactly on 1.0.
     const rep = (n) => {
         done += n;
-        _prog(Math.min(1, (tableReadEnd + done) / pass1Total), 'Resolving layout (1/2)');
+        _prog(Math.min(1, done / exefsSize), 'Resolving layout (1/2)', exefsSize);
     };
     const pfs0 = new StreamingPfs0Hasher(PFS0_EXEFS_HASH_BLOCK_SIZE);
     await streamExefs(async (chunk) => { pfs0.update(chunk, true); rep(chunk.length); });
@@ -519,14 +524,19 @@ export async function computeOwnBktrContentId({
         { off: metaB.subAbsOffset, len: metaB.subHeader.size },
     ].sort((a, b) => a.off - b.off);
     const tableReadEnd = tableRanges[tableRanges.length - 1].off + tableRanges[tableRanges.length - 1].len;
-    // Table phase + compute phase (2×exefs + data region) share one bar;
-    // estimate the compute denominator with romfsDataSize (≈ dataRegionSize,
-    // refined below once the tables are read).
-    const pass1Estimate = tableReadEnd + 2 * exefsSize + (romfsDataSize || 0);
+    // Phase protocol (#71): 'Reading BKTR tables...' is its OWN phase with its
+    // own denominator — the sequential prefix decompression to the tables
+    // (tableReadEnd bytes, the zstd/AES pass that physically must decode the
+    // whole RomFS prefix to reach the tables at its tail) fills the bar 0→1;
+    // the compute phase that follows starts fresh at 0 with its own scale.
+    let tablesDone = false;
     const tableSource = makeUpdateSource(tableRanges, (reached) => {
-        _prog(Math.min(1, reached / pass1Estimate), 'Reading BKTR tables...');
+        if (tablesDone) return; // late pump event — phase already ended at 1.0
+        _prog(Math.min(1, reached / tableReadEnd), 'Reading BKTR tables...', tableReadEnd);
     });
     const { relocBlock, subBlock } = await readBktrTables(tableSource, metaB);
+    tablesDone = true;
+    _prog(1, 'Reading BKTR tables...', tableReadEnd); // phase ends at exactly 1.0
     repPhase('tables', tableReadEnd, ph0);
     ph0 = performance.now();
 
@@ -590,13 +600,13 @@ export async function computeOwnBktrContentId({
 
     // ExeFS PFS0 hash table (pass A).
     let done = 0;
-    // Exact denominator: table prefix + 2×exefs + data region. The table-phase
-    // fraction (≈ tableReadEnd/pass1Estimate) is already booked on the bar; the
-    // compute phase continues from there and lands exactly on 1.0.
-    const pass1Total = tableReadEnd + 2 * exefsSize + dataRegionSize;
+    // Own denominator for this phase (the table prefix was the previous phase,
+    // already shown 0→100% on its own scale): 2×exefs + data region — the
+    // exact bytes this phase walks, so it fills 0→1 and lands exactly on 1.0.
+    const computeTotal = 2 * exefsSize + dataRegionSize;
     const rep = (n) => {
         done += n;
-        _prog(Math.min(1, (tableReadEnd + done) / pass1Total), 'Computing contentId (1/2)');
+        _prog(Math.min(1, done / computeTotal), 'Computing contentId (1/2)', computeTotal);
     };
     const pfs0 = new StreamingPfs0Hasher(PFS0_EXEFS_HASH_BLOCK_SIZE);
     await streamExefs(async (chunk) => { pfs0.update(chunk, true); rep(chunk.length); });

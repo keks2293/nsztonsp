@@ -2,15 +2,18 @@
 // Progress protocol test for the update pipeline (real Stardew base + update NSZ):
 // each path reports per-phase fractions (p in [0,1], stable phase label, phase byte
 // total), monotonic within a phase, each phase ends at exactly 1.0 — so the bar can
-// never regress across phases. Write phases are continuous (program + tail form one
-// bar: two-pass = 'Computing contentId (1/2)' + 'Writing output (2/2)',
-// streaming = 'Writing output (1/1)', buffered = 'Computing contentId (1/2)' +
-// 'Writing output (2/2)'). The NCZ two-pass/streaming flows first decompress the
-// update's sections in a silent prep pass — now reported as a labeled phase
+// never regress across phases. Phases: two-pass (own-BKTR) = 'Reading BKTR tables...'
+// (own denominator: the prefix decompression to the tables) + 'Computing contentId
+// (1/2)' (2×exefs + data region) + 'Writing output (2/2)',
+// streaming = 'Reading update sections...' + 'Writing output (1/1)', buffered =
+// 'Computing contentId (1/2)' + 'Writing output (2/2)'). The NCZ streaming flow first
+// decompresses the update's sections in a prep pass — reported as a labeled phase
 // ('Reading update sections...') with a per-byte fraction, so the status/bar move
-// while the input is being read (the buffered flow streams instead, no prep phase).
-// Also re-verifies streaming ≡ two-pass ≡ buffered byte-identity. In-memory outputs
-// only (no disk writes).
+// while the input is being read (the buffered flow streams instead, no prep phase;
+// the own-BKTR two-pass streams ExeFS one-shot — also no prep phase). Also
+// re-verifies streaming ≡ buffered byte-identity (the two-pass writes the
+// self-contained own-BKTR NCA — a different format by design, #135; verified at
+// merge level by test_twopass_sw_sim). In-memory outputs only (no disk writes).
 import fs from 'fs';
 import crypto from 'node:crypto';
 import { KeysParser } from '../keys.js';
@@ -131,11 +134,19 @@ const sha = (b) => crypto.createHash('sha256').update(b).digest('hex');
   });
   base.reader.close(); upd.reader.close();
   const buf = sw.build();
-  checkProtocol('two-pass (sw-sim, appendOnly)', events, ['Reading update sections...', 'Computing contentId (1/2)', 'Writing output (2/2)'], buf);
+  // The own-BKTR two-pass (post-#135) has NO 'Reading update sections...' prep
+  // (update.js:621 streams ExeFS one-shot instead of extractNcaSections); its
+  // Pass 1 opens with the tables phase — own denominator (tableReadEnd), ends
+  // at exactly 1.0 — then the compute phase starts at 0 on its own scale.
+  checkProtocol('two-pass (sw-sim, appendOnly)', events, ['Reading BKTR tables...', 'Computing contentId (1/2)', 'Writing output (2/2)'], buf);
 
   console.log(`\nstreaming sha256=${globalThis.__refSha} (${globalThis.__refLen})`);
   console.log(`two-pass  sha256=${sha(buf)} (${buf.length})`);
-  assert(globalThis.__refSha === sha(buf) && globalThis.__refLen === buf.length, 'streaming ≡ two-pass byte-identical');
+  // NOTE: streaming ≡ two-pass byte-compare dropped — post-#135 the two-pass
+  // emits a SELF-CONTAINED own-BKTR Program NCA (701,833,488 B) while the
+  // streaming/buffered paths write the plaintext-merged NCA (701,770,512 B);
+  // the formats differ by design. Two-pass bytes are verified at merge level
+  // by test_twopass_sw_sim.mjs; streaming ≡ buffered is checked in run 3.
 }
 
 // Run 3: buffered (sequential writer + updateMode 'buffered' → 1 merge into
