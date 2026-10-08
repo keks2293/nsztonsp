@@ -113,10 +113,11 @@ log('info', `Stardew: titleId=${titleId} exefsSize=0x${exefsSize.toString(16)} m
 
 const updateCtx = { headerRaw: updateHeaderRaw, source: null, reader: updateNcz, parsed: updateParsed, streamable: true };
 
-// The exact source factories the SW two-pass branch builds:
-const makeOwnUpdateSource = (ranges) => {
-    const src = new NczStreamSource(updateCtx.reader, updateCtx.parsed, log);
-    for (const r of ranges) src.registerRange(r.off, r.len);
+// The exact source factories the SW two-pass branch builds (mirrors update.js
+// makeOwnUpdateSource — including { register: false } for the walk):
+const makeOwnUpdateSource = (ranges, onProgress, opts = {}) => {
+    const src = new NczStreamSource(updateCtx.reader, updateCtx.parsed, log, onProgress);
+    if (opts.register !== false) for (const r of ranges) src.registerRange(r.off, r.len);
     return src;
 };
 const makeOwnBaseSource = () => new NczStreamSource(baseNcz, baseParsed, log);

@@ -204,16 +204,21 @@ export async function readPatchRun(updReader, updateRomfsSecOffset, subBlock, ti
     }
 }
 
-// ── Lockstep base (monotonic bases only) ─────────────────────────────────────
-// Serves the base non-patch runs from ONE sequential NCZ pass instead of
-// pre-allocated range buffers, for bases whose runs are already in PHYSICAL
-// order in entry (virtual) order (no backward jump, no overlap — the
-// registerRange sort+merge is then unnecessary). The merge's base reads are
-// then a forward-only cursor (offsets non-decreasing), so a single background
-// decompression suffices: it appends ciphertext chunks to a bounded window;
-// read(offset, n) waits until [offset, offset+n) is buffered, returns it, and
-// trims the front — releasing memory and unblocking the pump (backpressure).
-// Peak memory is the window + one read, not the whole base.
+// ── Lockstep (bounded window over one sequential NCZ pass) ───────────────────
+// Serves monotonic runs from ONE sequential NCZ pass instead of pre-allocated
+// range buffers: for the merge's base non-patch runs (bases already in
+// PHYSICAL order in entry (virtual) order — no backward jump, no overlap, so
+// the registerRange sort+merge is unnecessary), and for walkDataRegion's BOTH
+// patch and base walks (own-BKTR packer: patch intervals asc, then base
+// intervals asc — each walk a forward-only cursor over its own NCZ source).
+// The consumer's reads are a forward-only cursor (offsets non-decreasing), so
+// a single background decompression suffices: it appends ciphertext chunks to
+// a bounded window; read(offset, n) waits until [offset, offset+n) is buffered,
+// returns it, and trims the front — releasing memory and unblocking the pump
+// (backpressure). Peak memory is the window + one read, not the whole run set.
+// This is what keeps the own-BKTR walk from pre-allocating the ENTIRE data
+// region (patch + base ≈ 6.9 GB on LOLLIPOP CHAINSAW RePOP) at once — that
+// eager registration was the browser's "Array buffer allocation failed".
 //
 // AES-CTR stays in readBaseRun — its seek() runs at 16 MiB granularity (phys =
 // baseRomfsSecMeta.offset + physOffset + done, done stepping by 16 MiB), the
@@ -230,9 +235,10 @@ export async function readPatchRun(updReader, updateRomfsSecOffset, subBlock, ti
 const LOCKSTEP_WINDOW_BYTES = 4 * CHUNK_16MB; // pump-ahead cap (~64 MiB)
 
 class LockstepBaseReader {
-    constructor(source, totalEnd) {
+    constructor(source, totalEnd, label = 'base') {
         this._src = source;
         this._totalEnd = totalEnd; // last run's physEnd — stop the pass after it
+        this._label = label;       // error wording: 'base' (merge) / 'patch' / 'base' (walk)
         this._max = LOCKSTEP_WINDOW_BYTES;
         this._chunks = [];         // { data, start } ciphertext, NCA offset order
         this._windowBytes = 0;     // bytes currently in _chunks
@@ -281,14 +287,16 @@ class LockstepBaseReader {
 
     // Forward-only: offsets must be non-decreasing (the gate guarantees the base
     // runs are physically monotonic in entry order, and readBaseRun walks each
-    // run in 16 MiB steps). Returns the CIPHERTEXT for [offset, offset+length);
-    // the caller (readBaseRun) CTR-decrypts it at its own 16 MiB-aligned seek.
+    // run in 16 MiB steps; walkDataRegion's patch/base intervals are
+    // union-sorted asc — same property). Returns the CIPHERTEXT for
+    // [offset, offset+length); the caller (readBaseRun / readPatchRun)
+    // CTR-decrypts it at its own aligned seek.
     async read(offset, length) {
         this.start();
         const end = offset + length;
         for (;;) {
             if (this._err) throw this._err;
-            if (this._stopped) throw new Error('BKTR lockstep: base pass stopped');
+            if (this._stopped) throw new Error(`BKTR lockstep: ${this._label} pass stopped`);
             // Trim everything fully before `offset` (frees window memory and can
             // release the pump from backpressure).
             let trimmed = 0;
@@ -316,13 +324,14 @@ class LockstepBaseReader {
                     out.set(c.data.subarray(a, b), o);
                     o += b - a;
                 }
-                // Last run fully served — no more base bytes needed; let the
-                // pass stop (mirrors the fallback pump's STOP_PUMP).
+                // Last run fully served — no more bytes needed from this
+                // source; let the pass stop (mirrors the fallback pump's
+                // STOP_PUMP).
                 if (end >= this._totalEnd) { this._done = true; this._wake(); }
                 return out;
             }
             if (this._eof) {
-                throw new Error(`BKTR lockstep: base stream ended before read [0x${offset.toString(16)}, 0x${end.toString(16)})`);
+                throw new Error(`BKTR lockstep: ${this._label} stream ended before read [0x${offset.toString(16)}, 0x${end.toString(16)})`);
             }
             await new Promise(r => { (this._readers || (this._readers = [])).push(r); });
         }
@@ -349,6 +358,19 @@ function startLockstepIfMonotonic(baseSource, baseRuns, enabled) {
     const monotonic = baseRuns.every((r, i) => i === 0 || r.physStart >= baseRuns[i - 1].physEnd);
     if (!monotonic) return null;
     return new LockstepBaseReader(baseSource, baseRuns[baseRuns.length - 1].physEnd);
+}
+
+// Generalized lockstep reader for walkDataRegion (fs/bktr-pack.js): wrap a
+// sequential NCZ source whose reads are known forward-only, WITHOUT
+// registering any ranges (registration pre-allocates one Uint8Array per range
+// — the whole run set held at once, which OOMs the browser on multi-GB data
+// regions). Returns null for non-NCZ sources — the caller then keeps the
+// registerBaseRanges / registerRange path (a no-op for random-access
+// sources). totalEnd = the last wanted byte + 1 (the pass stops there);
+// label only words the error messages ('patch' / 'base').
+export function createLockstepReader(source, totalEnd, label) {
+    if (!(source instanceof NczStreamSource)) return null;
+    return new LockstepBaseReader(source, totalEnd, label);
 }
 
 // ── Virtual-order merge (default) ─────────────────────────────────────────────

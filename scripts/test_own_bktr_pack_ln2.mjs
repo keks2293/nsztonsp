@@ -102,9 +102,9 @@ const dataLevelSize = readLeU64(updFh, 0x18 + 5 * 0x18 + 8);
 log('info', `LN2: exefs=0x${exefsSize.toString(16)} dataLevel offset=0x${dataLevelOffset.toString(16)} size=0x${dataLevelSize.toString(16)}`);
 
 const updateCtx = { headerRaw: updateHeaderRaw, source: null, reader: updateNcz, parsed: updateParsed, streamable: true };
-const makeUpdateSource = (ranges) => {
-    const src = new NczStreamSource(updateCtx.reader, updateCtx.parsed, log);
-    for (const r of ranges) src.registerRange(r.off, r.len);
+const makeUpdateSource = (ranges, onProgress, opts = {}) => {
+    const src = new NczStreamSource(updateCtx.reader, updateCtx.parsed, log, onProgress);
+    if (opts.register !== false) for (const r of ranges) src.registerRange(r.off, r.len);
     return src;
 };
 const makeBaseSource = () => new NczStreamSource(baseNcz, baseParsed, log);
