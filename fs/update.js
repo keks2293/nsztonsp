@@ -819,13 +819,20 @@ export async function update(readers, output, options = {}) {
 
             // Own-BKTR source factories: every pass (two passes in compute, one in
             // the write) needs a FRESH sequential source. Patch runs / tables come
-            // from the update NCZ (pre-registered ranges), base runs from the base
-            // NCZ (registered via registerBaseRanges inside walkDataRegion);
-            // random-access inputs just get their shared source back.
-            const makeOwnUpdateSource = (ranges, onProgress) => {
+            // from the update NCZ, base runs from the base NCZ. `{ register: false }`
+            // (walkDataRegion) skips the eager registerRange loop — registering
+            // would pre-allocate one buffer per range, i.e. the WHOLE patch+base
+            // data region at once (≈6.9 GB on LOLLIPOP CHAINSAW RePOP → browser
+            // "Array buffer allocation failed"); the walk instead streams both
+            // sources through a bounded lockstep reader. The table reads keep
+            // registration (small, and read() needs the buffered ranges).
+            // Random-access inputs just get their shared source back.
+            const makeOwnUpdateSource = (ranges, onProgress, opts = {}) => {
                 if (!updateCtx.streamable) return updateCtx.source;
                 const src = new NczStreamSource(updateCtx.reader, updateCtx.parsed, log, onProgress);
-                for (const r of ranges) src.registerRange(r.off, r.len);
+                if (opts.register !== false) {
+                    for (const r of ranges) src.registerRange(r.off, r.len);
+                }
                 return src;
             };
             const makeOwnBaseSource = () => baseKind === 'ncz'

@@ -47,7 +47,7 @@ import {
     decryptNcaHeaderBytes, fsHeaderAt, reversedSectionCtr,
 } from './nca-utils.js';
 import { decryptBktrTableData } from './bktr.js';
-import { resolveBktrMeta, readBktrTables, readPatchRun, readBaseRun, registerBaseRanges } from './bktr-merge.js';
+import { resolveBktrMeta, readBktrTables, readPatchRun, readBaseRun, registerBaseRanges, createLockstepReader } from './bktr-merge.js';
 import {
     buildNcaHeader, buildPfs0FsHeader, fillPfs0Superblock, fillSectionHashes,
     encryptNcaHeader, StreamingPfs0Hasher, pad200, PFS0_EXEFS_HASH_BLOCK_SIZE, CRYPT,
@@ -244,43 +244,78 @@ function buildOwnBktrNcaHeader({ titleId, keys, ourTitlekey, L, exeHash, ownFsHd
 // Re-read the patch union intervals (asc) then the base union intervals (asc),
 // decrypt each from its source, re-encrypt with a fresh AesCtr over our own
 // layout, and hand the ciphertext to onChunk(cipher, dataRegionOffset).
+//
+// Sources are fed through a BOUNDED lockstep reader when they are sequential
+// NCZ streams (createLockstepReader), NOT range-registered: registration
+// pre-allocates one Uint8Array per range, and patch + base together span the
+// WHOLE data region (0x19de3b3c0 ≈ 6.9 GB on LOLLIPOP CHAINSAW RePOP) held
+// simultaneously — the browser refuses that ("Array buffer allocation
+// failed"). Both walks are union-sorted ascending and read forward-only (the
+// lockstep contract), so one NCZ pass per source with a ~64 MiB window serves
+// every read: peak memory is the window + one 16 MiB read, not the run set.
+// Random-access sources keep the register path (a no-op for them).
 async function walkDataRegion({ L, meta, makeUpdateSource, makeBaseSource, onChunk }) {
     const baseCtr = new AesCtr(meta.baseTitlekey, meta.baseNonce);
-    const patchSource = makeUpdateSource(meta.patchAbsRanges);
+    // Guard the lockstep contract up front: a backward read would otherwise
+    // surface as a confusing "stream ended before read". unionIntervals sorts
+    // + merges, so this holds by construction.
+    const asc = (arr, k) => arr.every((r, i, a) => i === 0 || r[k] >= a[i - 1][k] + a[i - 1].len);
+    if (!asc(meta.patchAbsRanges, 'off') || !asc(meta.baseAbsRanges, 'start')) {
+        throw new Error('own-BKTR: data-region intervals are not forward-only (union sort broken?) — cannot stream');
+    }
+    const patchSource = makeUpdateSource(meta.patchAbsRanges, null, { register: false });
     const baseSource = makeBaseSource();
-    // Base runs come sorted by physical offset already; registerBaseRanges
-    // sort+merges defensively and is a no-op for random-access sources.
-    registerBaseRanges(baseSource, meta.baseAbsRanges.map((r) => ({ start: r.start, end: r.start + r.len })));
+    // Last wanted byte + 1 per source — the lockstep pass stops there.
+    const patchEnd = meta.patchAbsRanges.reduce((e, r) => Math.max(e, r.off + r.len), 0);
+    const baseEnd = meta.baseAbsRanges.reduce((e, r) => Math.max(e, r.start + r.len), 0);
+    const patchLock = createLockstepReader(patchSource, patchEnd, 'patch');
+    const baseLock = createLockstepReader(baseSource, baseEnd, 'base');
+    // Fallback: non-NCZ sources get the (no-op) registration — reads go direct.
+    if (!patchLock) {
+        for (const r of meta.patchAbsRanges) patchSource.registerRange(r.off, r.len);
+    }
+    if (!baseLock) {
+        registerBaseRanges(baseSource, meta.baseAbsRanges.map((r) => ({ start: r.start, end: r.start + r.len })));
+    }
+    const patchReader = patchLock || patchSource;
+    const baseReader = baseLock || baseSource;
 
     const ownCtr = new AesCtr(meta.ourTitlekey, OWN_DATA_NONCE);
     ownCtr.seek(L.sec1Start);
 
     let placed = 0;
-    for (const iv of meta.patchIntervals) {
-        await readPatchRun(
-            patchSource, meta.updateRomfsSecOffset, meta.updateSubBlock,
-            meta.updateTitlekey, meta.secureValue,
-            iv.start, iv.place, iv.len,
-            async (chunk) => {
-                const cp = await ownCtr.encrypt(chunk);
-                placed += cp.length;
-                await onChunk(cp, placed - cp.length);
-            }
-        );
-    }
-    for (const iv of meta.baseIntervals) {
-        await readBaseRun(
-            baseSource, meta.baseRomfsSecMeta.offset, meta.baseRomfsSecMeta.size, baseCtr,
-            iv.start, iv.place, iv.len,
-            async (chunk) => {
-                const cp = await ownCtr.encrypt(chunk);
-                placed += cp.length;
-                await onChunk(cp, placed - cp.length);
-            }
-        );
-    }
-    if (placed !== L.relocOff) {
-        throw new Error(`own-BKTR: data region mismatch — placed 0x${placed.toString(16)} bytes, layout expects 0x${L.relocOff.toString(16)}`);
+    try {
+        for (const iv of meta.patchIntervals) {
+            await readPatchRun(
+                patchReader, meta.updateRomfsSecOffset, meta.updateSubBlock,
+                meta.updateTitlekey, meta.secureValue,
+                iv.start, iv.place, iv.len,
+                async (chunk) => {
+                    const cp = await ownCtr.encrypt(chunk);
+                    placed += cp.length;
+                    await onChunk(cp, placed - cp.length);
+                }
+            );
+        }
+        for (const iv of meta.baseIntervals) {
+            await readBaseRun(
+                baseReader, meta.baseRomfsSecMeta.offset, meta.baseRomfsSecMeta.size, baseCtr,
+                iv.start, iv.place, iv.len,
+                async (chunk) => {
+                    const cp = await ownCtr.encrypt(chunk);
+                    placed += cp.length;
+                    await onChunk(cp, placed - cp.length);
+                }
+            );
+        }
+        if (placed !== L.relocOff) {
+            throw new Error(`own-BKTR: data region mismatch — placed 0x${placed.toString(16)} bytes, layout expects 0x${L.relocOff.toString(16)}`);
+        }
+    } finally {
+        // Stop any in-flight lockstep pass (error path); a clean pass already
+        // stopped itself at totalEnd (finish is idempotent).
+        if (patchLock) patchLock.finish();
+        if (baseLock) baseLock.finish();
     }
 }
 
