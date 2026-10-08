@@ -858,7 +858,7 @@ export async function update(readers, output, options = {}) {
                         keys, baseTik: baseTikData, updateTik: updateTikData,
                         titleId: base.cnmt.titleId, exefsSize, romfsDataSize,
                         streamExefs: makeStreamExefs(), log,
-                        progress: (p, label) => progress(p, label || 'Resolving layout (1/2)', pass1Bytes),
+                        progress: (p, label, bytes) => progress(p, label || 'Resolving layout (1/2)', bytes || pass1Bytes),
                     }));
                 } else {
                     log('info', 'Two-pass own-BKTR: self-contained Program NCA (own reloc/sub tables, data region = merged RomFS)...');
@@ -869,7 +869,7 @@ export async function update(readers, output, options = {}) {
                         keys, baseTik: baseTikData, updateTik: updateTikData,
                         titleId: base.cnmt.titleId, exefsSize, romfsDataSize,
                         streamExefs: makeStreamExefs(), log,
-                        progress: (p, label) => progress(p, label || 'Computing contentId (1/2)', pass1Bytes),
+                        progress: (p, label, bytes) => progress(p, label || 'Computing contentId (1/2)', bytes || pass1Bytes),
                     }));
                 }
             } else {
