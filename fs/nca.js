@@ -135,6 +135,15 @@ export function decryptNcaHeader(raw, keys = null) {
         throw new Error(`decryptNcaHeader: invalid header_key (${headerKey.length} bytes, expected 32)`);
     }
     const arr = raw instanceof Uint8Array ? raw : new Uint8Array(raw);
+    // A short buffer means the READ failed (entry offset past the end of a
+    // truncated container), not that the key is wrong — say so instead of
+    // XTS-decrypting empty/garbage bytes and reporting a bogus "bad magic ''".
+    if (arr.length < NCA_HEADER_SIZE) {
+        throw new Error(
+            `decryptNcaHeader: NCA header read is short: got ${arr.length} bytes (expected ${NCA_HEADER_SIZE}) — ` +
+            `the member is likely past the end of a truncated/corrupt container`
+        );
+    }
     const len = Math.min(NCA_HEADER_SIZE, arr.length);
     // Header is ALWAYS XTS-encrypted (hacPack encrypts unconditionally).
     // cryptoType byte = keygen index, NOT "no encryption".
