@@ -200,7 +200,7 @@ async function rebuildCnmtNca(baseMeta, updateMeta, keys, log, mergedProgram = n
 // re-decompression for each extra section (e.g. update BKTR + ExeFS). Returns
 // the raw section buffers in the same order as `ranges`. Callers are always NCZ
 // (the raw-container read path is covered by FileRangeSource).
-async function extractNcaSections(reader, ranges, keys, log, onProgress = null) {
+async function extractNcaSections(reader, ranges, keys, log, onProgress = null, prealloc = null) {
     const parsed = await parseNczSections(reader);
     const last = ranges[ranges.length - 1];
     const lastEnd = last.offset + last.size;
@@ -211,7 +211,29 @@ async function extractNcaSections(reader, ranges, keys, log, onProgress = null) 
     // Progress is measured by how many of the requested section bytes have been
     // filled (monotonic; reaches exactly 1.0 when the last range is complete).
     const totalBytes = ranges.reduce((s, r) => s + r.size, 0);
-    const buffers = ranges.map(r => new Uint8Array(r.size));
+    let buffers;
+    // `prealloc` = buffers allocated by the caller's preflight (same ranges,
+    // guaranteed) — reused as-is so the feasibility probe never doubles the
+    // allocation. Anything mismatched falls through to allocating here.
+    if (prealloc && prealloc.length === ranges.length
+            && prealloc.every((b, i) => b.length === ranges[i].size)) {
+        buffers = prealloc;
+    } else {
+        try {
+            buffers = ranges.map(r => new Uint8Array(r.size));
+        } catch (e) {
+            // Browser ArrayBuffer ceiling (~2 GiB per allocation, sometimes lower under
+            // memory pressure). The 'auto' default never lands here for BKTR sections
+            // (scatter/own-BKTR route instead) — this is explicit 'two-pass'/'seekback'
+            // that skipped the preflight (non-BKTR path), or memory that shrank after it.
+            const big = ranges.reduce((m, r) => (r.size > m.size ? r : m), ranges[0]);
+            throw new Error(
+                `extractNcaSections: cannot allocate ${big.size} bytes ` +
+                `(${(big.size / 1024 ** 3).toFixed(2)} GiB) for section [0x${big.offset.toString(16)}..0x${(big.offset + big.size).toString(16)}) — ` +
+                `the browser's ArrayBuffer ceiling was hit. Use the default update mode (scatter/own-BKTR, no whole-section buffer) ` +
+                `instead of Buffer/two-pass for this title.`);
+        }
+    }
     const filled = ranges.map(() => 0);
     const decomp = new NCZDecompressor(reader);
     try {
@@ -448,7 +470,11 @@ function makeExefsStream(updateInput, keys, updateTikData, options, log) {
 }
 
 export async function update(readers, output, options = {}) {
-    const { log = () => {}, progress = () => {}, keys = null, updateMode = 'auto' } = options;
+    const { log = () => {}, progress = () => {}, keys = null, updateMode: requestedUpdateMode = 'auto' } = options;
+    // Effective mode: the buffered routes are probed for RAM feasibility below
+    // and may be demoted to 'auto' (the default no-buffer route) when their
+    // whole-section/NCA allocation cannot be satisfied — see the preflight block.
+    let updateMode = requestedUpdateMode;
 
     if (!Array.isArray(readers) || readers.length !== 2) {
         throw new Error('update: exactly two inputs required (base + update)');
@@ -606,11 +632,94 @@ export async function update(readers, output, options = {}) {
         const appendOnly = !!(output.writable && typeof output.writable.seek !== 'function');
         // Scatter seek-writes the NCA header + hash tables back over the data region,
         // so a sequential (append-only, SW) output is excluded here NO MATTER what.
-        const scatterActive = updateMode === 'scatter' && hasBktrRomfs && !appendOnly && outRead !== null;
+        // 'auto' (the default) routes to scatter whenever the output allows it — the
+        // old extract-sections whole-buffer path (updateMode 'two-pass'/'seekback')
+        // allocated the entire BKTR section (2.22 GiB on LOLLIPOP) and crashed the
+        // browser with "Array buffer allocation failed". Outputs without read-back
+        // (FSA/SW) fall through to the own-BKTR two-pass/single-pass writers below —
+        // the NORMAL route, not a degradation. Explicit 'scatter' still warns when
+        // the output can't take it; 'auto' stays silent (it just picks the route).
+        // 'auto' only requests scatter for .ncz updates — a .nsp update never goes
+        // through extractNcaSections (its source is the container), so there is no
+        // whole-section-buffer crash to avoid and its old routing stays untouched.
+
+        // Section data sizes for the Program NCA (single source, both paths).
+        let romfsDataSize, exefsSize, programSize;
+        if (hasBktrRomfs) {
+            ({ romfsDataSize, exefsSize, programSize } = parseUpdateSectionSizes(updateHeaderDec, updateHeaderRaw, updateRomfsSec, updateExefsSec, keys));
+        } else {
+            const baseDecBytes = decryptNcaHeaderBytes(baseHeaderRaw, keys);
+            const updateDecBytes = decryptNcaHeaderBytes(updateHeaderRaw, keys);
+            const { idx: romfsIdx } = findRomfsFsHeader(baseDecBytes, 'base');
+            const baseRomfsFsHdr = fsHeaderAt(baseDecBytes, romfsIdx);
+            romfsDataSize = readLeU64(baseRomfsFsHdr, FS_HDR.ROMFS_DATA_SIZE);
+            const { idx: updateExefsIdx } = findExefsFsHeader(updateDecBytes, 'update');
+            const updateExefsFsHdr = fsHeaderAt(updateDecBytes, updateExefsIdx);
+            exefsSize = readLeU64(updateExefsFsHdr, FS_HDR.PFS0_SIZE);
+            programSize = programNcaSize(exefsSize, romfsDataSize);
+        }
+
+        // ── Buffer feasibility preflight (auto-fallback) ──────────────────────
+        // The buffered routes hold big contiguous allocations in RAM:
+        //   'buffered' (BufferNCA) — the whole merged NCA (L.ncaSize);
+        //   'buffer-update' (BufferUpdate, every output) and 'two-pass'/
+        //     'seekback' (readable output only) — the BKTR + ExeFS sections
+        //     together (extractNcaSections' peak), on the extract route.
+        // Both blow the browser's ArrayBuffer ceiling (~2 GiB) on big titles
+        // (2.22 GiB BKTR section / 2.29 GiB NCA on LOLLIPOP). Allocate the
+        // real buffers HERE, before any decompression work and before the route
+        // is picked: on failure just disable the buffer and continue on the
+        // default no-buffer route ('auto' → scatter on a readable output,
+        // own-BKTR streaming on FSA/SW — what this title would have gotten with
+        // Buffer off) instead of failing mid-run. On success the pre-allocated
+        // buffers ARE the ones the buffered route uses, so no allocation is
+        // ever duplicated. The in-place guards (extractNcaSections, ncaBuf)
+        // remain as the last resort for allocations this preflight does not
+        // cover (e.g. the non-BKTR path or memory pressure growing afterwards).
+        let ncaBufProbe = null;      // whole-NCA buffer for the 'buffered' route
+        let sectionBufsProbe = null; // section buffers for the extract route
+        const tryAlloc = (fn, what, bytes) => {
+            try {
+                fn();
+                return true;
+            } catch {
+                // RangeError: "Array buffer allocation failed".
+                log('warn', `Buffer not possible: ${what} needs ${bytes} bytes (${(bytes / 1024 ** 3).toFixed(2)} GiB) in one allocation — over the ArrayBuffer ceiling. Disabling the buffer and retrying with the default route (scatter/own-BKTR streaming, no whole-section buffer)...`);
+                return false;
+            }
+        };
+        if (hasBktrRomfs && updateMode === 'buffered') {
+            const ncaSize = computeProgramNcaLayout(exefsSize, romfsDataSize).ncaSize;
+            if (!tryAlloc(() => { ncaBufProbe = new Uint8Array(ncaSize); },
+                    'BufferNCA (whole merged NCA)', ncaSize)) {
+                updateMode = 'auto';   // → default route: scatter / own-BKTR
+            }
+        } else if (hasBktrRomfs && updateKind === 'ncz'
+                && (updateMode === 'buffer-update'
+                    || ((updateMode === 'two-pass' || updateMode === 'seekback') && outRead !== null))) {
+            const probeRanges = [
+                ...(updateRomfsSec ? [{ offset: updateRomfsSec.offset, size: updateRomfsSec.endOffset - updateRomfsSec.offset }] : []),
+                { offset: updateExefsSec.offset, size: updateExefsSec.endOffset - updateExefsSec.offset },
+            ];
+            const secBytes = probeRanges.reduce((s, r) => s + r.size, 0);
+            const big = probeRanges.reduce((m, r) => (r.size > m.size ? r : m), probeRanges[0]);
+            if (!tryAlloc(() => { sectionBufsProbe = probeRanges.map(r => new Uint8Array(r.size)); },
+                    `BufferUpdate (update sections, biggest 0x${big.offset.toString(16)}..0x${(big.offset + big.size).toString(16)})`, secBytes)) {
+                sectionBufsProbe = null;
+                updateMode = 'auto';   // → default route: scatter / own-BKTR
+            }
+        }
+
+        const scatterRequested = updateMode === 'scatter'
+            || (updateMode === 'auto' && updateKind === 'ncz');
+        const scatterActive = scatterRequested && hasBktrRomfs && !appendOnly && outRead !== null;
         if (updateMode === 'scatter' && hasBktrRomfs && !scatterActive) {
             log('warn', appendOnly
                 ? 'Scatter not possible on a sequential (SW) output — falling back to two-pass'
                 : 'Scatter needs a readable (in-memory/fd) output — falling back to two-pass');
+        }
+        if (updateMode === 'auto' && updateKind === 'ncz' && hasBktrRomfs && !scatterActive) {
+            log('info', 'Auto route: output has no read-back — using own-BKTR streaming (no whole-section buffer)');
         }
         if (updateKind === 'ncz') {
             if (scatterActive || (updateMode === 'buffered' && hasBktrRomfs)) {
@@ -621,7 +730,8 @@ export async function update(readers, output, options = {}) {
                 // inside resolveBktrMergeTables (U1) and scatterRomFS Pass U (U2).
                 updateSource = new NczStreamSource(updateReader, updateParsed, log);
                 updateSource.registerRange(updateExefsSec.offset, updateExefsSec.endOffset - updateExefsSec.offset);
-            } else if (hasBktrRomfs && outRead === null && updateMode !== 'buffered') {
+            } else if (hasBktrRomfs && outRead === null && updateMode !== 'buffered'
+                    && updateMode !== 'buffer-update') {
                 // Two-pass on a sequential (SW) output: the update is NEVER
                 // buffered. The two-pass branch below routes this case to the
                 // own-BKTR writer (fs/bktr-pack.js): the whole BKTR section is
@@ -651,7 +761,8 @@ export async function update(readers, output, options = {}) {
                 const sectionBytes = updRanges.reduce((s, r) => s + r.size, 0);
                 progress(0, 'Reading update sections...', sectionBytes);
                 const updData = await extractNcaSections(updateReader, updRanges, keys, log,
-                    (frac) => progress(frac, 'Reading update sections...', sectionBytes));
+                    (frac) => progress(frac, 'Reading update sections...', sectionBytes),
+                    sectionBufsProbe);
                 const updateSections = [];
                 let u = 0;
                 if (hasBktrRomfs && updateRomfsSec) updateSections.push({ offset: updateRomfsSec.offset, data: updData[u++] });
@@ -691,7 +802,13 @@ export async function update(readers, output, options = {}) {
         // stream factories shared by the streaming and two-pass paths. Each call
         // returns a fresh stream (new acidFilter / fresh base source) so repeated
         // passes get clean state.
-        const segmentedActive = updateKind === 'ncz' && hasBktrRomfs && outRead === null && updateMode !== 'buffered';
+        // 'buffer-update' (BufferUpdate on a sequential output) stays OFF the
+        // own-BKTR writer: it takes the extract route (sections in RAM from the
+        // preflight) + the plain two-pass merge below — a plaintext-merged NCA,
+        // like .nsp updates on SW. own-BKTR is the fallback when the sections
+        // don't fit (preflight demotes the mode to 'auto').
+        const segmentedActive = updateKind === 'ncz' && hasBktrRomfs && outRead === null
+            && updateMode !== 'buffered' && updateMode !== 'buffer-update';
         const makeStreamExefs = () => makeExefsStream(updateInput, keys, updateTikData, options, log);
         const _baseReaderRef = baseReader;
         const _baseParsedRef = baseParsed;
@@ -717,22 +834,6 @@ export async function update(readers, output, options = {}) {
                     await emit(chunk, off);
                 });
             };
-
-        // Section data sizes for the Program NCA (single source, both paths).
-        let romfsDataSize, exefsSize, programSize;
-        if (hasBktrRomfs) {
-            ({ romfsDataSize, exefsSize, programSize } = parseUpdateSectionSizes(updateHeaderDec, updateHeaderRaw, updateRomfsSec, updateExefsSec, keys));
-        } else {
-            const baseDecBytes = decryptNcaHeaderBytes(baseHeaderRaw, keys);
-            const updateDecBytes = decryptNcaHeaderBytes(updateHeaderRaw, keys);
-            const { idx: romfsIdx } = findRomfsFsHeader(baseDecBytes, 'base');
-            const baseRomfsFsHdr = fsHeaderAt(baseDecBytes, romfsIdx);
-            romfsDataSize = readLeU64(baseRomfsFsHdr, FS_HDR.ROMFS_DATA_SIZE);
-            const { idx: updateExefsIdx } = findExefsFsHeader(updateDecBytes, 'update');
-            const updateExefsFsHdr = fsHeaderAt(updateDecBytes, updateExefsIdx);
-            exefsSize = readLeU64(updateExefsFsHdr, FS_HDR.PFS0_SIZE);
-            programSize = programNcaSize(exefsSize, romfsDataSize);
-        }
 
         if (outRead !== null && updateMode !== 'buffered') {
             log('info', `Streaming update (${scatterActive ? 'scatter, ' : ''}seekable output): ExeFS streamed, RomFS via ${hasBktrRomfs ? 'BKTR merge' : 'base as-is'} (no data buffer)...`);
@@ -927,7 +1028,20 @@ export async function update(readers, output, options = {}) {
         // (minus header/hash-table/IVFC levels, which it places in place) —
         // its contentId is a single one-shot WebCrypto digest over the buffer.
         const L = computeProgramNcaLayout(exefsSize, romfsDataSize);
-        const ncaBuf = new Uint8Array(L.ncaSize);
+        let ncaBuf;
+        try {
+            // ncaBufProbe = the preflight allocation for this exact route (see
+            // the preflight block) — reused, never allocated twice.
+            ncaBuf = ncaBufProbe ?? new Uint8Array(L.ncaSize);
+        } catch (e) {
+            // The whole merged NCA in RAM — ~7.2 GB on LOLLIPOP CHAINSAW RePOP,
+            // far past the browser's ~2 GiB ArrayBuffer ceiling. Fail fast with an
+            // actionable message instead of the bare "Array buffer allocation failed".
+            throw new Error(
+                `Buffered update: cannot allocate the whole NCA in memory — ${L.ncaSize} bytes ` +
+                `(${(L.ncaSize / 1024 ** 3).toFixed(2)} GiB) exceeds the browser's ArrayBuffer ceiling. ` +
+                `Turn Buffer off: the default mode merges via scatter/own-BKTR streaming with ~200 KB RAM.`);
+        }
         const freshBase = baseKind === 'ncz'
             ? { headerRaw: baseHeaderRaw, source: new NczStreamSource(_baseReaderRef, _baseParsedRef, log) }
             : baseInput;
