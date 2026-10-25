@@ -42,19 +42,22 @@ async function main() {
     const noDeltaBtn = document.getElementById('noDeltaBtn');
     const keepAcidSigBtn = document.getElementById('keepAcidSigBtn');
     const keepAcidKeyBtn = document.getElementById('keepAcidKeyBtn');
-    const bufferedBtn = document.getElementById('bufferedBtn');
-    const scatterBtn = document.getElementById('scatterBtn');
+    const bufferNcaBtn = document.getElementById('bufferNcaBtn');
+    const bufferUpdateBtn = document.getElementById('bufferUpdateBtn');
 
-    // Two pills over ONE merged-buffer path ('buffered' since fe3353f already
-    // streams the update in physical order — no separate update buffer):
-    //   Buffer  — hold the MERGED RomFS in memory (single output pass).
-    //   Scatter — same merged-buffer path; kept as its own pill for clarity.
-    //             IMPLIES Buffer: hashes come from the merged RomFS buffer, so it
-    //             works on any output incl. FSA (write+seek, no read-back). The old
-    //             no-buffer scatter (re-read the output) is gone from the UI — an
-    //             FSA output can't be re-read and a SW one can't seek at all.
-    let buffered = false;
-    let scatter = false;
+    // Default update route is 'auto' (engine fs/update.js): scatter on a readable
+    // seekable output (blob/fd — no whole-section buffer ever allocated), own-BKTR
+    // streaming on outputs without read-back (FSA/SW). Two optional buffer pills:
+    //   BufferUpdate — buffer only the UPDATE's sections (BKTR patch + ExeFS) in
+    //     RAM and stream the base through the merge (the update decompresses 1×
+    //     instead of 2-3×). On blob this was the old 'two-pass' route; on SW/FSA
+    //     it is the new 'buffer-update' mode (plaintext-merged output).
+    //   BufferNCA (SW/FSA only) — hold the whole merged Program NCA in RAM for a
+    //     single-pass merge + one-shot hash (fastest, ~1 extra NCA of RAM).
+    // When a buffer doesn't fit in memory (browser ~2 GiB ArrayBuffer ceiling),
+    // the engine's preflight logs a warning and falls back to the default
+    // no-buffer route automatically instead of failing.
+    let bufferRoute = null; // null | 'update' | 'nca' — mutually exclusive pills
 
     let fixPadding = false;
     let overwrite = false;
@@ -89,13 +92,18 @@ async function main() {
         noDeltaBtn.classList.toggle('hidden', !noDeltaVisible);
         keepAcidSigBtn.classList.toggle('hidden', !keepAcidVisible);
         keepAcidKeyBtn.classList.toggle('hidden', !keepAcidVisible);
-        // Buffer is meaningless for in-memory (blob) output — the output is already
-        // in RAM there, so only SW/FSA need the merged-buffer choice.
-        // Scatter works on any output: on SW/FSA it implies the merged buffer
-        // (hashes come from it, no readable output needed — routes to 'buffered');
-        // on blob it re-streams standalone (re-reads the in-memory output).
-        bufferedBtn.classList.toggle('hidden', !keepAcidVisible);
-        scatterBtn.classList.toggle('hidden', !keepAcidVisible);
+        // Buffer pills restore buffered routes (see the pill comment above); the
+        // default 'auto' route needs no pill — scatter/own-BKTR is automatic.
+        // BufferNCA is blob-excluded: blob never merges the whole NCA in RAM
+        // (its buffered route IS BufferUpdate), and a stale selection is cleared.
+        const bufferVisible = keepAcidVisible;
+        const ncaVisible = bufferVisible && downloadMode !== 'blob';
+        bufferUpdateBtn.classList.toggle('hidden', !bufferVisible);
+        bufferNcaBtn.classList.toggle('hidden', !ncaVisible);
+        if (!ncaVisible && bufferRoute === 'nca') {
+            bufferRoute = null;
+            bufferNcaBtn.classList.remove('on');
+        }
     }
 
     updateOptionsVisibility();
@@ -339,15 +347,14 @@ async function main() {
         keepAcidKeyBtn.classList.toggle('on', keepAcidKey);
     });
 
-    bufferedBtn.addEventListener('click', () => {
-        buffered = !buffered;
-        bufferedBtn.classList.toggle('on', buffered);
-    });
-
-    scatterBtn.addEventListener('click', () => {
-        scatter = !scatter;
-        scatterBtn.classList.toggle('on', scatter);
-    });
+    // The two buffer pills are mutually exclusive (each selects one route).
+    const setBufferRoute = (route) => {
+        bufferRoute = bufferRoute === route ? null : route;
+        bufferNcaBtn.classList.toggle('on', bufferRoute === 'nca');
+        bufferUpdateBtn.classList.toggle('on', bufferRoute === 'update');
+    };
+    bufferNcaBtn.addEventListener('click', () => setBufferRoute('nca'));
+    bufferUpdateBtn.addEventListener('click', () => setBufferRoute('update'));
 
     document.querySelectorAll('.pill[data-mode]').forEach(btn => {
         btn.addEventListener('click', () => {
@@ -755,15 +762,19 @@ async function main() {
                 writable,
                 keepNpdmAcidSig: keepAcidSig,
                 keepNpdmAcidKey: keepAcidKey,
-                // Scatter implies the merged buffer on SW/FSA: hashes come from the merged
-                // RomFS buffer (forward write, works even on append-only outputs),
-                // so no readable output is needed. On blob it still re-streams
-                // standalone (re-reads the in-memory output). Both pills select the
-                // same merged-buffer path since fe3353f ('buffered' streams the
-                // update in physical order — there is no separate update buffer).
-                updateMode: (scatter && downloadMode === 'blob') ? 'scatter'
-                    : ((buffered || scatter) && downloadMode !== 'blob') ? 'buffered'
-                    : 'two-pass',
+                // Default 'auto': scatter on a readable seekable output (blob/fd),
+                // own-BKTR streaming on SW/FSA (no read-back) — no whole-section
+                // buffer anywhere. BufferUpdate → 'buffer-update' (update sections
+                // in RAM, base streamed; plaintext-merged output on every output),
+                // BufferNCA → 'buffered' (whole merged NCA in RAM, SW/FSA only).
+                // Both are probed by the engine's preflight: if the allocation
+                // doesn't fit, it logs a warning and falls back to the default
+                // no-buffer route automatically.
+                updateMode: bufferRoute === 'nca'
+                    ? 'buffered'
+                    : bufferRoute === 'update'
+                        ? 'buffer-update'
+                        : 'auto',
             });
             checkSwDelivered(writable, result.size);
             await deliverResult(writable, result.blob, result.name);
