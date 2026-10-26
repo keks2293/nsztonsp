@@ -5,21 +5,26 @@ const ENTRY = 'main.js';
 const OUT = 'app.mjs';
 const ASSETS = ['favicon.svg', 'download-worker.js', 'sw.js'];
 
+// Ad tags per deploy domain (injected into <head> when DEPLOY_URL matches).
+// Old nap5k.com tags removed 2026-10-26 — new platform tags go here once issued.
 const AD_SITES = {
-    'nsztonsp.netlify.app': `<script>(function(s){s.dataset.zone='11368266',s.src='https://nap5k.com/tag.min.js'})([document.documentElement, document.body].filter(Boolean).pop().appendChild(document.createElement('script')))</script>`,
-    'nszjs.netlify.app': `<script>(function(s){s.dataset.zone='11024396',s.src='https://nap5k.com/tag.min.js'})([document.documentElement, document.body].filter(Boolean).pop().appendChild(document.createElement('script')))</script>`,
+    // 'example.netlify.app': `<script>…</script>`,
 };
 
 const DEPLOY_URL = process.env.DEPLOY_URL || process.env.URL || '';
 const AD = Object.entries(AD_SITES).find(([d]) => DEPLOY_URL.includes(d))?.[1] || null;
+
+// New ad platform ownership verification — inert meta, injected on EVERY build
+// (unconditional: verification must not depend on DEPLOY_URL being set/matching).
+const VERIFY_META = `<meta name="9a78969ad0697719fdf533e1b584eddaeef5db8a" content="9a78969ad0697719fdf533e1b584eddaeef5db8a" />`;
 
 mkdirSync('out', { recursive: true });
 execSync(`npx esbuild ${ENTRY} --bundle --minify --format=esm --outfile=out/${OUT} --external:node:fs --external:node:child_process --external:node:crypto --external:node:zlib --external:crypto`, { stdio: 'inherit' });
 
 let html = readFileSync('index.html', 'utf8');
 html = html.replace(`import('./${ENTRY}')`, `import('./${OUT}')`);
+html = html.replace('<head>', `<head>\n    ${[VERIFY_META, AD].filter(Boolean).join('\n    ')}`);
 if (AD) {
-    html = html.replace('<head>', `<head>\n    ${AD}`);
     console.log(`[build] Ad injected`);
 }
 writeFileSync('out/index.html', html);
