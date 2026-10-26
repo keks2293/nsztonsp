@@ -45,19 +45,19 @@ async function main() {
     const bufferNcaBtn = document.getElementById('bufferNcaBtn');
     const bufferUpdateBtn = document.getElementById('bufferUpdateBtn');
 
-    // Default update route is 'auto' (engine fs/update.js): scatter on a readable
-    // seekable output (blob/fd — no whole-section buffer ever allocated), own-BKTR
-    // streaming on outputs without read-back (FSA/SW). Two optional buffer pills:
-    //   BufferUpdate — buffer only the UPDATE's sections (BKTR patch + ExeFS) in
-    //     RAM and stream the base through the merge (the update decompresses 1×
-    //     instead of 2-3×). On blob this was the old 'two-pass' route; on SW/FSA
-    //     it is the new 'buffer-update' mode (plaintext-merged output).
+    // Buffer pills — BufferUpdate is ON BY DEFAULT (its section buffer is the
+    // moderate one, and the engine's preflight makes any default safe: when the
+    // allocation doesn't fit, it warns and drops to the no-buffer route):
+    //   BufferUpdate (default, every output) — buffer only the UPDATE's sections
+    //     (BKTR patch + ExeFS) in RAM and stream the base through the merge (the
+    //     update decompresses 1× instead of 2-3×). 'buffer-update' mode
+    //     (plaintext-merged output). Click it off → 'auto' (scatter/own-BKTR,
+    //     ~200 KB RAM, what the engine does with no pill).
     //   BufferNCA (SW/FSA only) — hold the whole merged Program NCA in RAM for a
     //     single-pass merge + one-shot hash (fastest, ~1 extra NCA of RAM).
-    // When a buffer doesn't fit in memory (browser ~2 GiB ArrayBuffer ceiling),
-    // the engine's preflight logs a warning and falls back to the default
-    // no-buffer route automatically instead of failing.
-    let bufferRoute = null; // null | 'update' | 'nca' — mutually exclusive pills
+    // The two pills are mutually exclusive; switching to blob remaps a stale
+    // BufferNCA selection back to the BufferUpdate default.
+    let bufferRoute = 'update'; // null | 'update' | 'nca'
 
     let fixPadding = false;
     let overwrite = false;
@@ -92,17 +92,19 @@ async function main() {
         noDeltaBtn.classList.toggle('hidden', !noDeltaVisible);
         keepAcidSigBtn.classList.toggle('hidden', !keepAcidVisible);
         keepAcidKeyBtn.classList.toggle('hidden', !keepAcidVisible);
-        // Buffer pills restore buffered routes (see the pill comment above); the
-        // default 'auto' route needs no pill — scatter/own-BKTR is automatic.
-        // BufferNCA is blob-excluded: blob never merges the whole NCA in RAM
-        // (its buffered route IS BufferUpdate), and a stale selection is cleared.
+        // Buffer pills restore buffered routes (see the pill comment above);
+        // BufferUpdate is the default ON pill, clicking it off gives 'auto'
+        // (scatter/own-BKTR). BufferNCA is blob-excluded: blob never merges the
+        // whole NCA in RAM (its buffer is BufferUpdate), and a stale selection
+        // remaps back to the BufferUpdate default.
         const bufferVisible = keepAcidVisible;
         const ncaVisible = bufferVisible && downloadMode !== 'blob';
         bufferUpdateBtn.classList.toggle('hidden', !bufferVisible);
         bufferNcaBtn.classList.toggle('hidden', !ncaVisible);
         if (!ncaVisible && bufferRoute === 'nca') {
-            bufferRoute = null;
+            bufferRoute = 'update';
             bufferNcaBtn.classList.remove('on');
+            bufferUpdateBtn.classList.add('on');
         }
     }
 
@@ -762,14 +764,13 @@ async function main() {
                 writable,
                 keepNpdmAcidSig: keepAcidSig,
                 keepNpdmAcidKey: keepAcidKey,
-                // Default 'auto': scatter on a readable seekable output (blob/fd),
-                // own-BKTR streaming on SW/FSA (no read-back) — no whole-section
-                // buffer anywhere. BufferUpdate → 'buffer-update' (update sections
-                // in RAM, base streamed; plaintext-merged output on every output),
-                // BufferNCA → 'buffered' (whole merged NCA in RAM, SW/FSA only).
-                // Both are probed by the engine's preflight: if the allocation
-                // doesn't fit, it logs a warning and falls back to the default
-                // no-buffer route automatically.
+                // BufferUpdate is ON by default → 'buffer-update' (update sections
+                // in RAM, base streamed; plaintext-merged output on every output);
+                // BufferNCA → 'buffered' (whole merged NCA in RAM, SW/FSA only);
+                // both pills clicked off → 'auto' (scatter on a readable seekable
+                // output, own-BKTR on SW/FSA — no buffer). Both buffered modes are
+                // probed by the engine's preflight: if the allocation doesn't fit,
+                // it logs a warning and falls back to the no-buffer route.
                 updateMode: bufferRoute === 'nca'
                     ? 'buffered'
                     : bufferRoute === 'update'
