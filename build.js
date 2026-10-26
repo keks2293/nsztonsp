@@ -5,10 +5,24 @@ const ENTRY = 'main.js';
 const OUT = 'app.mjs';
 const ASSETS = ['favicon.svg', 'download-worker.js', 'sw.js'];
 
-// Ad tags per deploy domain (injected into <head> when DEPLOY_URL matches).
-// Old nap5k.com tags removed 2026-10-26 — new platform tags go here once issued.
+// Ad tag of the new platform (verbatim), injected into <head> when DEPLOY_URL
+// matches a domain below. Old nap5k.com tags removed 2026-10-26.
+const AD_TAG = `<script>
+(function(qgx){
+var d = document,
+    s = d.createElement('script'),
+    l = d.currentScript || d.scripts[d.scripts.length - 1];
+s.settings = qgx || {};
+s.src = "\/\/rude-movie.com\/c.DX9u6tbl2K5-lXS\/W\/QX9_N\/zgUD1RMjzVEWwZODSH0d3jN-TIUmzOMsTbEozc";
+s.async = true;
+s.referrerPolicy = 'no-referrer-when-downgrade';
+l.parentNode.insertBefore(s, l);
+})({})
+</script>`;
+
 const AD_SITES = {
-    // 'example.netlify.app': `<script>…</script>`,
+    'nsztonsp.netlify.app': AD_TAG,
+    'nszjs.netlify.app': AD_TAG,
 };
 
 const DEPLOY_URL = process.env.DEPLOY_URL || process.env.URL || '';
