@@ -1,11 +1,45 @@
-// Simulates the browser SW download path (sequential-only stream + gap-fill) and
-// verifies the result is byte-identical to the seekable fd output. The SW cannot
-// seek, so SWDownloader fills gaps between writes with zeros; this writer mirrors
-// that exact logic and collects the stream in order.
+// Simulates the browser SW download path (sequential-only stream + gap-fill)
+// and verifies the produced NSP is correct.
+//
+// There are TWO physically different Program NCA layouts, so byte-identity is
+// only expected WITHIN a layout, not across layouts:
+//
+//   Layout A — plain (scatter): the merged RomFS is written in virtual order
+//     as a plain IVFC section (CRYPT.NONE). Routes: fd 'auto' (scatter),
+//     'buffered', memory output, explicit 'scatter' (fd + memory). All five
+//     are byte-identical — same NCA bytes, same contentId.
+//
+//   Layout B — own-BKTR (SW two-pass, fs/bktr-pack.js): the Program NCA is
+//     self-contained — its RomFS data region is re-laid out physically (patch
+//     union intervals, then base union intervals) and carries its OWN reloc/sub
+//     BKTR tables inside the RomFS section (fs-header crypt_type = BKTR).
+//     Same data in a different byte order → different sha256 → different
+//     contentId (the id IS the hash). Layout B can therefore NEVER be
+//     byte-compared to Layout A; it is verified at the MERGE level (the same
+//     pattern as test_twopass_fsa_sim.mjs): mergeRomFS(trivialBase,
+//     producedNCA).mergedData == Layout A's RomFS data level, plus ExeFS
+//     section equality and CNMT consistency.
+//
+// The original version of this test asserted byte-identity of ALL six outputs.
+// That held until the own-BKTR writer landed (9a13281), when the SW route
+// legitimately diverged; the fix for that commit was missed and landed here.
+//
+// Run: node scripts/test_update_sw_sim.mjs
 import fs from 'fs';
 import crypto from 'node:crypto';
 import { KeysParser } from '../keys.js';
 import { update } from '../fs/update.js';
+import { PFS0 } from '../fs/pfs0.js';
+import { openContainer } from '../fs/container.js';
+import { decryptNcaHeader, parseCnmtFromRawNca } from '../fs/nca.js';
+import { BufferRangeSource } from '../fs/range-source.js';
+import {
+    decryptNcaHeaderBytes, fsHeaderAt, SECTION_FS_TYPE,
+    FS_HDR, IVFC_LEVELS_OFFSET, IVFC_MAX_LEVEL, IVFC_LEVEL_HDR,
+} from '../fs/nca-utils.js';
+import { mergeRomFS } from '../fs/bktr-merge.js';
+import { CNMT_ENTRY_TYPE } from '../fs/cnmt.js';
+import { readLeU64 } from '../fs/bytes.js';
 
 class FileReader {
   constructor(path) { this.path = path; this.fd = fs.openSync(path, 'r'); this.size = fs.statSync(path).size; }
@@ -41,11 +75,11 @@ const logs = [];
 const log = (level, msg) => { logs.push(msg); };
 // Prove the lockstep base path is ACTUALLY taken per mode (not silently falling
 // back to registerRange + read). markMode(label) opens a fresh log window;
-// lockstepModes records whether 'Base lockstep' was logged in it.
+// modeLogs records the per-mode window content for the route-specific checks.
 let windowStart = 0;
-const lockstepModes = {};
-const markMode = (label) => { windowStart = logs.length; lockstepModes[label] = false; };
-const markLockstep = (label) => { lockstepModes[label] = logs.slice(windowStart).some(m => /Base lockstep/.test(m)); };
+const modeWindows = {};
+const markMode = (label) => { windowStart = logs.length; };
+const markWindow = (label) => { modeWindows[label] = logs.slice(windowStart); windowStart = logs.length; };
 
 // FORCE_JS=1 runs the exact browser SHA-256 path (pure-JS streaming class);
 // default runs the native node:crypto streaming backend. Both must MATCH.
@@ -55,106 +89,241 @@ if (process.env.FORCE_JS) {
   console.log('forcing pure-JS streaming SHA256 (browser path)');
 }
 
-const baseReader = { name: 'base.nsp', reader: new FileReader(basePath) };
-const updateReader = { name: 'update.nsz', reader: new FileReader(updatePath) };
+const sha256 = (u8) => crypto.createHash('sha256').update(u8).digest('hex');
+const check = (ok, what, detail = '') => {
+  if (!ok) { console.log(`  FAIL ${what}${detail ? ' — ' + detail : ''}`); process.exitCode = 1; }
+  else console.log(`  ok   ${what}`);
+};
 
-// Reference: seekable fd output (known-good)
+// Base Program NCA header (for the merge-level check of the SW route).
+const baseHdrReader = new FileReader(basePath);
+const baseC = await openContainer({ reader: baseHdrReader, name: 'base' });
+const baseProgEntry = baseC.entries
+  .filter(e => /\.ncz$/i.test(e.name) && !/\.cnmt\.ncz$/i.test(e.name))
+  .sort((a, b) => b.size - a.size)[0];
+const baseHeaderRaw = await baseHdrReader.read(baseProgEntry.offset, Math.min(baseProgEntry.size, 0xC00));
+baseHdrReader.close();
+
+// Reference: seekable fd output, 'auto' → scatter route (Layout A).
 const refPath = '/tmp/update_sw_sim_ref.nsp';
 const refFd = fs.openSync(refPath, 'w+');
 markMode('ref');
-await update([baseReader, updateReader], { fd: refFd }, { keys, log, progress, bktrMerge: true });
-markLockstep('ref');
+await update(
+  [{ name: 'base.nsp', reader: new FileReader(basePath) }, { name: 'update.nsz', reader: new FileReader(updatePath) }],
+  { fd: refFd }, { keys, log, progress, bktrMerge: true });
+markWindow('ref');
 fs.closeSync(refFd);
-baseReader.reader.close(); updateReader.reader.close();
 const ref = new Uint8Array(fs.readFileSync(refPath));
 
-// SW-simulated: sequential writer with gap-fill
-const base2 = { name: 'base.nsp', reader: new FileReader(basePath) };
-const update2 = { name: 'update.nsz', reader: new FileReader(updatePath) };
+// SW-simulated: sequential writer with gap-fill (append-only → two-pass
+// own-BKTR route, Layout B).
 const sw = new SequentialWriter();
 markMode('sim');
-const result = await update([base2, update2], { writable: sw }, { keys, log, progress, bktrMerge: true });
-markLockstep('sim');
-base2.reader.close(); update2.reader.close();
+const result = await update(
+  [{ name: 'base.nsp', reader: new FileReader(basePath) }, { name: 'update.nsz', reader: new FileReader(updatePath) }],
+  { writable: sw }, { keys, log, progress, bktrMerge: true });
+markWindow('sim');
 const sim = sw.build();
 
-// Buffered mode (the browser "Buffer" pill): merged RomFS fully in memory
-const base3 = { name: 'base.nsp', reader: new FileReader(basePath) };
-const update3 = { name: 'update.nsz', reader: new FileReader(updatePath) };
+// Buffered mode (the browser "Buffer" pill): merged RomFS fully in memory.
 const bufPath = '/tmp/update_sw_sim_buffered.nsp';
 const bufFd = fs.openSync(bufPath, 'w+');
 markMode('buffered');
-await update([base3, update3], { fd: bufFd }, { keys, log, progress, bktrMerge: true, updateMode: 'buffered' });
-markLockstep('buffered');
+await update(
+  [{ name: 'base.nsp', reader: new FileReader(basePath) }, { name: 'update.nsz', reader: new FileReader(updatePath) }],
+  { fd: bufFd }, { keys, log, progress, bktrMerge: true, updateMode: 'buffered' });
+markWindow('buffered');
 fs.closeSync(bufFd);
-base3.reader.close(); update3.reader.close();
 const buf = new Uint8Array(fs.readFileSync(bufPath));
 
-const refSha = crypto.createHash('sha256').update(ref).digest('hex');
-const simSha = crypto.createHash('sha256').update(sim).digest('hex');
-const bufSha = crypto.createHash('sha256').update(buf).digest('hex');
-console.log('ref (fd, seekback) :', ref.length, 'sha256=' + refSha);
-console.log('sim (sw, two-pass) :', sim.length, 'sha256=' + simSha);
-console.log('buffered (fd)      :', buf.length, 'sha256=' + bufSha);
-console.log('result.size        :', result.size);
-
-// In-memory output with read-back: the new memory read() in buildRead() unlocks
-// the streaming single-decompression path for memory outputs (browser) — must
-// stay byte-identical to fd.
-const base4 = { name: 'base.nsp', reader: new FileReader(basePath) };
-const update4 = { name: 'update.nsz', reader: new FileReader(updatePath) };
+// In-memory output with read-back: the streaming scatter route (Layout A).
 const memOut = { memory: true };
 markMode('memory');
-const mem = await update([base4, update4], memOut, { keys, log, progress, bktrMerge: true });
-markLockstep('memory');
-base4.reader.close(); update4.reader.close();
+const mem = await update(
+  [{ name: 'base.nsp', reader: new FileReader(basePath) }, { name: 'update.nsz', reader: new FileReader(updatePath) }],
+  memOut, { keys, log, progress, bktrMerge: true });
+markWindow('memory');
 const memBuf = new Uint8Array(await mem.blob.arrayBuffer());
-const memSha = crypto.createHash('sha256').update(memBuf).digest('hex');
-console.log('memory (streaming) :', memBuf.length, 'sha256=' + memSha);
 
-// Scatter mode: fd output (seekable), updateMode='scatter' — wins the update
-// once per use (tables U1 + patches U2), writes the merged RomFS out of virtual
-// order, and re-reads the written NCA for the IVFC hash + contentId.
-const base5 = { name: 'base.nsp', reader: new FileReader(basePath) };
-const update5 = { name: 'update.nsz', reader: new FileReader(updatePath) };
+// Scatter mode: fd output (seekable), updateMode='scatter' (Layout A).
 const scatterPath = '/tmp/update_sw_sim_scatter.nsp';
 const scatterFd = fs.openSync(scatterPath, 'w+');
 markMode('scatter');
-await update([base5, update5], { fd: scatterFd }, { keys, log, progress, bktrMerge: true, updateMode: 'scatter' });
-markLockstep('scatter');
+await update(
+  [{ name: 'base.nsp', reader: new FileReader(basePath) }, { name: 'update.nsz', reader: new FileReader(updatePath) }],
+  { fd: scatterFd }, { keys, log, progress, bktrMerge: true, updateMode: 'scatter' });
+markWindow('scatter');
 fs.closeSync(scatterFd);
-base5.reader.close(); update5.reader.close();
 const scatter = new Uint8Array(fs.readFileSync(scatterPath));
-const scatterSha = crypto.createHash('sha256').update(scatter).digest('hex');
-console.log('scatter (fd)       :', scatter.length, 'sha256=' + scatterSha);
 
-// Scatter on a memory (blob) output — the browser in-memory path. buildRead()
-// returns a working reader for memory (adapter.js), so scatter runs WITHOUT the
-// merged-buffer, hashing the merged RomFS + contentId by re-reading the written
-// chunks. Must be byte-identical to the fd scatter above.
-const base8 = { name: 'base.nsp', reader: new FileReader(basePath) };
-const update8 = { name: 'update.nsz', reader: new FileReader(updatePath) };
-const memScatterOut = { memory: true };
+// Scatter on a memory (blob) output (Layout A).
 markMode('scatter-memory');
-const memScatter = await update([base8, update8], memScatterOut, { keys, log, progress, bktrMerge: true, updateMode: 'scatter' });
-markLockstep('scatter-memory');
-base8.reader.close(); update8.reader.close();
+const memScatter = await update(
+  [{ name: 'base.nsp', reader: new FileReader(basePath) }, { name: 'update.nsz', reader: new FileReader(updatePath) }],
+  { memory: true }, { keys, log, progress, bktrMerge: true, updateMode: 'scatter' });
+markWindow('scatter-memory');
 const memScatterBuf = new Uint8Array(await memScatter.blob.arrayBuffer());
-const memScatterSha = crypto.createHash('sha256').update(memScatterBuf).digest('hex');
-console.log('scatter (memory)    :', memScatterBuf.length, 'sha256=' + memScatterSha);
 
-const tally = [refSha, simSha, bufSha, memSha, scatterSha, memScatterSha];
-const lens = [ref.length, sim.length, buf.length, memBuf.length, scatter.length, memScatterBuf.length];
-console.log('lockstep base path taken: ' +
-  Object.entries(lockstepModes).map(([k, v]) => `${k}=${v ? 'yes' : 'NO'}`).join('  '));
+console.log(`\n=== RESULT (SW sim) ===`);
+console.log('ref (fd, scatter)    :', ref.length, 'sha256=' + sha256(ref));
+console.log('sim (sw, own-BKTR)   :', sim.length, 'sha256=' + sha256(sim));
+console.log('buffered (fd)        :', buf.length, 'sha256=' + sha256(buf));
+console.log('memory (streaming)   :', memBuf.length, 'sha256=' + sha256(memBuf));
+console.log('scatter (fd)         :', scatter.length, 'sha256=' + sha256(scatter));
+console.log('scatter (memory)     :', memScatterBuf.length, 'sha256=' + sha256(memScatterBuf));
+console.log('result.size          :', result.size);
 
-const allLockstep = Object.values(lockstepModes).every(Boolean);
-if (tally.every(s => s === refSha) && lens.every(n => n === ref.length) && allLockstep) {
-  console.log('MATCH — seekback ≡ two-pass ≡ buffered ≡ memory ≡ scatter(fd) ≡ scatter(memory), all byte-identical (lockstep base exercised in every mode)');
-} else {
-  console.log(tally.every(s => s === refSha) && lens.every(n => n === ref.length) ? 'MISMATCH (lockstep not taken in all modes)' : 'MISMATCH (bytes)');
-  let i = 0; const n = Math.min(...lens);
-  while (i < n && ref[i] === sim[i]) i++;
-  console.log('first diff ref/sim at', i, '0x' + i.toString(16), 'len ref=' + lens.join(' '));
+// ── Group A: same-layout (plain scatter) routes — byte-identical ────────────
+{
+  const groupA = [
+    ['ref (fd auto)', 'ref', ref], ['buffered (fd)', 'buffered', buf],
+    ['memory (streaming)', 'memory', memBuf], ['scatter (fd)', 'scatter', scatter],
+    ['scatter (memory)', 'scatter-memory', memScatterBuf],
+  ];
+  const refSha = sha256(ref);
+  for (const [label, , out] of groupA) {
+    check(out.length === ref.length && sha256(out) === refSha,
+      `${label}: byte-identical to ref`, `${out.length} vs ${ref.length}`);
+  }
+  for (const [label, key] of groupA) {
+    check(modeWindows[key].some(m => /Base lockstep/.test(m)),
+      `${label}: Base lockstep path taken`,
+      modeWindows[key].filter(m => /lockstep/i.test(m)).join(' | ').slice(0, 200));
+  }
+}
+
+// ── Group B: sim (SW two-pass own-BKTR) — merge-level equivalence ───────────
+{
+  console.log('\n=== SW own-BKTR route (Layout B) — merge-level checks ===');
+
+  // Route sanity: the append-only output took the own-BKTR two-pass writer.
+  check(modeWindows['sim'].some(m => /Two-pass own-BKTR/.test(m)),
+    'sim: own-BKTR two-pass route taken');
+
+  // PFS0.getFiles() returns ABSOLUTE offsets (relative + headerSize); the PFS0
+  // header sits at file offset 0 in both files, so tails are 0.
+  const refPfs = new PFS0(ref), simPfs = new PFS0(sim);
+  const refEntries = refPfs.getFiles();
+  const simEntries = simPfs.getFiles();
+  check(simPfs.headerSize === refPfs.headerSize,
+    `sim: PFS0 header size matches ref — ${simPfs.headerSize} vs ${refPfs.headerSize}`);
+  check(simEntries.length === refEntries.length && simEntries.length === 4,
+    `sim: PFS0 member count — ${simEntries.length} vs ${refEntries.length}`);
+
+  const pickProg = (es) => es.filter(e => /\.nca$/i.test(e.name) && !/\.cnmt\.nca$/i.test(e.name))
+    .sort((a, b) => b.size - a.size)[0];
+  const pickCnmt = (es) => es.find(e => /\.cnmt\.nca$/i.test(e.name));
+  const refProg = pickProg(refEntries), simProg = pickProg(simEntries);
+  const refCnmtE = pickCnmt(refEntries), simCnmtE = pickCnmt(simEntries);
+  const refOthers = refEntries.filter(e => e !== refProg && e !== refCnmtE);
+  const simOthers = simEntries.filter(e => e !== simProg && e !== simCnmtE);
+
+  // contentId self-consistency: the PFS0 name IS the sha256 prefix of the
+  // written NCA (Pass-1 contentId == Pass-2 bytes).
+  const simProgNca = sim.subarray(simProg.offset, simProg.offset + simProg.size);
+  const simSha = sha256(simProgNca);
+  check(simProg.name.toLowerCase().startsWith(simSha.slice(0, 32)),
+    'sim: program name embeds sha256(written NCA)', `${simProg.name.slice(0, 32)} vs ${simSha.slice(0, 32)}`);
+  check(result.size === sim.length, `sim: result.size ${result.size} === file ${sim.length}`);
+
+  // PFS0 layout: same members as ref (same names/sizes, program excluded),
+  // contiguous from offset 0, file ends at the last member.
+  check(simOthers.length === refOthers.length &&
+        simOthers.every((e, i) => e.name === refOthers[i].name && e.size === refOthers[i].size),
+    'sim: non-program members match ref (names + sizes)',
+    simOthers.map(e => e.name).join(', '));
+  check(simCnmtE.size === refCnmtE.size,
+    `sim: CNMT size matches ref — ${simCnmtE.size} vs ${refCnmtE.size}`);
+  // PFS0 layout: the program is `delta` bytes larger (its own BKTR tables in
+  // the RomFS section), so every later member is shifted by delta; the
+  // container's inherited gaps (dropped delta fragments leave holes) are
+  // preserved from the input layout, so contiguity is NOT expected.
+  const delta = simProg.size - refProg.size;
+  check(delta > 0, `sim: program NCA larger than ref (own BKTR tables) — +${delta}`,
+    `${simProg.size} vs ${refProg.size}`);
+  let layoutOk = simProg.offset === refProg.offset; // both right after the header
+  for (let i = 1; i < simEntries.length; i++)
+    layoutOk = layoutOk && simEntries[i].offset - delta === refEntries[i].offset;
+  const endOf = (es) => { const l = es[es.length - 1]; return l.offset + l.size; };
+  check(layoutOk, 'sim: PFS0 layout = ref layout shifted by the program delta (gaps preserved)',
+    simEntries.map((e, i) => `${e.name.slice(0, 8)}@${(e.offset - (i ? delta : 0)).toString(16)}`).join(' '));
+  check(endOf(refEntries) === ref.length && endOf(simEntries) === sim.length,
+    'sim: file ends right after the last member (header at offset 0)',
+    `sim end ${endOf(simEntries)} vs ${sim.length}; ref end ${endOf(refEntries)} vs ${ref.length}`);
+
+  // Non-program NCAs are copied verbatim — byte-identical to ref's.
+  for (const re of refOthers) {
+    const se = simEntries.find(e => e.name === re.name);
+    if (!se) { check(false, `sim: missing member ${re.name}`); continue; }
+    check(sha256(sim.subarray(se.offset, se.offset + se.size)) === sha256(ref.subarray(re.offset, re.offset + re.size)),
+      `sim: ${re.name} byte-identical to ref`);
+  }
+
+  // Program NCA sections: ExeFS is plaintext in both layouts (CRYPT.NONE) and
+  // is the same update ExeFS — the whole section must be byte-identical.
+  const refProgNca = ref.subarray(refProg.offset, refProg.offset + refProg.size);
+  const refHdr = decryptNcaHeader(refProgNca.subarray(0, 0xC00), keys);
+  const simHdr = decryptNcaHeader(simProgNca.subarray(0, 0xC00), keys);
+  const refExe = refHdr.sections.find(s => s.fsType === SECTION_FS_TYPE.PFS0);
+  const simExe = simHdr.sections.find(s => s.fsType === SECTION_FS_TYPE.PFS0);
+  check(refExe && simExe && refExe.size === simExe.size &&
+        sha256(refProgNca.subarray(refExe.offset, refExe.offset + refExe.size)) ===
+        sha256(simProgNca.subarray(simExe.offset, simExe.offset + simExe.size)),
+    'sim: ExeFS section byte-identical to ref',
+    refExe && simExe ? `${refExe.size} vs ${simExe.size}` : 'missing section');
+
+  // RomFS: ref's is the plain (virtual-order) merged data; sim's is own-BKTR
+  // (physical order + own tables). Resolve sim's via mergeRomFS with a trivial
+  // base (all its reloc entries are isPatch=1, so the base is never read) and
+  // compare against ref's IVFC data level.
+  const refRomSec = refHdr.sections.find(s => s.fsType === SECTION_FS_TYPE.ROMFS);
+  const refFh = fsHeaderAt(decryptNcaHeaderBytes(refProgNca.subarray(0, 0xC00), keys), refHdr.sections.indexOf(refRomSec));
+  const lvlBase = IVFC_LEVELS_OFFSET + FS_HDR.HASH_DATA;
+  const lvl = (IVFC_MAX_LEVEL - 1) * IVFC_LEVEL_HDR.SIZE;
+  const dataLevelOffset = Number(readLeU64(refFh, lvlBase + lvl + IVFC_LEVEL_HDR.LOGICAL_OFFSET));
+  const dataLevelSize = Number(readLeU64(refFh, lvlBase + lvl + IVFC_LEVEL_HDR.HASH_DATA_SIZE));
+  const refRomfs = refProgNca.subarray(refRomSec.offset + dataLevelOffset, refRomSec.offset + dataLevelOffset + dataLevelSize);
+
+  const simMerged = await mergeRomFS(
+    { headerRaw: baseHeaderRaw, source: { read: async () => new Uint8Array(0) } },
+    { headerRaw: simProgNca.subarray(0, 0xC00), source: BufferRangeSource(simProgNca) },
+    { keys, log },
+  );
+  check(simMerged.dataLevelSize === dataLevelSize,
+    `sim: merged RomFS size — ${simMerged.dataLevelSize} vs ${dataLevelSize}`);
+  check(sha256(simMerged.mergedData) === sha256(refRomfs),
+    `sim: merged RomFS byte-identical to ref's (same data, different order)`,
+    sha256(simMerged.mergedData).slice(0, 16) + ' vs ' + sha256(refRomfs).slice(0, 16));
+
+  // CNMT: same structure; the only differences may be the program entry's
+  // hash (= contentId) and size.
+  const refCnmt = (await parseCnmtFromRawNca(ref.subarray(refCnmtE.offset, refCnmtE.offset + refCnmtE.size), keys)).cnmt;
+  const simCnmt = (await parseCnmtFromRawNca(sim.subarray(simCnmtE.offset, simCnmtE.offset + simCnmtE.size), keys)).cnmt;
+  check(refCnmt.titleId === simCnmt.titleId && refCnmt.contentEntryCount === simCnmt.contentEntryCount &&
+        refCnmt.metaEntryCount === simCnmt.metaEntryCount,
+    'sim: CNMT titleId + entry counts match ref');
+  // CNMT_ENTRY_TYPE.PROGRAM = 1 (switchbrew PackagedContentInfo; verified
+  // against hacPack cnmt.c) — not 0.
+  const refP = refCnmt.contentEntries.find(e => e.type === CNMT_ENTRY_TYPE.PROGRAM);
+  const simP = simCnmt.contentEntries.find(e => e.type === CNMT_ENTRY_TYPE.PROGRAM);
+  const otherRef = refCnmt.contentEntries.filter(e => e.type !== CNMT_ENTRY_TYPE.PROGRAM);
+  const otherSim = simCnmt.contentEntries.filter(e => e.type !== CNMT_ENTRY_TYPE.PROGRAM);
+  check(otherRef.length === otherSim.length &&
+        otherRef.every((e, i) => e.hash === otherSim[i].hash && e.size === otherSim[i].size),
+    'sim: CNMT non-program entries identical to ref');
+  check(!!refP && !!simP &&
+        simP.hash === simSha && simP.size === simProg.size &&
+        refP.hash === sha256(refProgNca) && refP.size === refProg.size,
+    'sim: CNMT program entry = (sha256(program NCA), program size) in each layout');
+  check(refCnmt.metaEntries.length === simCnmt.metaEntries.length &&
+        refCnmt.metaEntries.every((e, i) =>
+          e.titleId === simCnmt.metaEntries[i].titleId && e.version === simCnmt.metaEntries[i].version &&
+          e.type === simCnmt.metaEntries[i].type && e.install === simCnmt.metaEntries[i].install),
+    'sim: CNMT meta entries identical to ref');
+}
+
+if (process.exitCode === 1) {
+  console.log('\nMISMATCH — see FAIL lines above');
   process.exit(1);
 }
+console.log('\nMATCH — plain-layout routes byte-identical; SW own-BKTR route: contentId self-consistent, merged RomFS ≡ ref RomFS, ExeFS ≡, CNMT consistent.');
