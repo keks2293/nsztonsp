@@ -1,14 +1,30 @@
 import { AesCtr, aesBackend } from '../crypto/aes-ops.mjs';
 import { decompressBlock, decompressStream } from '../crypto/zstd.js';
 import { readLeU64, readLeU32, CHUNK_16MB } from './bytes.js';
-const UNCOMPRESSABLE_HEADER_SIZE = 0x4000;
+// The first 0x4000 bytes of an .ncz are the raw (still encrypted) NCA header,
+// verbatim — shared with the compressor (fs/compress.js).
+export const UNCOMPRESSABLE_HEADER_SIZE = 0x4000;
 const SECTION_CHUNK_SIZE = CHUNK_16MB; // 16MB
 
 // NCZ container crypto_type (python nsz `Type.Crypto`), as stored in the
 // .ncz section tables. DIFFERENT from the NCA-header enum (SECTION_CRYPTO_TYPE
 // in nca-utils.js): here 1 = NONE/plaintext (FakeSection gap / unencrypted
-// ExeFS), 2 = XTS, 3 = CTR, 4 = BKTR.
-const NCZ_CRYPTO_TYPE = { NONE: 1, XTS: 2, CTR: 3, BKTR: 4 };
+// ExeFS), 2 = XTS, 3 = CTR, 4 = BKTR. Shared with the compressor
+// (fs/compress.js buildSectnTable).
+export const NCZ_CRYPTO_TYPE = { NONE: 1, XTS: 2, CTR: 3, BKTR: 4 };
+
+// NCZSECTN entry — 64 bytes: offset u64, size u64, crypto_type u64,
+// 8B reserved, crypto_key 16B, crypto_counter 16B. One declaration of the
+// layout for both sides: written by fs/compress.js (buildSectnTable), read
+// here (NCZSection).
+export const NCZ_SECTN_ENTRY = {
+    ENTRY_SIZE: 64,
+    OFFSET: 0,
+    SIZE: 8,
+    CRYPTO_TYPE: 16,
+    KEY: 32,
+    COUNTER: 48,
+};
 
 function allocByte(n) {
     return new Uint8Array(n);
@@ -68,11 +84,12 @@ class BufferReader extends DataReader {
 
 class NCZSection {
     constructor(data, offset) {
-        this.offset = readLeU64(data, offset);
-        this.size = readLeU64(data, offset + 8);
-        this.cryptoType = readLeU64(data, offset + 16);
-        this.cryptoKey = sliceBytes(data, offset + 32, offset + 48);
-        this.cryptoCounter = sliceBytes(data, offset + 48, offset + 64);
+        const E = NCZ_SECTN_ENTRY;
+        this.offset = readLeU64(data, offset + E.OFFSET);
+        this.size = readLeU64(data, offset + E.SIZE);
+        this.cryptoType = readLeU64(data, offset + E.CRYPTO_TYPE);
+        this.cryptoKey = sliceBytes(data, offset + E.KEY, offset + E.KEY + 16);
+        this.cryptoCounter = sliceBytes(data, offset + E.COUNTER, offset + E.COUNTER + 16);
     }
 }
 
@@ -132,9 +149,9 @@ async function parseNczSections(reader) {
 
     const sections = [];
     for (let i = 0; i < sectionCount; i++) {
-        const sectionData = await reader.read(offset, 64);
+        const sectionData = await reader.read(offset, NCZ_SECTN_ENTRY.ENTRY_SIZE);
         sections.push(new NCZSection(sectionData, 0));
-        offset += 64;
+        offset += NCZ_SECTN_ENTRY.ENTRY_SIZE;
     }
 
     if (sections[0].offset - UNCOMPRESSABLE_HEADER_SIZE > 0) {

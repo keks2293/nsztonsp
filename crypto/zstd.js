@@ -356,9 +356,20 @@ function nodeZlib() {
     return nodeZlibPromise;
 }
 
-async function compressNode(data, level) {
+// node:zlib zstd params. Keys MUST be the numeric ZSTD_c_* constants (string
+// names are rejected: "X is not a valid zstd parameter"). Long mode (python
+// nsz -L) = libzstd's defaults for the level + LDM enabled — python-zstandard
+// from_level(level, enable_ldm=True) leaves the ldm sub-parameters default.
+async function zstdCompressParams(level, ldm) {
     const zlib = await nodeZlib();
-    return new Uint8Array(zlib.zstdCompressSync(data, { params: { [zlib.constants.ZSTD_c_compressionLevel]: level } }));
+    const params = { [zlib.constants.ZSTD_c_compressionLevel]: level };
+    if (ldm) params[zlib.constants.ZSTD_c_enableLongDistanceMatching] = 1;
+    return params;
+}
+
+async function compressNode(data, level, ldm = false) {
+    const zlib = await nodeZlib();
+    return new Uint8Array(zlib.zstdCompressSync(data, { params: await zstdCompressParams(level, ldm) }));
 }
 
 async function decompressNode(data) {
@@ -382,8 +393,16 @@ export function setZstdStreamForcedWasm(v = false) { forceWasm = v; }
 // Compress one chunk into a self-contained zstd frame (NCZ block / payload).
 // Node uses in-process node:zlib; browser (and forced-WASM) uses the
 // tootallnate WASM encoder.
-export async function compressBlock(data, level = 18) {
-    if (isNode && !forceWasm) return compressNode(data, level);
+// ldm (long-distance matching, python nsz -L) needs the node:zlib parameter
+// API — the tootallnate wasm exposes no compressor parameters, so it is
+// CLI-only.
+// Whether a chunk is stored raw (incompressible) vs compressed is
+// container-level knowledge kept in fs/compress.js, not here.
+export async function compressBlock(data, level = 18, ldm = false) {
+    if (ldm && !isNode) {
+        throw new Error('zstd long mode (LDM) is CLI-only: the browser wasm build has no compressor parameters');
+    }
+    if (isNode && !forceWasm) return compressNode(data, level, ldm);
     const $ = await loadWasm();
     return compressWith($, data, level);
 }
@@ -453,6 +472,134 @@ async function* decompressNodeStream(readChunk) {
         if (!decompressor.destroyed) decompressor.destroy();
         await feed.catch(() => {});
     }
+}
+
+// Node-only STREAMING zstd compressor for SOLID NCZ (python nsz -S /
+// SolidCompressor): one frame over the whole NCA payload, fed in chunks.
+// The tootallnate wasm does have a streaming compressor (ZSTD_compressStream2
+// via compress_stream, driven by this facade) — but solid mode is not wired
+// into the browser path yet (only the CLI uses it), so it stays CLI-only.
+//
+// Usage:
+//   const comp = await createSolidCompressor({ level, ldm });
+//   const pump = (async () => { for await (const c of comp) await out(c); })();
+//   await comp.write(plainChunk);  // backpressured (bounded queue)
+//   comp.finish();                 // no more input
+//   await pump;                    // resolves when the frame is fully flushed
+// On error: comp.abort() to tear the compressor down, then rethrow.
+// Buffers are COPIED on write() — the caller may reuse its own buffers.
+//
+// The producer (write) and the compressor's readable side are decoupled by a
+// bounded queue (QUEUE_MAX chunks, 16 MiB each by convention): the feed loop
+// shifts chunks into createZstdCompress with drain backpressure, exactly the
+// pump model of decompressNodeStream — so peak memory is O(window + queue),
+// never the whole payload.
+export async function createSolidCompressor({ level = 18, ldm = false } = {}) {
+    if (!isNode) {
+        throw new Error('Solid compression is CLI-only (node:zlib streaming zstd): solid mode is not wired into the browser path yet');
+    }
+    const zlib = await nodeZlib();
+    const compressor = zlib.createZstdCompress({ highWaterMark: 1 << 20, params: await zstdCompressParams(level, ldm) });
+
+    const QUEUE_MAX = 8;
+    const queue = [];
+    let spaceWaiters = [];   // write() callers waiting for queue space
+    let itemWaiters = [];    // feed loop waiting for the next chunk / end
+    let inputEnded = false;
+    let aborted = false;
+    let feedError = null;
+
+    const wake = () => {
+        spaceWaiters.splice(0).forEach((r) => r());
+        itemWaiters.splice(0).forEach((r) => r());
+    };
+
+    const write = async (chunk) => {
+        if (aborted) throw new Error('zstd solid compressor: aborted');
+        if (!chunk || !chunk.byteLength) return;
+        while (queue.length >= QUEUE_MAX) {
+            await new Promise((resolve) => {
+                if (aborted) return resolve();
+                spaceWaiters.push(resolve);
+            });
+            if (aborted) throw new Error('zstd solid compressor: aborted');
+        }
+        queue.push(new Uint8Array(chunk)); // copy — the caller may reuse its buffer
+        wake();
+    };
+
+    const finish = () => { inputEnded = true; wake(); };
+
+    const abort = () => {
+        if (aborted) return;
+        aborted = true;
+        queue.length = 0;
+        wake();
+        if (!compressor.destroyed) compressor.destroy();
+    };
+
+    async function* pump() {
+        const outIt = compressor[Symbol.asyncIterator]();
+        // 'drain' wait must also resolve when the stream is destroyed or
+        // errors out, otherwise the feed deadlocks on backpressure.
+        const waitDrain = () => new Promise((resolve, reject) => {
+            if (aborted) return resolve();
+            const onDrain = () => { cleanup(); resolve(); };
+            const onError = (e) => { cleanup(); reject(e); };
+            const onClose = () => { cleanup(); resolve(); };
+            const cleanup = () => {
+                compressor.removeListener('drain', onDrain);
+                compressor.removeListener('error', onError);
+                compressor.removeListener('close', onClose);
+            };
+            compressor.once('drain', onDrain);
+            compressor.once('error', onError);
+            compressor.once('close', onClose);
+        });
+        const feed = (async () => {
+            try {
+                for (;;) {
+                    if (aborted) return;
+                    if (queue.length > 0) {
+                        const chunk = queue.shift();
+                        wake(); // queue space freed
+                        if (!compressor.write(chunk)) {
+                            await waitDrain();
+                            if (aborted) return;
+                        }
+                        continue;
+                    }
+                    if (inputEnded) { compressor.end(); return; }
+                    await new Promise((resolve) => {
+                        if (aborted) return resolve();
+                        itemWaiters.push(resolve);
+                    });
+                }
+            } catch (e) {
+                feedError = e;
+                if (!compressor.destroyed) compressor.destroy(e);
+            }
+        })();
+        try {
+            for (;;) {
+                const { value, done } = await outIt.next();
+                if (done) break;
+                if (value && value.byteLength) {
+                    yield new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+                }
+            }
+            await feed;
+            if (feedError) throw feedError;
+        } finally {
+            aborted = true;
+            queue.length = 0;
+            wake();
+            if (!compressor.destroyed) compressor.destroy();
+            await feed.catch(() => {});
+        }
+    }
+
+    return { write, finish, abort, [Symbol.asyncIterator]: pump };
 }
 
 // Stream-decompress lazily from an async readChunk() source, yielding

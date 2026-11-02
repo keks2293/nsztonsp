@@ -222,12 +222,17 @@ Offset  Size  Description
 
 ## 6. Crypto Types
 
+The numbering is Python nsz's `Type.Crypto` enum (`nsz/Type.py`), which is the same as the raw crypto byte in the NCA's inner fs-headers (`FsHeader + 0x04`). ⚠️ This is **NOT** the `SECTION_CRYPTO_TYPE` enum in `nca-utils.js` (that one is a different numbering and must not be used for this byte).
+
 | cryptoType | Description | Applied? |
 |------------|-------------|----------|
-| 1 | Plaintext (no encryption) | No |
-| 2 | ? | No |
-| 3 | AES-CTR with section key/IV | Yes |
-| 4 | AES-CTR with section key/IV | Yes |
+| 0 | ERR (invalid) | No |
+| 1 | NONE — plaintext | No |
+| 2 | XTS (AES-XTS, NCA-level encryption) | No (NCZ sections are never XTS — XTS NCAs are copied, not compressed) |
+| 3 | CTR — AES-CTR with section key/IV | Yes |
+| 4 | BKTR — AES-CTR with per-subsection counters (sub-entries + tail) | Yes |
+
+**BKTR section layout:** a BKTR NCA section is split into subsections (each with its own `ctrVal` from the NCA's BKTR header) plus a plaintext tail; the section table stores every subsection as a **CTR (3) entry** whose counter head is `[secureValue 4B BE][subEntry.ctrVal 4B BE]`, and the tail as an entry with the reversed section counter as its head (see section 12).
 
 **AES-CTR implementation (`aes128.AESCTR`):**
 ```python
@@ -407,8 +412,137 @@ if hexHash[:32] == fileNameHash:
 | Per-section zstd read | `0x10000` (64KB) | `0x100000` (1MB) | nsz-js 16x larger — fewer write() syscalls, native AES is fast enough |
 | Container non-compressed copy | `0x100000` (1MB) | full `file.slice().arrayBuffer()` | nsz-js reads whole file; fine for small CNMT/ticket files |
 | NCZBLOCK compression | `0x100000` (1MB) | `0x100000` (1MB) | ✅ match |
-| Solid compression | `0x1000000` (16MB) | n/a (no compress) | Not applicable — nsz-js doesn't compress |
+| Solid compression | `0x1000000` (16MB) | n/a | Not implemented — nsz-js compresses via NCZBLOCK only (see section 12), no solid mode |
 | PFS0/HFS0 page flush | `0x100000` (1MB) | `0x10000` (64KB, header reads) | nsz-js only reads headers, no page flush |
 | XCI extract to dir copy | `0x10000` (64KB) | n/a | Buffer for extracting XCI files to disk, not compression |
 | Compressed data read chunk | n/a (Python no ArrayBuffer limit) | `0x1000000` (16MB) | nsz-js avoids 2GB ArrayBuffer limit |
 | Block compressor | `0x100000` (1MB) | `0x100000` (1MB) | ✅ match |
+
+---
+
+## 12. Compression Pipeline (NSP→NSZ / XCI→XCZ, `fs/compress.js`)
+
+`compressNSPtoNSZ` / `compressXCItoXCZ` rebuild a container byte-for-byte the way
+Python nsz v5 does: eligible NCAs become NCZ, everything else is copied, and the
+container headers (PFS0 / root HFS0 + partition HFS0s) are written **last**,
+seeking back, once all member sizes are known (no zero placeholders anywhere).
+
+### Skip rules (mirror python `BlockCompressor`; `analyzeNca`)
+
+An NCA is compressed only if ALL hold:
+
+- content type is PROGRAM(0) or PUBLIC_DATA(5) (the header is parsed for every
+  NCA — the type drives container-level filters regardless of compressibility);
+- size > 0x4000 (the uncompressible raw header);
+- "packed" per python `isNcaPacked`: the fs sections (fsType ≠ NONE) are
+  contiguous from the first section offset to exactly the NCA end;
+- no XTS section (raw crypto byte 2 — the NCZ round-trip cannot re-encrypt XTS);
+- a titlekey is resolvable (see below).
+
+Everything else (non-`.nca` members, small NCAs, META/CONTROL/MANUAL/DATA,
+undecryptable headers, non-packed NCAs) is copied verbatim with a `[SKIP]` log.
+Delta fragments (DATA NCAs) are **dropped** unless `keep` (python default;
+`--keep` retains them for bit-identical output).
+
+### Compression options (python nsz parity; `normalizeCompressOptions`)
+
+| Option | python flag | Range / default | Where |
+|---|---|---|---|
+| `level` | `-l` | int 1-22, default **18** | web + CLI |
+| `blockSizeExponent` | `-s` | int 14-32 (2^exp), default **20** = 1 MiB | web + CLI, block mode only |
+| `ldm` | `-L` | off/on | **CLI only** (node:zlib parameters; the browser wasm exposes no compressor parameters) |
+| `mode` | `-S` / `-B` | `'block'` / `'solid'`, default **`'block'`** (python defaults to solid for NSZ — here block is the deliberate default) | solid is **CLI only** (not wired into the browser path yet; the browser wasm does have a streaming compressor) |
+
+**Block mode** (`mode: 'block'`, python `BlockCompressor` / `-B`): the payload
+is NCZBLOCK — header (magic, ver 2, type 1, unused 0, `blockSizeExponent`@11,
+blocks u32@12, decompSize u64@16) + block-size list (u32×n, seek-back write) +
+independent zstd frames of `2^blockSizeExponent` plaintext each; an
+incompressible block is stored verbatim (plaintext).
+
+**Solid mode** (`mode: 'solid'`, python `SolidCompressor` / `-S`): ONE zstd
+frame (magic 0xFD2FB528) over the whole `[0x4000, ncaSize)` payload, right
+after the NCZSECTN table — **no NCZBLOCK header**. The frame is streamed
+(node:zlib `createZstdCompress`): the producer feeds 16 MiB plaintext chunks
+through a bounded 8-chunk queue with drain backpressure (python
+CHUNK_SZ=0x1000000 / FLUSH_FRAME equivalent), so peak memory is
+O(window + queue), never the payload. Mode detection on read is the magic
+after the table (`fs/ncz.js`): `NCZBLOCK` → blocks, else one frame.
+
+The compressed payload (both modes) is the **plaintext** of the continuous NCA
+bytes `[0x4000, ncaSize)`: CTR/BKTR ranges are decrypted on the fly (CTR
+encrypt == decrypt; the decompressor re-encrypts). The `[0x4000, firstSection)`
+gap is plaintext and never compressed (the decompressor inserts a FakeSection
+for it). The NCZSECTN table is **identical in both modes** — only the payload
+layout differs.
+
+**LDM parity:** python `-L` = `zstandard.ZstdCompressor.from_level(level,
+enable_ldm=True)` = libzstd defaults for the level + LDM enabled (the ldm
+sub-parameters stay default) → node:zlib
+`params = { [ZSTD_c_compressionLevel]: level, [ZSTD_c_enableLongDistanceMatching]: 1 }`
+(numeric constant keys — string names are rejected by node:zlib).
+
+### Section-table (NCZSECTN) semantics
+
+One 64-byte entry per section — offset u64, size u64, crypto_type u64, 8B
+reserved, key 16B, counter 16B (layout: `NCZ_SECTN_ENTRY` in `fs/ncz.js`):
+
+- `crypto_type` is the **RAW NCA FsHeader crypto byte** (python `Type.Crypto`:
+  0=ERR, 1=NONE, 2=XTS, 3=CTR, 4=BKTR — §6), NOT the nca-utils enum;
+- CTR: key = titlekey, counter = `[reversed section counter 8B][00×8]` — the
+  low 8 bytes stay zero: the decompressor's `AesCtr.seek(section.offset)` fills
+  them with `offset>>4`;
+- BKTR: each subsection is stored as a **CTR entry** with counter head
+  `[secureValue 4B BE][subEntry.ctrVal 4B BE]` (python `setBktrCounter`), and
+  the tables region after the data is one tail entry with the reversed section
+  counter head;
+- **NONE (plaintext) entries store the titlekey + the zero counter — not a
+  zero key/counter** (the python table carries the titlekey in every row).
+
+### Container layout
+
+- **NSP→NSZ:** the output's first member sits at the **input's**
+  `firstFileOffset` (python `Pfs0Stream` does `f.seek(container.
+  getFirstFileOffset())`), so a smaller output PFS0 header is followed by a
+  zero gap; the PFS0 header reuses the input string-table size (grows only if
+  the new names are longer) and is 0x10-aligned.
+- **XCI→XCZ:** `[0x000,0x200)` = the input's first 0x200 bytes **verbatim**
+  (python's "gross hack" — `validDataEndOffset` & co stay STALE),
+  `[0x200,0xF000)` zeros, root HFS0 at 0xF000 (actual size, unpadded),
+  partitions sequentially from 0x17000 in input root-HFS0 order; each
+  partition: HFS0 header at its start, files from partition-relative 0x8000,
+  size `actualSize + align0x200(actualSize)` with
+  `align0x200(n) = 0x200 − n % 0x200` (an empty partition is a 0x200 stub
+  carrying a 0-file HFS0 header). Shared constants: `XCI_LAYOUT`/`XCI_HEAD` in
+  `fs/xci.js`.
+
+### Sparse-hole semantics
+
+The zero regions above (NSZ gap, XCI `[0x200,0xF00)`, root-HFS0 tail,
+0x8000 partition header regions, stub paddings) are **HOLEs, not writes**:
+fd/FSA zero-fill on extend (POSIX sparse semantics — python never writes them
+either), and the memory adapter materializes them at `collectBlob` time
+(zero-fill to `totalSize`). The one extent data alone cannot establish — a
+stub partition (only bytes are the later-written 0-file HFS0 header) — gets an
+explicit 0x200 zero write.
+
+### Titlekey resolution
+
+The container's `.tik` members are scanned up front (`collectTicketMaps` in
+`fs/ticket.js`; python fills its `Titles` db from every ticket seen while
+opening the container — for XCI, across **all** partitions). A rights-managed
+NCA resolves via rightsId, then titleId; non-rights NCAs take the titlekey
+from the header key area. A missing titlekey **fails the whole job**
+(`Missing title key for …`) rather than silently copying the NCA into a
+bloated output.
+
+### Upstream asymmetries mirrored (not "fixed")
+
+- **XCI `keep`:** python runs `blockCompressContainer` only when
+  `keep or partition == "secure"` — without keep, normal/update/logo become
+  empty 0x200 stubs even when the input has content in them (logged
+  `[SKIP-PARTITION]`). The python *decompressor* does process all partitions.
+- **XCI layout guard:** python hardcodes the output root HFS0 to 0xF000 and
+  copies the input header verbatim, so non-standard layouts (backup HEAD at
+  0x1100, `hfs0Offset ≠ 0xF000`) cannot be compressed into a valid file —
+  nsz-js throws `Unsupported XCI layout: …` instead of emitting python's
+  broken file.

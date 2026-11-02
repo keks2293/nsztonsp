@@ -8,6 +8,7 @@ import { decompressXCZ } from './fs/xcz-decompress.js';
 import { mergeNSP } from './fs/merge.js';
 import { update } from './fs/update.js';
 import { splitNSP as splitNSPFile } from './fs/split.js';
+import { compressNSPtoNSZ as compressNSPtoNSZFile, compressXCItoXCZ as compressXCItoXCZFile } from './fs/compress.js';
 import { formatBytes } from './fs/format.js';
 
 class FileSliceReader extends DataReader {
@@ -169,6 +170,72 @@ class NSZConverter {
 
         onProgress(1.0, 'Done!');
         return result;
+    }
+
+    // Compress an NSP to NSZ (.nsp → .nsz). The inverse of decompressNSZtoNSP:
+    // eligible NCAs are re-compressed to .ncz (block mode, zstd level 18,
+    // 1 MiB blocks — configurable via level/blockSizeExponent), the rest is
+    // copied. Delta fragments (DATA NCAs) are dropped unless keep. Compression
+    // needs a seekable target (the PFS0 header is written last and the NCZ
+    // size list is patched back), so the output is either a seekable FSA
+    // writable or in-memory — never an append-only SW stream (callers guard
+    // this). ldm and solid mode are CLI-only (nsz-cli.js -L/-S).
+    async compressNSPtoNSZ(file, options = {}) {
+        const { onProgress = () => {}, onLog = () => {}, keep = false, writable = null, level, blockSizeExponent } = options;
+        onLog('info', `Compressing ${file.name} (${formatBytes(file.size)})...`);
+        await this.init();
+        if (!this.keys || !this.keys.header_key) {
+            throw new Error('Keys are required to compress (decrypt NCA headers and resolve titlekeys). Load keys first.');
+        }
+
+        const reader = new FileSliceReader(file, 0, file.size);
+        const result = await compressNSPtoNSZFile(reader, writable ? { writable } : { memory: true }, {
+            keys: this.keys,
+            keep,
+            level,
+            blockSizeExponent,
+            log: onLog,
+            progress: onProgress,
+        });
+
+        onProgress(1.0, 'Done!');
+        const outputName = file.name.replace(/\.nsp$/i, '.nsz');
+        onLog('success', `Output: ${outputName} (${formatBytes(result.size)}), ${result.memberCount} members`);
+        return { blob: result.blob || null, name: outputName, size: result.size, memberCount: result.memberCount, writable: !!writable };
+    }
+
+    // Compress an XCI to XCZ (.xci → .xcz). The inverse of
+    // decompressXCZtoXCI: eligible NCAs in the partitions are re-compressed to
+    // .ncz (block mode, zstd level 18, 1 MiB blocks — configurable via
+    // level/blockSizeExponent), the rest is copied. Like Python nsz, only the
+    // "secure" partition is processed unless keep is set (the other partitions
+    // become empty 0x200 stubs). Delta fragments (DATA NCAs) are dropped
+    // unless keep. Compression needs a seekable target (per-partition HFS0
+    // headers are written after their data), so the output is either a
+    // seekable FSA writable or in-memory — never an append-only SW stream
+    // (callers guard this). ldm and solid mode are CLI-only (nsz-cli.js -L/-S).
+    async compressXCItoXCZ(file, options = {}) {
+        const { onProgress = () => {}, onLog = () => {}, keep = false, writable = null, level, blockSizeExponent } = options;
+        onLog('info', `Compressing ${file.name} (${formatBytes(file.size)})...`);
+        await this.init();
+        if (!this.keys || !this.keys.header_key) {
+            throw new Error('Keys are required to compress (decrypt NCA headers and resolve titlekeys). Load keys first.');
+        }
+
+        const reader = new FileSliceReader(file, 0, file.size);
+        const result = await compressXCItoXCZFile(reader, writable ? { writable } : { memory: true }, {
+            keys: this.keys,
+            keep,
+            level,
+            blockSizeExponent,
+            log: onLog,
+            progress: onProgress,
+        });
+
+        onProgress(1.0, 'Done!');
+        const outputName = file.name.replace(/\.xci$/i, '.xcz');
+        onLog('success', `Output: ${outputName} (${formatBytes(result.size)}), ${result.memberCount} members`);
+        return { blob: result.blob || null, name: outputName, size: result.size, memberCount: result.memberCount, writable: !!writable };
     }
 
 }

@@ -42,8 +42,12 @@ async function main() {
     const noDeltaBtn = document.getElementById('noDeltaBtn');
     const keepAcidSigBtn = document.getElementById('keepAcidSigBtn');
     const keepAcidKeyBtn = document.getElementById('keepAcidKeyBtn');
+    const keepDeltasBtn = document.getElementById('keepDeltasBtn');
     const bufferNcaBtn = document.getElementById('bufferNcaBtn');
     const bufferUpdateBtn = document.getElementById('bufferUpdateBtn');
+    const compressSettings = document.getElementById('compressSettings');
+    const compressLevelInput = document.getElementById('compressLevelInput');
+    const compressBlockSizeSelect = document.getElementById('compressBlockSizeSelect');
 
     // Buffer pills — BufferUpdate is ON BY DEFAULT (its section buffer is the
     // moderate one, and the engine's preflight makes any default safe: when the
@@ -65,6 +69,7 @@ async function main() {
     let noDeltas = false;
     let keepAcidSig = false;
     let keepAcidKey = false;
+    let keepDeltas = false;
     let mode = 'decompress';
     const isMobile = /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent);
     let downloadMode = isMobile ? 'sw' : 'fsa';
@@ -86,12 +91,15 @@ async function main() {
         const overwriteVisible = downloadMode === 'fsa';
         const noDeltaVisible = mode === 'merge';
         const keepAcidVisible = mode === 'update';
+        const keepDeltasVisible = mode === 'compress';
+        compressSettings.classList.toggle('hidden', !keepDeltasVisible);
         fixPaddingBtn.classList.toggle('hidden', !fixVisible);
         verifyBtn.classList.toggle('hidden', !verifyVisible);
         overwriteBtn.classList.toggle('hidden', !overwriteVisible);
         noDeltaBtn.classList.toggle('hidden', !noDeltaVisible);
         keepAcidSigBtn.classList.toggle('hidden', !keepAcidVisible);
         keepAcidKeyBtn.classList.toggle('hidden', !keepAcidVisible);
+        keepDeltasBtn.classList.toggle('hidden', !keepDeltasVisible);
         // Buffer pills restore buffered routes (see the pill comment above);
         // BufferUpdate is the default ON pill, clicking it off gives 'auto'
         // (scatter/own-BKTR). BufferNCA is blob-excluded: blob never merges the
@@ -132,13 +140,18 @@ async function main() {
             const lower = name.toLowerCase();
             return lower.endsWith('.nsp') || lower.endsWith('.nsz') || lower.endsWith('.xci') || lower.endsWith('.xcz');
         }
+        // split takes a single .nsp; compress takes a single .nsp or .xci
+        if (mode === 'compress') {
+            const lower = name.toLowerCase();
+            return lower.endsWith('.nsp') || lower.endsWith('.xci');
+        }
         return name.toLowerCase().endsWith('.nsp');
     }
 
     function updateButtonLabel() {
-        decompressBtn.textContent = mode === 'merge' ? 'Merge' : mode === 'update' ? 'Update' : mode === 'split' ? 'Split' : 'Decompress';
+        decompressBtn.textContent = mode === 'merge' ? 'Merge' : mode === 'update' ? 'Update' : mode === 'split' ? 'Split' : mode === 'compress' ? 'Compress' : 'Decompress';
         if (processing) return;
-        decompressBtn.disabled = mode === 'merge' ? files.length < 2 : mode === 'update' ? files.length !== 2 : mode === 'split' ? files.length !== 1 : files.length === 0;
+        decompressBtn.disabled = mode === 'merge' ? files.length < 2 : mode === 'update' ? files.length !== 2 : (mode === 'split' || mode === 'compress') ? files.length !== 1 : files.length === 0;
     }
 
     function setMode(m) {
@@ -347,6 +360,11 @@ async function main() {
     keepAcidKeyBtn.addEventListener('click', () => {
         keepAcidKey = !keepAcidKey;
         keepAcidKeyBtn.classList.toggle('on', keepAcidKey);
+    });
+
+    keepDeltasBtn.addEventListener('click', () => {
+        keepDeltas = !keepDeltas;
+        keepDeltasBtn.classList.toggle('on', keepDeltas);
     });
 
     // The two buffer pills are mutually exclusive (each selects one route).
@@ -843,10 +861,93 @@ async function main() {
         endRun();
     }
 
+    async function runCompress() {
+        if (files.length !== 1) return;
+
+        beginRun();
+        addLog('info', `Starting compression (${downloadMode})...`);
+        addLog('info', 'Options: keys required (decrypt NCA headers, resolve titlekeys)');
+
+        // Compression needs a seekable target (the PFS0 header is written last
+        // and the NCZ size list is patched back after the data) — an append-only
+        // SW stream can't be used, so only File System or Blob output.
+        if (downloadMode === 'sw') {
+            addLog('error', 'Compress needs a seekable output: switch Download mode to File System or Blob (SW streaming is append-only).');
+            endRun();
+            return;
+        }
+
+        // Compression options (python nsz parity): level 1-22 (-l), block
+        // size exponent 14-32 (-s). ldm (-L) and solid (-S) are CLI-only —
+        // ldm needs the node:zlib parameter API (the wasm exposes no
+        // compressor parameters); solid is not wired into the browser path
+        // yet.
+        const level = parseInt(compressLevelInput.value, 10);
+        const blockSizeExponent = parseInt(compressBlockSizeSelect.value, 10);
+        if (!Number.isInteger(level) || level < 1 || level > 22) {
+            addLog('error', `Invalid zstd level: ${compressLevelInput.value} (must be an integer from 1 to 22).`);
+            endRun();
+            return;
+        }
+        if (!Number.isInteger(blockSizeExponent) || blockSizeExponent < 14 || blockSizeExponent > 32) {
+            addLog('error', `Invalid block size exponent: ${compressBlockSizeSelect.value} (must be an integer from 14 to 32).`);
+            endRun();
+            return;
+        }
+        addLog('info', `Options: zstd level ${level}, block size ${blockSizeExponent >= 20 ? (1 << (blockSizeExponent - 20)) + ' MiB' : ((1 << (blockSizeExponent - 10)) / 1024) + ' KiB'}`);
+
+        const totalBytes = files[0].size;
+        const startTime = Date.now();
+        const updateStats = makeUpdateStats(totalBytes, startTime);
+
+        const directoryHandle = await pickOrAbort();
+        if (directoryHandle === 'ABORT') return;
+
+        const isXci = files[0].name.toLowerCase().endsWith('.xci');
+        const outputName = files[0].name.replace(/\.(nsp|xci)$/i, isXci ? '.xcz' : '.nsz');
+        const compressFn = isXci ? converter.compressXCItoXCZ.bind(converter) : converter.compressNSPtoNSZ.bind(converter);
+        let writable = null;
+        if (downloadMode === 'fsa') {
+            const out = await openFSAOutput(outputName, directoryHandle);
+            if (out.exists) {
+                addLog('warn', `Exists, skipping: ${outputName}`);
+                processing = false;
+                updateButtonLabel();
+                return;
+            }
+            writable = out.writable;
+        }
+
+        const onProgress = (p, label) => { updateProgress(p); updateStats(p); if (label) progressTitle.textContent = label; };
+
+        try {
+            const result = await compressFn(files[0], {
+                onProgress,
+                onLog: addLog,
+                writable,
+                keep: keepDeltas,
+                level,
+                blockSizeExponent,
+            });
+            checkSwDelivered(writable, result.size);
+            await deliverResult(writable, result.blob, result.name);
+            for (let i = 0; i < files.length; i++) fileStatus[i] = 'ok';
+            updateFileList();
+        } catch (error) {
+            addLog('error', `Compress failed: ${error.message}`);
+            await cleanupFailedWritable(writable, outputName, directoryHandle);
+            fileStatus[0] = 'err';
+            updateFileList();
+        }
+
+        endRun();
+    }
+
     decompressBtn.addEventListener('click', async () => {
         if (mode === 'merge') await runMerge();
         else if (mode === 'update') await runUpdate();
         else if (mode === 'split') await runSplit();
+        else if (mode === 'compress') await runCompress();
         else await runDecompress();
     });
 

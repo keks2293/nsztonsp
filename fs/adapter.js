@@ -20,18 +20,36 @@ async function buildAdapter(output, read, callbacks) {
     }
     if (output.memory) {
         const chunks = output._chunks || (output._chunks = []);
-        // Keep _chunks sorted by offset as writes arrive (seek-back writes land at
-        // the head/middle). Chunks are disjoint — each write is a distinct region —
-        // so insertion preserves order; the data itself is never copied, and Blob
-        // references the chunks in place.
+        // Keep _chunks sorted by offset AND disjoint. A seekable target may
+        // legitimately rewrite a region — the NCZ block-size list is zeroed
+        // first and patched back after the blocks are compressed, and the PFS0
+        // header is written last at offset 0 — so an incoming write that
+        // overlaps existing chunks trims/splits/drops them (last write wins).
+        // Chunk buffers are referenced in place (Blob, read-back): no copies.
         const write = (offset, data) => {
-            let lo = 0, hi = chunks.length;
-            while (lo < hi) {
-                const mid = (lo + hi) >> 1;
-                if (chunks[mid].offset < offset) lo = mid + 1;
-                else hi = mid;
+            if (data.length === 0) return;
+            const end = offset + data.length;
+            const inserts = [];
+            let i = 0;
+            while (i < chunks.length) {
+                const c = chunks[i];
+                const cEnd = c.offset + c.data.length;
+                if (cEnd <= offset || c.offset >= end) { i++; continue; }
+                if (c.offset < offset) inserts.push({ offset: c.offset, data: c.data.subarray(0, offset - c.offset) });
+                if (cEnd > end) inserts.push({ offset: end, data: c.data.subarray(end - c.offset) });
+                chunks.splice(i, 1);
             }
-            chunks.splice(lo, 0, { offset, data });
+            inserts.push({ offset, data });
+            inserts.sort((a, b) => a.offset - b.offset);
+            for (const ins of inserts) {
+                let lo = 0, hi = chunks.length;
+                while (lo < hi) {
+                    const mid = (lo + hi) >> 1;
+                    if (chunks[mid].offset < ins.offset) lo = mid + 1;
+                    else hi = mid;
+                }
+                chunks.splice(lo, 0, ins);
+            }
         };
         return {
             read,
@@ -44,10 +62,27 @@ async function buildAdapter(output, read, callbacks) {
 }
 
 function collectBlob(adapter, totalSize) {
-    // _chunks is kept sorted by offset at write time, so Blob can reference the
-    // chunk buffers in place — zero copy, no extra flat buffer. Any overlap would
-    // break this (doubled bytes), but writes are always into distinct regions.
-    return new Blob(adapter._chunks.map(c => c.data), { type: 'application/octet-stream' });
+    // The memory output emulates a SPARSE FILE, exactly like fd/FSA: written
+    // chunks keep their positions, and unwritten holes read as zeros. fd gets
+    // that for free (POSIX: a positioned write extends the file and the
+    // intervening bytes are zeros); FSA inherits the platform's POSIX-like
+    // semantics. Producers therefore write data at logical offsets — plus the
+    // FINAL EXTENT that sets the file length — and do NOT pad internal holes
+    // with explicit zero writes (doing so for fd would defeat sparseness and
+    // waste disk writes, the same way python nsz never writes its gaps).
+    // _chunks is kept sorted by offset and disjoint at write time, so this can
+    // reference chunk buffers in place (zero copy) and only ALLOCATES the
+    // actual gaps (head/interior/tail) up to totalSize.
+    const chunks = adapter._chunks;
+    const parts = [];
+    let pos = 0;
+    for (const c of chunks) {
+        if (c.offset > pos) parts.push(new Uint8Array(c.offset - pos));
+        parts.push(c.data);
+        pos = c.offset + c.data.length;
+    }
+    if (totalSize > pos) parts.push(new Uint8Array(totalSize - pos));
+    return new Blob(parts, { type: 'application/octet-stream' });
 }
 
 // Build a seekable read(offset, length) for the output, or null if the output

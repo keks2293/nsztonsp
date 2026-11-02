@@ -1,6 +1,6 @@
 import { PFS0, PFS0Writer } from './pfs0.js';
 import { decryptNcaHeader, parseCnmtFromRawNca } from './nca.js';
-import { Ticket } from './ticket.js';
+import { collectTicketMaps } from './ticket.js';
 import { buildAdapter, collectBlob, copyRange } from './adapter.js';
 import { isMetaNca, NCA_HEADER_SIZE } from './nca-utils.js';
 import { CNMT_ENTRY_TYPE, CNMT_TITLE_TYPE } from './cnmt.js';
@@ -29,22 +29,6 @@ function resolveTicket(g, byRightsId, byTitleId) {
     return tik;
 }
 
-async function collectTickets(reader, ticketEntries, log = () => {}) {
-    const byRightsId = new Map();
-    const byTitleId = new Map();
-    for (const e of ticketEntries) {
-        try {
-            const data = (await reader.read(e.offset, e.size)).slice();
-            const t = Ticket.parse(data.buffer);
-            byRightsId.set(t.rightsId.toLowerCase(), e);
-            byTitleId.set(t.titleId.toLowerCase(), e);
-        } catch (err) {
-            log('warn', `Skipping malformed ticket: ${e.name}`);
-        }
-    }
-    return { byRightsId, byTitleId };
-}
-
 export async function splitNSP(reader, keys, outputFactory, options = {}) {
     if (!keys || !keys.header_key) {
         throw new Error('splitNSP: keys are required to read NCA headers and CNMT metadata');
@@ -53,16 +37,15 @@ export async function splitNSP(reader, keys, outputFactory, options = {}) {
 
     const pfs0 = await PFS0.open(reader);
 
+    const files = pfs0.getFiles();
     const ncaEntries = new Map();
     const cnmtXmlEntries = new Map();
-    const ticketEntries = [];
     const certEntries = [];
 
-    for (const f of pfs0.getFiles()) {
+    for (const f of files) {
         const lower = f.name.toLowerCase();
         if (lower.endsWith('.nca')) ncaEntries.set(stem(f.name), f);
         else if (lower.endsWith('.cnmt.xml')) cnmtXmlEntries.set(stem(f.name), f);
-        else if (lower.endsWith('.tik')) ticketEntries.push(f);
         else if (lower.endsWith('.cert')) certEntries.push(f);
     }
 
@@ -70,7 +53,9 @@ export async function splitNSP(reader, keys, outputFactory, options = {}) {
         throw new Error('splitNSP: no .nca files found in the input');
     }
 
-    const { byRightsId, byTitleId } = await collectTickets(reader, ticketEntries, log);
+    // Tickets are scanned from the full member list (shared collector,
+    // fs/ticket.js — same db python nsz Pfs0.open builds on open).
+    const { byRightsId, byTitleId } = await collectTicketMaps(reader, files, log);
 
     const parsedHeaders = new Map();
     for (const [name, entry] of ncaEntries) {

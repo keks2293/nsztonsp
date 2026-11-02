@@ -1,11 +1,7 @@
 import { HFS0Writer } from './hfs0.js';
-import { XCIReader } from './xci.js';
+import { XCIReader, XCI_LAYOUT, XCI_HEAD } from './xci.js';
 import { buildAdapter, collectBlob } from './adapter.js';
 import { collectFileMetas, writeFromReader, collectCnmtHashMap } from './archive-common.js';
-
-const PARTITION_HEADER_SIZE = 0x8000;
-const ROOT_HFS0_PADDED_SIZE = 0x8000;
-const ROOT_HFS0_OFFSET = 0xF000;
 
 async function buildPartitionMetas(xci, verify, adapter, extractCnmtHashMap) {
     const partitions = xci.getPartitions();
@@ -13,7 +9,7 @@ async function buildPartitionMetas(xci, verify, adapter, extractCnmtHashMap) {
 
     for (const partition of partitions) {
         if (partition.size === 0) {
-            partitionMetas.push({ name: partition.name, files: [], totalSize: 0, hfs0BufferSize: PARTITION_HEADER_SIZE, raw: false, cnmtHashMap: new Map() });
+            partitionMetas.push({ name: partition.name, files: [], totalSize: 0, hfs0BufferSize: XCI_LAYOUT.PARTITION_HEADER_SIZE, raw: false, cnmtHashMap: new Map() });
             continue;
         }
 
@@ -35,7 +31,7 @@ async function buildPartitionMetas(xci, verify, adapter, extractCnmtHashMap) {
             name: partition.name,
             files: fileMetas,
             totalSize: fileTotalSize,
-            hfs0BufferSize: PARTITION_HEADER_SIZE,
+            hfs0BufferSize: XCI_LAYOUT.PARTITION_HEADER_SIZE,
             raw: false,
             cnmtHashMap
         });
@@ -45,7 +41,7 @@ async function buildPartitionMetas(xci, verify, adapter, extractCnmtHashMap) {
 }
 
 function computeLayout(partitionMetas, baseOffset = 0) {
-    const rootWriter = new HFS0Writer(ROOT_HFS0_PADDED_SIZE);
+    const rootWriter = new HFS0Writer(XCI_LAYOUT.PARTITION_HEADER_SIZE);
     const partSizes = [];
     for (const pm of partitionMetas) {
         const partSize = pm.hfs0BufferSize + pm.totalSize;
@@ -56,7 +52,7 @@ function computeLayout(partitionMetas, baseOffset = 0) {
     const rootHeader = rootHfs0.buffer;
     const rootActualHeader = rootHfs0.actualHeader;
 
-    let currentDataOffset = baseOffset + ROOT_HFS0_OFFSET + rootHfs0.headerSize;
+    let currentDataOffset = baseOffset + XCI_LAYOUT.ROOT_HFS0_OFFSET + rootHfs0.headerSize;
     const partOffsets = [];
     for (let i = 0; i < partitionMetas.length; i++) {
         partOffsets.push({ name: partitionMetas[i].name, offset: currentDataOffset });
@@ -70,16 +66,19 @@ function computeLayout(partitionMetas, baseOffset = 0) {
 async function writeXciHeaders(adapter, xciHeaderBytes, layout, baseOffset = 0, prefixData = null) {
     const { rootHeader, rootActualHeader, totalSize } = layout;
 
-    const xciOut = new Uint8Array(0x200);
+    const xciOut = new Uint8Array(XCI_LAYOUT.HEAD_SIZE);
     xciOut.set(xciHeaderBytes instanceof Uint8Array ? xciHeaderBytes : new Uint8Array(xciHeaderBytes), 0);
     const xciView = new DataView(xciOut.buffer);
-    xciView.setBigUint64(0x118, BigInt(totalSize), true);
-    xciView.setBigUint64(0x130, BigInt(ROOT_HFS0_OFFSET), true);
-    xciView.setBigUint64(0x138, BigInt(rootActualHeader), true);
+    xciView.setBigUint64(XCI_HEAD.VALID_DATA_END_OFFSET, BigInt(totalSize), true);
+    xciView.setBigUint64(XCI_HEAD.HFS0_OFFSET, BigInt(XCI_LAYOUT.ROOT_HFS0_OFFSET), true);
+    xciView.setBigUint64(XCI_HEAD.HFS0_HEADER_SIZE, BigInt(rootActualHeader), true);
 
     if (prefixData) await adapter.write(0, prefixData);
+    // The [0x200, 0xF000) gap (baseOffset == 0) is a hole: fd/FSA zero-fill it
+    // (POSIX extend semantics) and the memory adapter materializes it at
+    // collectBlob time — no explicit zero write.
     await adapter.write(baseOffset, xciOut);
-    await adapter.write(baseOffset + ROOT_HFS0_OFFSET, rootHeader);
+    await adapter.write(baseOffset + XCI_LAYOUT.ROOT_HFS0_OFFSET, rootHeader);
 }
 
 async function writePartitions(adapter, partitionMetas, layout, verify, options) {
@@ -93,12 +92,12 @@ async function writePartitions(adapter, partitionMetas, layout, verify, options)
         const pm = partitionMetas[pi];
         const po = partOffsets[pi];
 
-        const pWriter = new HFS0Writer(PARTITION_HEADER_SIZE);
+        const pWriter = new HFS0Writer(XCI_LAYOUT.PARTITION_HEADER_SIZE);
         for (const m of pm.files) pWriter.addEntry(m.name, m.size);
         const hfs0Header = pWriter.buildHeader();
         await adapter.write(po.offset, hfs0Header.buffer);
 
-        let writePos = po.offset + PARTITION_HEADER_SIZE;
+        let writePos = po.offset + XCI_LAYOUT.PARTITION_HEADER_SIZE;
         for (let fi = 0; fi < pm.files.length; fi++) {
             const meta = pm.files[fi];
             await writeFromReader(adapter, writePos,
@@ -110,7 +109,7 @@ async function writePartitions(adapter, partitionMetas, layout, verify, options)
             progress(pct(dataOverall), `${pm.name}/${meta.inputName} done`);
         }
 
-        const paddedDataSize = Math.max(PARTITION_HEADER_SIZE, writePos - po.offset);
+        const paddedDataSize = Math.max(XCI_LAYOUT.PARTITION_HEADER_SIZE, writePos - po.offset);
         if (paddedDataSize > writePos - po.offset) {
             const padSize = paddedDataSize - (writePos - po.offset);
             await adapter.write(writePos, new Uint8Array(padSize));
@@ -125,15 +124,15 @@ async function decompressXCZStreaming(xci, adapter, options, partitionMetas) {
         partitionMetas = await buildPartitionMetas(xci, verify, adapter, options.extractCnmtHashMap);
     }
 
-    const baseOffset = xci.headOffset - 0x100;
+    const baseOffset = xci.headOffset - XCI_LAYOUT.HEAD_OFFSET;
     const layout = computeLayout(partitionMetas, baseOffset);
 
     let prefixData = null;
     if (baseOffset > 0) {
-        prefixData = await adapter.read(0, baseOffset + ROOT_HFS0_OFFSET);
+        prefixData = await adapter.read(0, baseOffset + XCI_LAYOUT.ROOT_HFS0_OFFSET);
     }
 
-    const xciHeaderBytes = await adapter.read(baseOffset, 0x200);
+    const xciHeaderBytes = await adapter.read(baseOffset, XCI_LAYOUT.HEAD_SIZE);
     await writeXciHeaders(adapter, xciHeaderBytes, layout, baseOffset, prefixData);
 
     await writePartitions(adapter, partitionMetas, layout, verify, { log, progress, createHash: options.createHash });

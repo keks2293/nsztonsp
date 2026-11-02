@@ -337,6 +337,53 @@
             color: var(--text-dim);
         }
 
+        .setting.hidden { display: none; }
+
+        /* Compression options (zstd level + block size) — compact inline controls */
+        .compress-opts {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 10px;
+            margin-left: auto;
+            align-items: center;
+        }
+
+        .compress-opt {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            font-size: 11px;
+            color: var(--text-faint);
+            white-space: nowrap;
+        }
+
+        .compress-opt input[type="number"],
+        .compress-opt select {
+            background: var(--bg-raised);
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            color: var(--text);
+            font-size: 11px;
+            font-family: inherit;
+            padding: 4px 8px;
+            outline: none;
+            -webkit-tap-highlight-color: transparent;
+        }
+
+        .compress-opt input[type="number"] {
+            width: 52px;
+            text-align: center;
+        }
+
+        .compress-opt input[type="number"]:focus,
+        .compress-opt select:focus {
+            border-color: var(--accent-glow-strong);
+        }
+
+        .compress-opt select {
+            cursor: pointer;
+        }
+
         .pills {
             display: flex;
             flex-wrap: wrap;
@@ -717,13 +764,15 @@
                                     <b>Decompress</b> — .nsz → .nsp, .xcz → .xci.<br>
                                     <b>Merge</b> — merge .nsp/.nsz/.xci/.xcz (base + update + DLC) into one .nsp. Compressed .ncz members are decompressed to .nca.<br>
                                     <b>Update</b> — patch the update into the base so the result installs as a single title (base + update, 2 files). Needs keys.<br>
-                                    <b>Split</b> — split a merged NSP into one .nsp per title. Needs keys.
+                                    <b>Split</b> — split a merged NSP into one .nsp per title. Needs keys.<br>
+                                    <b>Compress</b> — compress .nsp → .nsz / .xci → .xcz: program NCAs become NCZ (zstd L18), the rest is copied. For .xci only the "secure" partition is compressed (matching Python nsz). Needs keys, seekable output (File System or Blob).
                                 </div>
                                 <div class="pills segmented" id="operationOptions">
                                     <button class="pill on" data-op="decompress" title="Decompress .nsz/.xcz into .nsp/.xci">Decompress</button>
                                     <button class="pill" data-op="merge" title="Merge multiple NSPs/NSZs/XCIs/XCZs into one NSP (base + update + DLC)">Merge</button>
                                     <button class="pill" data-op="update" title="Patch the update into the base, producing a single installable NSP">Update</button>
                                     <button class="pill" data-op="split" title="Split a merged NSP into one .nsp per title">Split</button>
+                                    <button class="pill" data-op="compress" title="Compress .nsp → .nsz (program NCAs to NCZ, zstd level 18)">Compress</button>
                                 </div>
                             </div>
                             <div class="setting">
@@ -750,6 +799,7 @@
                                      <b>Overwrite</b> — Continue even if a file with same name exists.<br>
                                      <b>Verify</b> — Verify SHA-256 hash after conversion. Slower, rarely needed.<br>
                                       <b>No Deltas</b> — Merge: exclude delta-fragment NCAs (needs keys to detect them).<br>
+                                       <b>Keep Deltas</b> — Compress: keep delta-fragment NCAs in the .nsz (dropped by default, matching Python nsz).<br>
                                        <b>Keep ACID Sig / Key</b> — Update: keep the original ACID signature/key in main.npdm (hacpack --nozeronpdmsig/--nozeroacidkey). Zeroed by default.<br>
                                        <b>Buffer</b> — Update: buffer the merged RomFS in memory (much more RAM, single pass). Off = two-pass streaming (low RAM, re-reads the sources).
                                     </div>
@@ -758,11 +808,35 @@
                                       <button class="pill" id="overwriteBtn" title="Continue even if file with same name exists.">Overwrite</button>
                                       <button class="pill" id="verifyBtn" title="Verify SHA-256 hash after conversion. Slower, rarely needed.">Verify</button>
                                        <button class="pill" id="noDeltaBtn" title="Merge: exclude delta-fragment NCAs (needs keys to detect them).">No Deltas</button>
+                                       <button class="pill" id="keepDeltasBtn" title="Compress: keep delta-fragment NCAs in the output (dropped by default, matching Python nsz).">Keep Deltas</button>
                                        <button class="pill" id="keepAcidSigBtn" title="Update: keep the original ACID signature in main.npdm (hacpack --nozeronpdmsig). Zeroed by default.">Keep ACID Sig</button>
                                         <button class="pill" id="keepAcidKeyBtn" title="Update: keep the original ACID key in main.npdm (hacpack --nozeroacidkey). Zeroed by default.">Keep ACID Key</button>
                                         <button class="pill" id="bufferNcaBtn" title="Update (SW/FSA): BufferNCA — hold the whole merged Program NCA in RAM for a single-pass merge and a one-shot hash (fastest, ~1 extra NCA of RAM). If the NCA doesn't fit in memory, the engine warns and falls back to the default streaming route (own-BKTR, ~200 KB RAM) automatically. Hidden on blob.">BufferNCA</button>
                                         <button class="pill on" id="bufferUpdateBtn" title="Update: buffer the update's sections (BKTR patch + ExeFS) in RAM and stream the base through the merge — ON BY DEFAULT: the update decompresses 1× instead of 2-3×. RAM = size of the update sections (not the whole NCA); if they don't fit in memory, the engine warns and falls back to the default no-buffer route (scatter/own-BKTR) automatically. Click it off for the no-buffer 'auto' route (~200 KB RAM).">BufferUpdate</button>
                                     </div>
+                            </div>
+                            <div class="setting hidden" id="compressSettings">
+                                <button class="setting-label" popovertarget="compress-opts-info" aria-label="Show compression options descriptions">
+                                    Compression ⓘ
+                                </button>
+                                <div id="compress-opts-info" popover class="info-popover" role="dialog" aria-label="Compression options descriptions">
+                                    <b>Level</b> — zstd compression level 1-22 (higher = better ratio, slower). Default 18, matching Python nsz -l.<br>
+                                    <b>Block size</b> — NCZ block size, 64 KiB to 16 MiB. Default 1 MiB, matching Python nsz -s. Smaller blocks decompress faster and use less RAM on random access; larger blocks compress better.
+                                </div>
+                                <div class="compress-opts">
+                                    <label class="compress-opt" for="compressLevelInput">Level <input type="number" id="compressLevelInput" min="1" max="22" step="1" value="18"></label>
+                                    <label class="compress-opt" for="compressBlockSizeSelect">Block <select id="compressBlockSizeSelect">
+                                        <option value="16">64 KiB</option>
+                                        <option value="17">128 KiB</option>
+                                        <option value="18">256 KiB</option>
+                                        <option value="19">512 KiB</option>
+                                        <option value="20" selected>1 MiB</option>
+                                        <option value="21">2 MiB</option>
+                                        <option value="22">4 MiB</option>
+                                        <option value="23">8 MiB</option>
+                                        <option value="24">16 MiB</option>
+                                    </select></label>
+                                </div>
                             </div>
                         </div>
                         <div class="actions">

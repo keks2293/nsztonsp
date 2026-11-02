@@ -76,3 +76,28 @@ export class Ticket {
         };
     }
 }
+
+// Collect the container's .tik members into rightsId/titleId → entry maps
+// (python nsz Pfs0.open fills the Titles db the same way). `files` is the
+// full member list (e.g. PFS0.getFiles()); only names ending in .tik are
+// scanned. Entry: { name, size, offset } (copying the member, split.js) +
+// read() → pre-read ticket bytes (titlekey extraction, compress.js).
+// Maps are keyed by lowercased id; malformed tickets are skipped with a warn.
+export async function collectTicketMaps(reader, files, log = () => {}) {
+    const byRightsId = new Map();
+    const byTitleId = new Map();
+    for (const f of files) {
+        if (!f.name.toLowerCase().endsWith('.tik')) continue;
+        try {
+            const data = (await reader.read(f.offset, f.size)).slice();
+            // Ticket.parse builds a DataView over the raw ArrayBuffer.
+            const t = Ticket.parse(data.buffer);
+            const entry = { name: f.name, size: f.size, offset: f.offset, read: async () => data };
+            byRightsId.set(t.rightsId.toLowerCase(), entry);
+            byTitleId.set(t.titleId.toLowerCase(), entry);
+        } catch (err) {
+            log('warn', `[Tik] ${f.name}: unreadable ticket (${err.message})`);
+        }
+    }
+    return { byRightsId, byTitleId };
+}

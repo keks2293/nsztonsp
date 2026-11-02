@@ -11,6 +11,7 @@ import { extractContentHashMap } from './fs/cnmt-hashes.js';
 import { mergeNSP as mergeNSPFile } from './fs/merge.js';
 import { splitNSP as splitNSPFile } from './fs/split.js';
 import { update as updateFile } from './fs/update.js';
+import { compressNSPtoNSZ as compressNSPtoNSZFile, compressXCItoXCZ as compressXCItoXCZFile } from './fs/compress.js';
 import { formatBytes } from './fs/format.js';
 
 class FileDescriptorReader extends DataReader {
@@ -51,9 +52,16 @@ async function main() {
     let mergeMode = false;
     let splitMode = false;
     let updateMode = false;
+    let compressMode = false;
     let nodelta = false;
+    let keep = false;
     let keepNpdmAcidSig = false;
     let keepNpdmAcidKey = false;
+    let level = null;
+    let bsExp = null;
+    let long = false;
+    let solid = false;
+    let block = false;
     const positionals = [];
 
     for (let i = 0; i < args.length; i++) {
@@ -72,6 +80,10 @@ async function main() {
             splitMode = true;
         } else if (args[i] === '--update') {
             updateMode = true;
+        } else if (args[i] === '--compress') {
+            compressMode = true;
+        } else if (args[i] === '--keep' || args[i] === '-K') {
+            keep = true;
         } else if (args[i] === '--nodelta' || args[i] === '-n') {
             nodelta = true;
         } else if (args[i] === '--overwrite' || args[i] === '-w') {
@@ -82,6 +94,16 @@ async function main() {
             keepNpdmAcidSig = true;
         } else if (args[i] === '--keep-npdm-acid-key') {
             keepNpdmAcidKey = true;
+        } else if ((args[i] === '-l' || args[i] === '--level') && i + 1 < args.length) {
+            level = args[++i];
+        } else if ((args[i] === '-s' || args[i] === '--bs') && i + 1 < args.length) {
+            bsExp = args[++i];
+        } else if (args[i] === '-L' || args[i] === '--long') {
+            long = true;
+        } else if (args[i] === '-S' || args[i] === '--solid') {
+            solid = true;
+        } else if (args[i] === '-B' || args[i] === '--block') {
+            block = true;
         } else if ((args[i] === '-o' || args[i] === '--output') && i + 1 < args.length) {
             outputDir = args[++i];
         } else if (!args[i].startsWith('-')) {
@@ -97,6 +119,7 @@ async function main() {
         console.log('  node nsz-cli.js --merge <nsp|nsz|xci|xcz> <nsp|nsz|xci|xcz> [...] [options] merge NSPs/NSZs/XCIs/XCZs into one .nsp (base+update+dlc)');
         console.log('  node nsz-cli.js --update <base> <update> [options]   physically apply update to base: one patched program NCA, single .nsp (requires --keys)');
         console.log('  node nsz-cli.js --split <nsp> [keys.txt] [options]  split a merged NSP into one .nsp per title');
+        console.log('  node nsz-cli.js --compress <nsp|xci> [options]     compress .nsp -> .nsz or .xci -> .xcz (PROGRAM/PUBLIC_DATA NCAs to NCZ, zstd level 18, block mode; requires --keys)');
         console.log('');
         console.log('Input formats:');
         console.log('  .nsz   -> .nsp');
@@ -108,9 +131,16 @@ async function main() {
         console.log('  --rm-source          Delete input file(s) after successful operation');
         console.log('  --no-verify, -nv     Skip SHA256 verification [decompress]');
         console.log('  --fix-padding, -p    Re-pad PFS0 header to 0x20 boundary [decompress] (default: reuse input string-table size, matching Python nsz)');
-        console.log('  --keys <file>        Keys file [split] (required for --split CNMT parsing; used by decompress --verify for CNMT hash checks)');
+        console.log('  --keys <file>        Keys file (required for --split CNMT parsing and --compress NCA header decryption; used by decompress --verify for CNMT hash checks)');
         console.log('  -n, --nodelta        Exclude delta-fragment NCAs [merge]: drop NCAs referenced as DeltaFragment (ContentInfo type 6) in CNMTs (requires --keys)');
         console.log('  --update             Apply update to base physically: output a single .nsp with one patched program NCA');
+        console.log('  --compress           Compress .nsp -> .nsz / .xci -> .xcz: NCZ-compress PROGRAM/PUBLIC_DATA NCAs (zstd level 18, 1 MiB blocks, block mode by default), copy the rest; .xci: only the "secure" partition is compressed (matching Python nsz)');
+        console.log('  -K, --keep           Keep delta-fragment NCAs in the compressed output [compress] (dropped by default, matching Python nsz)');
+        console.log('  -l, --level <n>      zstd compression level 1-22 [compress] (default 18, matching Python nsz -l)');
+        console.log('  -s, --bs <exp>       NCZ block size 2^exp, exp 14-32 [compress] (default 20 = 1 MiB, matching Python nsz -s); block mode only');
+        console.log('  -L, --long           zstd long-distance matching [compress] (best ratio, slowest; matching Python nsz -L)');
+        console.log('  -S, --solid          Solid mode: one zstd frame per NCA [compress] (Python nsz NSZ default; mutually exclusive with -B)');
+        console.log('  -B, --block          Block mode: independent NCZBLOCK blocks [compress] (default here; mutually exclusive with -S)');
         console.log('  --keep-npdm-acid-sig Keep the original ACID signature in main.npdm [--update] (hacpack --nozeronpdmsig); zeroed by default');
         console.log('  --keep-npdm-acid-key Keep the original ACID key in main.npdm [--update] (hacpack --nozeroacidkey); zeroed by default');
         console.log('');
@@ -122,6 +152,10 @@ async function main() {
     }
     if (updateMode && (mergeMode || splitMode)) {
         console.error('Error: --update is mutually exclusive with --merge and --split.');
+        process.exit(1);
+    }
+    if (compressMode && (mergeMode || splitMode || updateMode)) {
+        console.error('Error: --compress is mutually exclusive with --merge, --split and --update.');
         process.exit(1);
     }
 
@@ -175,6 +209,55 @@ async function main() {
         const input = openInputReader(inputPath);
         try {
             await splitNSP(input, inputPath, outputDir, keys, overwrite, rmSource);
+        } finally {
+            fs.closeSync(input.fd);
+        }
+        return;
+    }
+
+    if (compressMode) {
+        inputPath = positionals[0];
+        if (positionals.length > 1) keysPath = keysPath || positionals[1];
+        if (!inputPath) {
+            console.error('Error: --compress requires a single .nsp input.');
+            printUsage();
+            process.exit(1);
+        }
+        const ext = path.extname(inputPath).toLowerCase();
+        if (ext !== '.nsp' && ext !== '.xci') {
+            console.error(`Error: --compress supports .nsp and .xci inputs only: ${inputPath}`);
+            process.exit(1);
+        }
+        if (solid && block) {
+            console.error('Error: --solid and --block are mutually exclusive.');
+            process.exit(1);
+        }
+        const toInt = (v, flag) => {
+            const n = Number(v);
+            if (!Number.isInteger(n)) {
+                console.error(`Error: ${flag} must be an integer: ${v}`);
+                process.exit(1);
+            }
+            return n;
+        };
+        if (level !== null) level = toInt(level, '-l/--level');
+        if (bsExp !== null) bsExp = toInt(bsExp, '-s/--bs');
+        const compressOpts = {
+            keep,
+            level,                    // null → default (18)
+            blockSizeExponent: bsExp, // null → default (20 = 1 MiB)
+            ldm: long,
+            mode: solid ? 'solid' : 'block',
+        };
+        const keys = await loadKeys(keysPath);
+        if (!keys) {
+            console.error('Error: --compress requires a keys file (--keys <path> or ./static/prod.keys) to decrypt NCA headers.');
+            process.exit(1);
+        }
+        const input = openInputReader(inputPath);
+        try {
+            if (ext === '.xci') await compressXCI(input, inputPath, outputDir, keys, compressOpts, overwrite, rmSource);
+            else await compressNSP(input, inputPath, outputDir, keys, compressOpts, overwrite, rmSource);
         } finally {
             fs.closeSync(input.fd);
         }
@@ -367,6 +450,62 @@ async function updateNSPs(inputPaths, outputDir, overwrite, rmSource, keysPath, 
             try { fs.closeSync(fd); } catch {}
         }
     }
+}
+
+async function runCompress(inFdInfo, inputPath, outputDir, keys, compressOpts, overwrite, rmSource, label, outExt, compressFile) {
+    console.log(`=== COMPRESS ${label} ===`);
+    console.log(`Options: level=${compressOpts.level ?? 18}, bs=2^${compressOpts.blockSizeExponent ?? 20}, long=${compressOpts.ldm ? 'yes' : 'no'}, mode=${compressOpts.mode}`);
+    const stem = path.basename(inputPath, path.extname(inputPath));
+    const outName = `${stem}${outExt}`;
+    const outPath = outputDir ? path.join(outputDir, outName) : path.join(path.dirname(inputPath), outName);
+
+    if (!overwrite && fs.existsSync(outPath)) {
+        console.error(`Error: ${outPath} already exists. Use -w/--overwrite to overwrite.`);
+        process.exit(1);
+    }
+
+    const fds = [];
+    let result;
+    try {
+        const outputFd = fs.openSync(outPath, 'w');
+        fds.push(outputFd);
+        try {
+            result = await compressFile(inFdInfo.reader, { fd: outputFd }, {
+                log: (level, msg) => console.log(msg),
+                progress: () => {},
+                keys,
+                ...compressOpts,
+            });
+        } catch (e) {
+            fs.closeSync(outputFd);
+            try { fs.unlinkSync(outPath); } catch {}
+            throw e;
+        }
+
+        console.log('');
+        console.log('=== DONE ===');
+        console.log(`Output: ${outPath} (${formatBytes(result.size)})`);
+        console.log(`Members: ${result.memberCount}${compressOpts.keep ? ' (delta fragments kept)' : ' (delta fragments dropped)'}`);
+
+        if (rmSource) {
+            fs.unlinkSync(inputPath);
+            console.log(`Deleted source: ${inputPath}`);
+        }
+    } finally {
+        for (const fd of fds) {
+            try { fs.closeSync(fd); } catch {}
+        }
+    }
+}
+
+async function compressNSP(inFdInfo, inputPath, outputDir, keys, compressOpts, overwrite, rmSource) {
+    await runCompress(inFdInfo, inputPath, outputDir, keys, compressOpts, overwrite, rmSource,
+        'NSP -> NSZ', '.nsz', compressNSPtoNSZFile);
+}
+
+async function compressXCI(inFdInfo, inputPath, outputDir, keys, compressOpts, overwrite, rmSource) {
+    await runCompress(inFdInfo, inputPath, outputDir, keys, compressOpts, overwrite, rmSource,
+        'XCI -> XCZ', '.xcz', compressXCItoXCZFile);
 }
 
 async function splitNSP(inFdInfo, inputPath, outputDir, keys, overwrite, rmSource) {

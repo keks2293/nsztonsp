@@ -75,9 +75,14 @@ export function pfs0HeaderSize(nameLengths, { fixPadding = false, inputStringTab
     const stringTableLen = nameLengths.reduce((sum, len) => sum + len + 1, 0);
     const rawSize = PFS0_HEADER_SIZE + nameLengths.length * PFS0_ENTRY_SIZE + stringTableLen;
     const pad = (headerAlign - (rawSize % headerAlign)) % headerAlign;
+    // Python Pfs0Stream.getStringTableSize: the input string-table size is
+    // reused as-is; it only grows to the EXACT natural output length (no
+    // alignment padding) when the output names are longer.
     const paddedSize = fixPadding
         ? stringTableLen + pad
-        : (inputStringTableSize ?? (stringTableLen + pad));
+        : (inputStringTableSize === null || inputStringTableSize === undefined
+            ? stringTableLen + pad
+            : Math.max(inputStringTableSize, stringTableLen));
     return PFS0_HEADER_SIZE + nameLengths.length * PFS0_ENTRY_SIZE + paddedSize;
 }
 
@@ -89,16 +94,21 @@ class PFS0Writer {
     // verified on original NSZ headers: Stardew 0x1D0, Little Nightmares II
     // 0x190, both mod 0x20 = 16). The inner CNMT PFS0 (META NCA) uses the 0x20
     // rule (verified: Stardew CNMT strtab=0x38, hdr=0x60).
-    constructor(fixPadding = false, inputStringTableSize = null, headerAlign = 0x20) {
+    // firstOffset: the RELATIVE offset (from the header end) of the first
+    // entry — nonzero when the data starts after a zero gap (python Pfs0Stream
+    // keeps writing at the INPUT's firstFileOffset, so a shrunk output header
+    // is followed by zero padding).
+    constructor(fixPadding = false, inputStringTableSize = null, headerAlign = 0x20, firstOffset = 0) {
         this.files = [];
         this.fixPadding = fixPadding;
         this.inputStringTableSize = inputStringTableSize;
         this.headerAlign = headerAlign;
+        this.firstOffset = firstOffset;
     }
 
     add(name, size) {
         const offset = this.files.length === 0
-            ? 0
+            ? this.firstOffset
             : this.files[this.files.length - 1].offset + this.files[this.files.length - 1].size;
         this.files.push({ name, offset, size });
         this.addpos = offset + size;

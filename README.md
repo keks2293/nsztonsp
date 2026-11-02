@@ -7,7 +7,8 @@ A **100% local** pure JavaScript converter for Nintendo Switch compressed game f
 - **Pure JavaScript**: No server-side processing required
 - **Browser-based**: Works entirely in the browser with File System Access API
 - **Node.js CLI**: Command-line tool for batch processing
-- **Zstandard**: Full support for both streaming and block compression
+- **Zstandard**: Full support for both streaming and block compression, plus compression (NSP→NSZ, XCI→XCZ)
+- **Compression**: NSP→NSZ and XCI→XCZ matching Python nsz byte-for-byte (NCZBLOCK, level 18)
 - **NCA encryption**: Supports CTR and BKTR encryption modes
 - **Integrity verification**: Validates NCA file hashes against CNMT records (per-partition for XCZ)
 - **Python nsz compatible**: Output matches Python nsz byte-for-byte
@@ -21,23 +22,36 @@ A **100% local** pure JavaScript converter for Nintendo Switch compressed game f
 ### Browser Version
 
 1. Open `index.html` in a modern web browser
-2. Drag and drop NSZ files or click to select
-3. (Optional) Load default keys or paste your own prod.keys
-4. Click "Decompress" to decompress
+2. Drag and drop files or click to select
+3. Pick the operation: **Decompress** (`.nsz`/`.xcz` → decompress), **Compress** (a single `.nsp`/`.xci` → `.nsz`/`.xcz`; requires keys — load them first; a **Keep Deltas** toggle retains delta fragments; a **Compression** row sets the zstd level 1-22 and the NCZ block size 64 KiB-16 MiB), **Merge** or **Update**
+4. Click the operation button to run. Compress needs a seekable output — use File System or Blob download mode (SW streaming is refused with an actionable error)
 
 ### Node.js Version
 
 ```bash
-node nsz-cli.js <input> [output] [keys.txt] [options]
+node nsz-cli.js <input> [keys.txt] [options]          # decompress .nsz -> .nsp, .xcz -> .xci
+node nsz-cli.js --merge <nsp|nsz|xci|xcz> [...]      # merge containers into one .nsp
+node nsz-cli.js --update <base> <update>             # physically apply update to base
+node nsz-cli.js --split <nsp>                        # split a merged NSP into one .nsp per title
+node nsz-cli.js --compress <nsp|xci>                 # compress .nsp -> .nsz / .xci -> .xcz (requires --keys)
 ```
 
 Options:
 - `-o, --output <dir>` - Output directory
 - `-w, --overwrite` - Overwrite existing output files
-- `--rm-source` - Delete input file after successful conversion
-- `--keys <path>` - Path to prod.keys file
-- `--no-verify, -nv` - Skip SHA256 verification (faster)
-- `--fix-padding, -p` - Use 0x20-byte alignment (default: 16-byte)
+- `--rm-source` - Delete input file after successful operation
+- `--keys <path>` - Path to prod.keys file (required for `--split`/`--compress`; used by decompress verification for CNMT hash checks)
+- `--no-verify, -nv` - Skip SHA256 verification (faster) [decompress]
+- `--fix-padding, -p` - Use 0x20-byte alignment (default: reuse input string-table size, matching Python nsz) [decompress]
+- `--compress` - Compress PROGRAM/PUBLIC_DATA NCAs to NCZ (zstd level 18, 1 MiB blocks, block mode by default), copy the rest; for `.xci` only the "secure" partition is compressed (matching Python nsz)
+- `-K, --keep` - Keep delta-fragment NCAs in the compressed output (dropped by default, matching Python nsz) [compress]
+- `-l, --level <n>` - zstd compression level 1-22 (default 18, matching Python nsz `-l`) [compress]
+- `-s, --bs <exp>` - NCZ block size 2^exp, exp 14-32 (default 20 = 1 MiB, matching Python nsz `-s`) [compress, block mode]
+- `-L, --long` - zstd long-distance matching (best ratio, slowest; matching Python nsz `-L`) [compress]
+- `-S, --solid` - Solid mode: one zstd frame per NCA (Python nsz NSZ default; mutually exclusive with `-B`) [compress]
+- `-B, --block` - Block mode: independent NCZBLOCK blocks (default here; mutually exclusive with `-S`) [compress]
+- `-n, --nodelta` - Exclude delta-fragment NCAs [merge]
+- `--update`, `--keep-npdm-acid-sig`, `--keep-npdm-acid-key` - update options (see `--help`)
 - `-h, --help` - Show usage information
 
 ## Python nsz Compatibility
@@ -74,7 +88,8 @@ nsz-js/
 │   ├── ncz.js              # NCZ decompression, DataReader hierarchy, AsyncBlockDecompressorReader
 │   ├── nsz-decompress.js      # NSZ→NSP streaming/memory conversion (adapter pattern)
 │   ├── xcz-decompress.js      # XCZ→XCI streaming conversion (adapter pattern)
-│   ├── xci.js              # XCI/HFS0 container support (XCIReader)
+│   ├── compress.js         # NSP→NSZ / XCI→XCZ compression (Python nsz byte-for-byte)
+│   ├── xci.js              # XCI/HFS0 container support (XCIReader, shared XCI layout constants)
 │   ├── hfs0.js             # HFS0 container parsing and writing
 │   ├── ticket.js           # Ticket parsing
 │   ├── cnmt.js             # CNMT (Content Metadata) parsing
@@ -113,6 +128,7 @@ nsz-js/
 - **build.js** - esbuild bundler script, builds `out/app.mjs` and copies runtime assets
 - **fs/nsz-decompress.js** - NSZ→NSP streaming/memory conversion (adapter pattern, shared with CLI)
 - **fs/xcz-decompress.js** - XCZ→XCI streaming conversion (adapter pattern, shared with CLI)
+- **fs/compress.js** - NSP→NSZ / XCI→XCZ compression: per-NCA analysis (skip rules), NCZBLOCK writer (zstd level 18, 1 MiB blocks), NCZ section tables, container rebuilds with seek-back headers (shared with CLI + browser)
 
 ### Crypto Files
 
@@ -235,6 +251,8 @@ The `scripts/` directory contains 54 comparison, analysis, debugging, and benchm
 |-------|--------|-------------|
 | `.nsz` | `.nsp` | Compressed NSP container |
 | `.xcz` | `.xci` | Compressed XCI (game card) image |
+| `.nsp` | `.nsz` | Compress (PROGRAM/PUBLIC_DATA NCAs → NCZ, zstd level 18; requires keys) |
+| `.xci` | `.xcz` | Compress (same rules; without `--keep` only the "secure" partition, matching Python nsz) |
 
 ### Internal formats
 
