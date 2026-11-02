@@ -450,8 +450,8 @@ Delta fragments (DATA NCAs) are **dropped** unless `keep` (python default;
 |---|---|---|---|
 | `level` | `-l` | int 1-22, default **18** | web + CLI |
 | `blockSizeExponent` | `-s` | int 14-32 (2^exp), default **20** = 1 MiB | web + CLI, block mode only |
-| `ldm` | `-L` | off/on | **CLI only** (node:zlib parameters; the browser wasm exposes no compressor parameters) |
-| `mode` | `-S` / `-B` | `'block'` / `'solid'`, default **`'block'`** (python defaults to solid for NSZ — here block is the deliberate default) | solid is **CLI only** (not wired into the browser path yet; the browser wasm does have a streaming compressor) |
+| `ldm` | `-L` | off/on | **CLI only** (node:zlib parameters; enforced at the zstd leaves — `compressBlock` / `createSolidCompressor` throw on the wasm path, which exposes no compressor parameters) |
+| `mode` | `-S` / `-B` | `'block'` / `'solid'`, default **`'block'`** (python defaults to solid for NSZ — here block is the deliberate default) | web + CLI (node:zlib streaming on Node; the tootallnate wasm streaming compressor in the browser — `createSolidCompressor` dispatches) |
 
 **Block mode** (`mode: 'block'`, python `BlockCompressor` / `-B`): the payload
 is NCZBLOCK — header (magic, ver 2, type 1, unused 0, `blockSizeExponent`@11,

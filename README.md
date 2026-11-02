@@ -23,7 +23,7 @@ A **100% local** pure JavaScript converter for Nintendo Switch compressed game f
 
 1. Open `index.html` in a modern web browser
 2. Drag and drop files or click to select
-3. Pick the operation: **Decompress** (`.nsz`/`.xcz` → decompress), **Compress** (a single `.nsp`/`.nsz`/`.xci`/`.xcz` → `.nsz`/`.xcz`; the output is named `<name>_blockcomp.<ext>` — the browser is block mode only; a `.nsz`/`.xcz` input is RE-COMPRESSED — its `.ncz` members are decompressed and re-compressed with the selected options; requires keys — load them first; a **Keep Deltas** toggle retains delta fragments; a **Compression** row sets the zstd level 1-22 and the NCZ block size 64 KiB-16 MiB), **Merge** or **Update**
+3. Pick the operation: **Decompress** (`.nsz`/`.xcz` → decompress), **Compress** (a single `.nsp`/`.nsz`/`.xci`/`.xcz` → `.nsz`/`.xcz`; the output is named `<name>_blockcomp.<ext>` / `<name>_solidcomp.<ext>` per the selected mode; a `.nsz`/`.xcz` input is RE-COMPRESSED — its `.ncz` members are decompressed and re-compressed with the selected options; requires keys — load them first; a **Keep Deltas** toggle retains delta fragments; a **Compression** row sets the zstd level 1-22, the mode — Block (NCZBLOCK random access) or Solid (one zstd frame over the whole payload, the Python nsz NSZ default) — and the NCZ block size 64 KiB-16 MiB (block mode only); long mode (LDM) is CLI-only), **Merge** or **Update**
 4. Click the operation button to run. Compress needs a seekable output — use File System or Blob download mode (SW streaming is refused with an actionable error)
 
 ### Node.js Version

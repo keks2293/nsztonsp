@@ -821,10 +821,15 @@
                                 </button>
                                 <div id="compress-opts-info" popover class="info-popover" role="dialog" aria-label="Compression options descriptions">
                                     <b>Level</b> — zstd compression level 1-22 (higher = better ratio, slower). Default 18, matching Python nsz -l.<br>
-                                    <b>Block size</b> — NCZ block size, 64 KiB to 16 MiB. Default 1 MiB, matching Python nsz -s. Smaller blocks decompress faster and use less RAM on random access; larger blocks compress better.
+                                    <b>Mode</b> — Block: independent zstd blocks with random access (NCZBLOCK; Python nsz -B). Solid: one zstd frame over the whole payload (Python nsz -S, its default for NSZ) — best ratio, but no random access and the block size does not apply. Long mode (LDM) is CLI-only.<br>
+                                    <b>Block size</b> — NCZ block size, 64 KiB to 16 MiB. Default 1 MiB, matching Python nsz -s. Smaller blocks decompress faster and use less RAM on random access; larger blocks compress better. (Block mode only.)
                                 </div>
                                 <div class="compress-opts">
                                     <label class="compress-opt" for="compressLevelInput">Level <input type="number" id="compressLevelInput" min="1" max="22" step="1" value="18"></label>
+                                    <label class="compress-opt" for="compressModeSelect">Mode <select id="compressModeSelect">
+                                        <option value="block" selected>Block</option>
+                                        <option value="solid">Solid</option>
+                                    </select></label>
                                     <label class="compress-opt" for="compressBlockSizeSelect">Block <select id="compressBlockSizeSelect">
                                         <option value="16">64 KiB</option>
                                         <option value="17">128 KiB</option>

@@ -173,18 +173,20 @@ class NSZConverter {
     }
 
     // Compress an NSP/NSZ to NSZ (.nsp → .nsz, .nsz → .nsz). The inverse of
-    // decompressNSZtoNSP: eligible NCAs are re-compressed to .ncz (block mode,
-    // zstd level 18, 1 MiB blocks — configurable via level/blockSizeExponent),
-    // the rest is copied. .nsz input re-compresses its .ncz members (their
-    // original NCA bytes are re-run through the same pipeline — an extension,
-    // Python nsz never re-compresses). The output name is
-    // <stem>_blockcomp<ext> / <stem>_solidcomp<ext> (compressedOutputName —
-    // every compression output gets it; it never collides with the input).
-    // Delta fragments (DATA NCAs) are dropped unless keep. Compression
-    // needs a seekable target (the PFS0 header is written last and the NCZ
-    // size list is patched back), so the output is either a seekable FSA
-    // writable or in-memory — never an append-only SW stream (callers guard
-    // this). ldm and solid mode are CLI-only (nsz-cli.js -L/-S).
+    // decompressNSZtoNSP: eligible NCAs are re-compressed to .ncz (block mode
+    // by default, zstd level 18, 1 MiB blocks — configurable via
+    // level/blockSizeExponent/mode), the rest is copied. .nsz input
+    // re-compresses its .ncz members (their original NCA bytes are re-run
+    // through the same pipeline — an extension, Python nsz never re-compresses).
+    // The output name is <stem>_blockcomp<ext> / <stem>_solidcomp<ext>
+    // (compressedOutputName — every compression output gets it; it never
+    // collides with the input). Delta fragments (DATA NCAs) are dropped unless
+    // keep. Compression needs a seekable target (the PFS0 header is written
+    // last and the NCZ size list is patched back), so the output is either a
+    // seekable FSA writable or in-memory — never an append-only SW stream
+    // (callers guard this). solid works in both environments (node:zlib / wasm
+    // streaming); ldm is CLI-only (nsz-cli.js -L — the browser wasm build has
+    // no compressor parameters).
     async compressNSPtoNSZ(file, options = {}) {
         const { onProgress = () => {}, onLog = () => {}, keep = false, writable = null, level, blockSizeExponent, mode } = options;
         onLog('info', `Compressing ${file.name} (${formatBytes(file.size)})...`);
@@ -214,18 +216,20 @@ class NSZConverter {
 
     // Compress an XCI/XCZ to XCZ (.xci → .xcz, .xcz → .xcz). The inverse of
     // decompressXCZtoXCI: eligible NCAs in the partitions are re-compressed to
-    // .ncz (block mode, zstd level 18, 1 MiB blocks — configurable via
-    // level/blockSizeExponent), the rest is copied. .xcz input re-compresses
-    // its .ncz members (an extension, Python nsz never re-compresses). The
-    // output name is <stem>_blockcomp<ext> / <stem>_solidcomp<ext>
-    // (compressedOutputName — every compression output gets it; it never
-    // collides with the input). Like Python nsz,
-    // only the "secure" partition is processed unless keep is set (the other
-    // partitions become empty 0x200 stubs). Delta fragments (DATA NCAs) are
-    // dropped unless keep. Compression needs a seekable target (per-partition HFS0
-    // headers are written after their data), so the output is either a
-    // seekable FSA writable or in-memory — never an append-only SW stream
-    // (callers guard this). ldm and solid mode are CLI-only (nsz-cli.js -L/-S).
+    // .ncz (block mode by default, zstd level 18, 1 MiB blocks — configurable
+    // via level/blockSizeExponent/mode), the rest is copied. .xcz input
+    // re-compresses its .ncz members (an extension, Python nsz never
+    // re-compresses). The output name is <stem>_blockcomp<ext> /
+    // <stem>_solidcomp<ext> (compressedOutputName — every compression output
+    // gets it; it never collides with the input). Like Python nsz, only the
+    // "secure" partition is processed unless keep is set (the other partitions
+    // become empty 0x200 stubs). Delta fragments (DATA NCAs) are dropped unless
+    // keep. Compression needs a seekable target (per-partition HFS0 headers are
+    // written after their data), so the output is either a seekable FSA
+    // writable or in-memory — never an append-only SW stream (callers guard
+    // this). solid works in both environments (node:zlib / wasm streaming);
+    // ldm is CLI-only (nsz-cli.js -L — the browser wasm build has no
+    // compressor parameters).
     async compressXCItoXCZ(file, options = {}) {
         const { onProgress = () => {}, onLog = () => {}, keep = false, writable = null, level, blockSizeExponent, mode } = options;
         onLog('info', `Compressing ${file.name} (${formatBytes(file.size)})...`);

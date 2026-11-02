@@ -48,6 +48,7 @@ async function main() {
     const bufferUpdateBtn = document.getElementById('bufferUpdateBtn');
     const compressSettings = document.getElementById('compressSettings');
     const compressLevelInput = document.getElementById('compressLevelInput');
+    const compressModeSelect = document.getElementById('compressModeSelect');
     const compressBlockSizeSelect = document.getElementById('compressBlockSizeSelect');
 
     // Buffer pills — BufferUpdate is ON BY DEFAULT (its section buffer is the
@@ -368,6 +369,15 @@ async function main() {
     keepDeltasBtn.addEventListener('click', () => {
         keepDeltas = !keepDeltas;
         keepDeltasBtn.classList.toggle('on', keepDeltas);
+    });
+
+    // Mode: block (NCZBLOCK, random access) / solid (one zstd frame over the
+    // whole payload — python nsz -S, its NSZ default). Solid has no blocks, so
+    // the block size control is disabled for it (like python -S ignoring -s).
+    // LDM (python -L) is CLI-only: the browser wasm build exposes no
+    // compressor parameters.
+    compressModeSelect.addEventListener('change', () => {
+        compressBlockSizeSelect.disabled = compressModeSelect.value !== 'block';
     });
 
     // The two buffer pills are mutually exclusive (each selects one route).
@@ -880,24 +890,29 @@ async function main() {
             return;
         }
 
-        // Compression options (python nsz parity): level 1-22 (-l), block
-        // size exponent 14-32 (-s). ldm (-L) and solid (-S) are CLI-only —
-        // ldm needs the node:zlib parameter API (the wasm exposes no
-        // compressor parameters); solid is not wired into the browser path
-        // yet.
+        // Compression options (python nsz parity): level 1-22 (-l), mode
+        // block/solid (-B/-S), block size exponent 14-32 (-s, block mode only).
+        // ldm (-L) is CLI-only — it needs the node:zlib parameter API (the
+        // wasm exposes no compressor parameters).
         const level = parseInt(compressLevelInput.value, 10);
+        const compressMode = compressModeSelect.value;
         const blockSizeExponent = parseInt(compressBlockSizeSelect.value, 10);
         if (!Number.isInteger(level) || level < 1 || level > 22) {
             addLog('error', `Invalid zstd level: ${compressLevelInput.value} (must be an integer from 1 to 22).`);
             endRun();
             return;
         }
+        // Mode comes from a two-option select (block/solid) — nothing to check
+        // here; normalizeCompressOptions is the validation gate (throws on any
+        // other value).
         if (!Number.isInteger(blockSizeExponent) || blockSizeExponent < 14 || blockSizeExponent > 32) {
             addLog('error', `Invalid block size exponent: ${compressBlockSizeSelect.value} (must be an integer from 14 to 32).`);
             endRun();
             return;
         }
-        addLog('info', `Options: zstd level ${level}, block size ${blockSizeExponent >= 20 ? (1 << (blockSizeExponent - 20)) + ' MiB' : ((1 << (blockSizeExponent - 10)) / 1024) + ' KiB'}`);
+        addLog('info', compressMode === 'solid'
+            ? `Options: zstd level ${level}, mode solid (one frame, no random access)`
+            : `Options: zstd level ${level}, mode block, block size ${blockSizeExponent >= 20 ? (1 << (blockSizeExponent - 20)) + ' MiB' : ((1 << (blockSizeExponent - 10)) / 1024) + ' KiB'}`);
 
         const totalBytes = files[0].size;
         const startTime = Date.now();
@@ -908,15 +923,15 @@ async function main() {
 
         const inputName = files[0].name.toLowerCase();
         const isXci = inputName.endsWith('.xci') || inputName.endsWith('.xcz');
-        // The output is named <stem>_blockcomp<ext> (compressedOutputName —
-        // the same naming as the CLI; the browser is block mode only), so it
+        // The output is named <stem>_blockcomp<ext> / <stem>_solidcomp<ext>
+        // (compressedOutputName — the same uniform naming as the CLI), so it
         // never collides with the input in any download mode. The FSA check
         // below is the backstop for the one remaining collision: the input
-        // itself already carries that suffix (the browser hides the input's
-        // path, so same-name + same-size in the picked directory is the only
-        // signal).
+        // itself already carries the chosen mode's suffix (the browser hides
+        // the input's path, so same-name + same-size in the picked directory
+        // is the only signal).
         const reCompress = inputName.endsWith('.nsz') || inputName.endsWith('.xcz');
-        const outputName = compressedOutputName(files[0].name, 'block', isXci ? '.xcz' : '.nsz');
+        const outputName = compressedOutputName(files[0].name, compressMode, isXci ? '.xcz' : '.nsz');
         const compressFn = isXci ? converter.compressXCItoXCZ.bind(converter) : converter.compressNSPtoNSZ.bind(converter);
         if (reCompress) {
             addLog('info', `Re-compression: .ncz members are decompressed and re-compressed with the selected options (output ${outputName}).`);
@@ -952,6 +967,7 @@ async function main() {
                 writable,
                 keep: keepDeltas,
                 level,
+                mode: compressMode,
                 blockSizeExponent,
             });
             checkSwDelivered(writable, result.size);

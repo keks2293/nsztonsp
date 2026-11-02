@@ -474,11 +474,13 @@ async function* decompressNodeStream(readChunk) {
     }
 }
 
-// Node-only STREAMING zstd compressor for SOLID NCZ (python nsz -S /
-// SolidCompressor): one frame over the whole NCA payload, fed in chunks.
-// The tootallnate wasm does have a streaming compressor (ZSTD_compressStream2
-// via compress_stream, driven by this facade) — but solid mode is not wired
-// into the browser path yet (only the CLI uses it), so it stays CLI-only.
+// STREAMING zstd compressor for SOLID NCZ (python nsz -S / SolidCompressor):
+// one frame over the whole NCA payload, fed in chunks. Platform dispatch:
+// Node uses node:zlib createZstdCompress (full parameter API — supports LDM);
+// browser (and forced-WASM) uses the tootallnate wasm streaming compressor
+// (ZSTD_compressStream2 via compress_stream) — LDM is impossible there (the
+// wasm build exposes no compressor parameters, only cctx_set_level), so ldm
+// throws.
 //
 // Usage:
 //   const comp = await createSolidCompressor({ level, ldm });
@@ -489,15 +491,23 @@ async function* decompressNodeStream(readChunk) {
 // On error: comp.abort() to tear the compressor down, then rethrow.
 // Buffers are COPIED on write() — the caller may reuse its own buffers.
 //
-// The producer (write) and the compressor's readable side are decoupled by a
-// bounded queue (QUEUE_MAX chunks, 16 MiB each by convention): the feed loop
-// shifts chunks into createZstdCompress with drain backpressure, exactly the
-// pump model of decompressNodeStream — so peak memory is O(window + queue),
-// never the whole payload.
+// The producer (write) and the compressor are decoupled by a bounded queue
+// (QUEUE_MAX chunks, 16 MiB each by convention), so peak memory is
+// O(window + queue), never the whole payload.
 export async function createSolidCompressor({ level = 18, ldm = false } = {}) {
-    if (!isNode) {
-        throw new Error('Solid compression is CLI-only (node:zlib streaming zstd): solid mode is not wired into the browser path yet');
+    if (!isNode || forceWasm) {
+        if (ldm) {
+            throw new Error('zstd long mode (LDM) is CLI-only: the browser wasm build has no compressor parameters');
+        }
+        return createWasmSolidCompressor(level);
     }
+    return createNodeSolidCompressor({ level, ldm });
+}
+
+// node:zlib variant: the feed loop shifts queue chunks into
+// createZstdCompress with drain backpressure — the pump model of
+// decompressNodeStream.
+async function createNodeSolidCompressor({ level, ldm }) {
     const zlib = await nodeZlib();
     const compressor = zlib.createZstdCompress({ highWaterMark: 1 << 20, params: await zstdCompressParams(level, ldm) });
 
@@ -596,6 +606,152 @@ export async function createSolidCompressor({ level = 18, ldm = false } = {}) {
             wake();
             if (!compressor.destroyed) compressor.destroy();
             await feed.catch(() => {});
+        }
+    }
+
+    return { write, finish, abort, [Symbol.asyncIterator]: pump };
+}
+
+// tootallnate WASM variant: the same push contract, driven by the raw
+// streaming exports. The feed loop shifts queue chunks into
+// ZSTD_compressStream2 (synchronous calls, sliced to cstream_in_size —
+// feeding more silently corrupts the heap) and the chunks it produces land in
+// outQueue, which the pump yields; a bounded outQueue (fed at most as fast as
+// the input queue drains) keeps peak memory at O(window + 2×queue), never the
+// whole payload. Fresh cctx + buffers per compressor, freed when the pump
+// ends (a cctx, unlike a dctx, is not tainted by errors, but per-op
+// allocation is the uniform policy and cctx_new is a cheap small malloc).
+async function createWasmSolidCompressor(level) {
+    const $ = await loadWasm();
+    const cctx = $.cctx_new();
+    if (!cctx) throw new Error('zstd wasm: failed to allocate compressor context');
+    const inCap = $.cstream_in_size();
+    const outCap = $.cstream_out_size();
+    const inP = $.zstd_malloc(inCap);
+    const outP = $.zstd_malloc(outCap);
+    const bufP = $.zstd_malloc(BUF.SIZE);
+    if (!inP || !outP || !bufP) {
+        $.cctx_free(cctx);
+        throw new Error('zstd wasm: failed to allocate streaming buffers');
+    }
+    try {
+        checkError($, $.cctx_set_level(cctx, level)); // applies to the next frame
+    } catch (e) {
+        $.cctx_free(cctx);
+        $.zstd_free(inP);
+        $.zstd_free(outP);
+        $.zstd_free(bufP);
+        throw e;
+    }
+
+    const QUEUE_MAX = 8;
+    const queue = [];        // plain input chunks waiting to be fed
+    const outQueue = [];     // compressed chunks produced, waiting to be pulled
+    let spaceWaiters = [];   // write() callers waiting for input-queue space
+    let itemWaiters = [];    // feed loop waiting for the next chunk / end
+    let outWaiters = [];     // pump waiting for produced output
+    let inputEnded = false;
+    let aborted = false;
+    let feedError = null;
+
+    const wake = () => {
+        spaceWaiters.splice(0).forEach((r) => r());
+        itemWaiters.splice(0).forEach((r) => r());
+        outWaiters.splice(0).forEach((r) => r());
+    };
+
+    const write = async (chunk) => {
+        if (aborted) throw new Error('zstd solid compressor: aborted');
+        if (!chunk || !chunk.byteLength) return;
+        while (queue.length >= QUEUE_MAX) {
+            await new Promise((resolve) => {
+                if (aborted) return resolve();
+                spaceWaiters.push(resolve);
+            });
+            if (aborted) throw new Error('zstd solid compressor: aborted');
+        }
+        queue.push(new Uint8Array(chunk)); // copy — the caller may reuse its buffer
+        wake();
+    };
+
+    const finish = () => { inputEnded = true; wake(); };
+
+    const abort = () => {
+        if (aborted) return;
+        aborted = true;
+        queue.length = 0;
+        wake();
+    };
+
+    async function* pump() {
+        // Output is COPIED out of the wasm heap: a later heap growth detaches
+        // every ArrayBuffer-backed view, and the SW output adapter may
+        // transfer (detach) the chunk buffers.
+        const onOutput = (view) => {
+            outQueue.push(new Uint8Array(view));
+            wake();
+        };
+        // The feed IIFE always settles (errors are captured in feedError);
+        // its finally marks the compressor done and wakes every waiter, so a
+        // pump blocked in outWaiters can never outlive the feed.
+        const feed = (async () => {
+            try {
+                for (;;) {
+                    if (aborted) return;
+                    if (queue.length > 0) {
+                        const chunk = queue.shift();
+                        wake(); // input-queue space freed
+                        // Input MUST be sliced into inCap-sized pieces (the
+                        // wasm input buffer bound); feeding more at once
+                        // silently corrupts the heap.
+                        for (let off = 0; off < chunk.length; off += inCap) {
+                            if (aborted) return;
+                            const take = Math.min(chunk.length - off, inCap);
+                            new Uint8Array($.memory.buffer).set(chunk.subarray(off, off + take), inP);
+                            runCompress($, cctx, inP, outP, bufP, outCap, take, 0, onOutput);
+                        }
+                        continue;
+                    }
+                    if (inputEnded) {
+                        runCompress($, cctx, inP, outP, bufP, outCap, 0, 2, onOutput); // end
+                        return;
+                    }
+                    await new Promise((resolve) => {
+                        if (aborted) return resolve();
+                        itemWaiters.push(resolve);
+                    });
+                }
+            } catch (e) {
+                feedError = e;
+            } finally {
+                aborted = true;
+                wake();
+            }
+        })();
+        try {
+            for (;;) {
+                while (outQueue.length === 0) {
+                    if (feedError) throw feedError;
+                    if (aborted) break; // feed ended without error
+                    await new Promise((resolve) => {
+                        if (aborted || feedError || outQueue.length > 0) return resolve();
+                        outWaiters.push(resolve);
+                    });
+                }
+                if (outQueue.length === 0) break; // feed ended (or aborted)
+                yield outQueue.shift();
+            }
+            await feed;
+            if (feedError) throw feedError;
+        } finally {
+            aborted = true;
+            queue.length = 0;
+            wake();
+            $.cctx_free(cctx);
+            $.zstd_free(inP);
+            $.zstd_free(outP);
+            $.zstd_free(bufP);
+            await feed;
         }
     }
 

@@ -5,7 +5,9 @@
 // 1 MiB blocks, raw-when-incompressible — or ONE solid zstd frame) and the
 // container is rebuilt (PFS0 for NSZ; XCI/HFS0 for XCZ). Options (level,
 // blockSizeExponent, ldm, mode) match python: -l, -s, -L, -S/-B — see
-// normalizeCompressOptions; ldm and solid are CLI-only (node:zlib).
+// normalizeCompressOptions. ldm is CLI-only — enforced at the zstd leaves
+// (compressBlock / createSolidCompressor throw on the wasm path: the build
+// exposes no compressor parameters).
 //
 // ── Crypto model (verified byte-for-byte against real base.nsz + update.nsz
 //    produced by Python nsz) ────────────────────────────────────────────────
@@ -51,7 +53,6 @@
 // undecryptable headers, non-packed NCAs) is copied verbatim.
 
 import { compressBlock, createSolidCompressor } from '../crypto/zstd.js';
-import { isNode } from '../crypto/platform.js';
 import { UNCOMPRESSABLE_HEADER_SIZE, NCZ_CRYPTO_TYPE, NCZ_SECTN_ENTRY, NczNcaReader } from './ncz.js';
 import { readLeU64, writeU32LE, writeU64LE } from './bytes.js';
 import { NCAHeader, decryptNcaSection } from './nca.js';
@@ -78,9 +79,10 @@ const DEFAULT_LEVEL = 18;                       // python -l default
 //                     parameters; the browser wasm has no compressor params)
 //   mode              'block' (NCZBLOCK, the default here; python -B) or
 //                     'solid' (one zstd frame over the whole payload; python
-//                     -S; CLI only — not wired into the browser path yet; the
-//                     browser wasm does have a streaming compressor, the CLI
-//                     just uses node:zlib for now). NOTE: python nsz defaults
+//                     -S). Works in both environments: node:zlib streaming on
+//                     Node, the tootallnate wasm streaming compressor in the
+//                     browser (createSolidCompressor dispatches). NOTE: python
+//                     nsz defaults
 //                     to SOLID for NSZ
 //                     and BLOCK for XCZ; here BLOCK is the default for both —
 //                     the NCZSECTN table is identical in both modes, only the
@@ -99,9 +101,10 @@ export function normalizeCompressOptions(opts = {}) {
     if (mode !== 'block' && mode !== 'solid') {
         throw new Error(`Invalid compression mode '${mode}' (must be 'block' or 'solid')`);
     }
-    if (!isNode && (ldm || mode === 'solid')) {
-        throw new Error(`${ldm ? 'Long mode (LDM)' : 'Solid mode'} is CLI-only: ${ldm ? 'the browser zstd wasm exposes no compressor parameters' : 'solid mode is not wired into the browser path yet'}`);
-    }
+    // ldm is not checked here: the capability guards live at the leaves where
+    // the divergence would occur — compressBlock() and createSolidCompressor()
+    // both throw for ldm on the wasm path (the build exposes no compressor
+    // parameters).
     return { level, blockSizeExponent, ldm, mode };
 }
 
@@ -427,8 +430,10 @@ export async function compressNcaToWriter(ncaReader, ncaSize, analysis, opts, wr
     if (mode === 'solid') {
         // SOLID (python -S / SolidCompressor): ONE zstd frame over the whole
         // payload, right after the table — NO NCZBLOCK header. The frame is
-        // streamed (node:zlib): plaintext is fed in 16 MiB chunks (python
-        // CHUNK_SZ) and the frame is written out as it is produced.
+        // STREAMED (createSolidCompressor: node:zlib on Node — supports LDM —
+        // or the tootallnate wasm in the browser): plaintext is fed in 16 MiB
+        // chunks (python CHUNK_SZ) and the frame is written out as it is
+        // produced.
         const comp = await createSolidCompressor({ level, ldm });
         let outPos = payloadStart;
         let runIdx = 0;
@@ -605,7 +610,7 @@ async function planMembers(files, { reader, keys, byRightsId, byTitleId, keep, l
 // `reader` is the input NSP reader; `output` is { memory:true } | { fd } | { writable }.
 export async function compressNSPtoNSZ(reader, output, options = {}) {
     const { keys, keep = false, log = () => {}, progress = () => {}, createHash } = options;
-    const compressOpts = normalizeCompressOptions(options); // validate level/bs/ldm/mode up front
+    const compressOpts = normalizeCompressOptions(options); // validate level/bs/mode up front (ldm at the zstd leaves)
     if (!keys || !keys.header_key) throw new Error('Keys are required to compress (decrypt NCA headers). Load keys first.');
 
     const pfs0 = await PFS0.open(reader);
@@ -711,7 +716,7 @@ export async function compressNSPtoNSZ(reader, output, options = {}) {
 // `reader` is the input XCI reader; `output` is { memory:true } | { fd } | { writable }.
 export async function compressXCItoXCZ(reader, output, options = {}) {
     const { keys, keep = false, log = () => {}, progress = () => {}, createHash } = options;
-    const compressOpts = normalizeCompressOptions(options); // validate level/bs/ldm/mode up front
+    const compressOpts = normalizeCompressOptions(options); // validate level/bs/mode up front (ldm at the zstd leaves)
     if (!keys || !keys.header_key) throw new Error('Keys are required to compress (decrypt NCA headers). Load keys first.');
 
     const xci = new XCIReader(reader);

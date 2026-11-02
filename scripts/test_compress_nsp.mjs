@@ -195,7 +195,8 @@ const nspSize = fstatSync(openSync(NSP_PATH, 'r')).size;
 // ── 0c. Compression options on a synthetic CTR NCA ──────────────────────────
 // Builds a small PROGRAM NCA (0x64000: raw 0x4000 header + one 0x60000 CTR
 // section) in a 1-member PFS0 NSP and exercises the python-nsz option set:
-//   - level + blockSizeExponent (block mode), solid (one zstd frame), ldm
+//   - level + blockSizeExponent (block mode), solid (one zstd frame — node:zlib
+//     and the forced-WASM browser path), ldm
 // Every variant must round-trip (NCZDecompressor → original NCA bytes), and the
 // NCZSECTN table must be byte-identical across variants — options change only
 // the payload layout, never the table.
@@ -322,6 +323,41 @@ const nspSize = fstatSync(openSync(NSP_PATH, 'r')).size;
     // 4. ldm (block mode, long-distance matching).
     const ldm = await compressNsp({ ldm: true });
     check('opt ldm: round-trip identical', sameBytes(await roundTrip(ldm.nczFile, ldm.blob), nca));
+
+    // 4b. Solid on the FORCED-WASM backend (the browser path): the tootallnate
+    // streaming compressor. NOTE: both backends are libzstd 1.5.7, so the same
+    // input yields a BYTE-IDENTICAL frame (verified: 654 B, equal) — the
+    // backend switch is NOT observable in the frame bytes. The one observable
+    // difference is that only the wasm branch throws for LDM (node:zlib
+    // supports it), so (a) proves the flag routed to the wasm branch, then (b)
+    // asserts the wasm path produces a valid single frame that round-trips and
+    // keeps the identical table.
+    {
+        const { setZstdStreamForcedWasm, createSolidCompressor, inspectFrame } = await import('../crypto/zstd.js');
+        setZstdStreamForcedWasm(true);
+        try {
+            // (a) forced-wasm flag routes to the wasm branch: it throws for LDM.
+            let ldmThrew = false;
+            try { await createSolidCompressor({ level: 18, ldm: true }); }
+            catch (e) { ldmThrew = /LDM|CLI-only|long mode/i.test(e.message); }
+            check('opt solid(wasm): forced-wasm flag routes to the wasm branch (ldm throws)', ldmThrew);
+            // (b) integration: solid on the wasm path.
+            const solidWasm = await compressNsp({ mode: 'solid' });
+            bh = blockHdr(solidWasm.blob, solidWasm.nczFile);
+            check('opt solid(wasm): zstd frame after the table (magic 0xFD2FB528 LE)',
+                bh[0] === 0x28 && bh[1] === 0xB5 && bh[2] === 0x2F && bh[3] === 0xFD,
+                [bh[0], bh[1], bh[2], bh[3]].map(b => '0x' + b.toString(16)).join(' '));
+            const solidFrame = solidWasm.blob.subarray(
+                solidWasm.nczFile.offset + 0x4000 + 80, solidWasm.nczFile.offset + solidWasm.nczFile.size);
+            check('opt solid(wasm): frame is a valid single zstd frame', inspectFrame(solidFrame) !== null);
+            check('opt solid(wasm): round-trip identical',
+                sameBytes(await roundTrip(solidWasm.nczFile, solidWasm.blob), nca));
+            check('opt solid(wasm): table identical to default',
+                tableOf(solidWasm.blob, solidWasm.nczFile).equals(tableOf(dflt.blob, dflt.nczFile)));
+        } finally {
+            setZstdStreamForcedWasm(false);
+        }
+    }
 
     // 5. Invalid options are rejected (before any payload work).
     for (const [opts, label] of [
