@@ -48,3 +48,6 @@ for (const file of ASSETS) {
 }
 mkdirSync('out/static', { recursive: true });
 copyFileSync('static/prod.keys', 'out/static/prod.keys');
+// Runtime-fetched by crypto/zstd.js in the browser (true streaming compress +
+// decompress; the old zstddec.mjs base64 embedding is gone).
+copyFileSync('static/zstd.wasm', 'out/static/zstd.wasm');

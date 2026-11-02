@@ -597,12 +597,13 @@ async function main() {
     // WASM-path guard for the writeFromReader reader length. The streaming
     // decompressor must be fed exactly the container bytes (nczLen), never the
     // decompressed size (size/ncaSize): over-feeding runs past the zstd frame
-    // into trailing data, and the zstddec WASM wrapper throws ZSTD_decompressStream
-    // failed: -10 (prefix_unknown). node:zlib silently ignores that trailing data
-    // (which is how the pre-fix bug sailed through this suite), so this case
-    // forces the WASM path via setZstdStreamForcedWasm and traces the real
-    // writeFromReader loop. The member carries garbage *after* the frame so any
-    // over-read hits non-zstd bytes and must fail the test.
+    // into trailing data, and the WASM streaming path rejects it — the decoder
+    // errors on input after the frame ends ("trailing bytes after frame end")
+    // and the expectedSize byte-count gate throws. node:zlib silently ignores
+    // that trailing data (which is how the pre-fix bug sailed through this
+    // suite), so this case forces the WASM path via setZstdStreamForcedWasm and
+    // traces the real writeFromReader loop. The member carries garbage *after*
+    // the frame so any over-read hits non-zstd bytes and must fail the test.
     const wasmPayload = new Uint8Array(0x20000);
     for (let i = 0; i < wasmPayload.length; i++) wasmPayload[i] = (i * 3 + 11) & 0xFF;
     const nczWasm = buildNcz(header, wasmPayload);

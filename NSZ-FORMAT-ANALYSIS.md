@@ -397,7 +397,7 @@ if hexHash[:32] == fileNameHash:
 - Block decompressor — ✅ implemented in `ncz.js`
 - AES-CTR counter (nonce[0:8] + BE64 blockIndex) — ✅ FIXED (big-endian counter)
 - NCA header preservation — ✅ FIXED (detect and prepend when present)
-- Browser zstd decompression — `DecompressionStream('zstd')` NOT supported in any browser. Uses zstddec WASM library via `static/zstddec.mjs`. Handles any window size. See `BROWSER-ZSTD-LIMITATION.md`.
+- Browser zstd compress + decompression — `DecompressionStream('zstd')` NOT supported in any browser. Uses `@tootallnate/zstd-wasm` (true streaming) via `static/zstd.wasm`. Handles any window size. See `BROWSER-ZSTD-BACKEND.md`.
 - Shellcode zstd detection — ✅ implemented in `ncz.js`
 
 ### Chunk size comparison (nsz v4.6.1):

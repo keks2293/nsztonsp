@@ -7,7 +7,7 @@ A **100% local** pure JavaScript converter for Nintendo Switch compressed game f
 - **Pure JavaScript**: No server-side processing required
 - **Browser-based**: Works entirely in the browser with File System Access API
 - **Node.js CLI**: Command-line tool for batch processing
-- **Zstandard decompression**: Full support for both streaming and block compression
+- **Zstandard**: Full support for both streaming and block compression
 - **NCA encryption**: Supports CTR and BKTR encryption modes
 - **Integrity verification**: Validates NCA file hashes against CNMT records (per-partition for XCZ)
 - **Python nsz compatible**: Output matches Python nsz byte-for-byte
@@ -84,10 +84,9 @@ nsz-js/
 │   ├── aesctr.mjs          # AES-CTR mode (Node.js native crypto / Web Crypto API)
 │   ├── aesxts.mjs          # AES-XTS mode (NCA header key area decryption)
 │   ├── sha256.js           # SHA-256 hash function
-│   ├── zstd.js             # Zstandard decompression (uses zstddec WASM)
-│   └── zstddec-stream-wrapper.js  # WASM streaming decompression wrapper
+│   └── zstd.js             # Zstandard compress + decompress (tootallnate WASM / node:zlib)
 ├── static/                 # Static dependencies for browser (offline use)
-│   ├── zstddec.mjs         # WASM-based zstd decompression
+│   ├── zstd.wasm           # WASM zstd (compress + decompress), unmodified package copy
 │   └── prod.keys           # Nintendo Switch keys file
 ├── scripts/                 # Comparison, analysis, debugging, and benchmark scripts
 ├── test_*.mjs              # Test suites
@@ -121,12 +120,12 @@ nsz-js/
 - **crypto/aesctr.mjs** - AES-CTR encryption/decryption (Node.js native `crypto.createCipheriv` or browser Web Crypto API)
 - **crypto/aesxts.mjs** - AES-XTS encryption/decryption (NCA header key area unwrap)
 - **crypto/sha256.js** - Pure JavaScript SHA-256 implementation
-- **crypto/zstd.js** - Zstandard decompression using zstddec WASM library
+- **crypto/zstd.js** - Zstandard compress + decompress facade (browser: `@tootallnate/zstd-wasm` via `static/zstd.wasm`, true streaming; Node: native `node:zlib`)
 
 ### Dependencies
 
 **Browser (served from `static/` folder):**
-- **zstddec** ([GitHub](https://github.com/StadiA/zstddec), [npm](https://www.npmjs.com/package/zstddec)) - WASM-based zstd decompression. Handles any window size. Served from `static/zstddec.mjs`.
+- **@tootallnate/zstd-wasm** ([GitHub](https://github.com/TooTallNate/switch-tools), [npm](https://www.npmjs.com/package/@tootallnate/zstd-wasm)) - WASM-based zstd (one binary for both compression and decompression, true streaming API). Handles any window size. Served from `static/zstd.wasm`.
 
 ### Static Folder
 
@@ -134,12 +133,12 @@ The `static/` folder contains downloaded copies of browser dependencies for offl
 
 | File | Package | Version | Source |
 |------|---------|---------|--------|
-| `static/zstddec.mjs` | zstddec | 0.2.0 | Copied from `node_modules/zstddec/dist/zstddec-stream.modern.js`. Bundled into `out/app.mjs` by esbuild — no separate HTTP request at runtime. |
+| `static/zstd.wasm` | @tootallnate/zstd-wasm | 0.1.0 | Copied from `node_modules/@tootallnate/zstd-wasm/dist/zstd.wasm` (unmodified, 546,166 B). Fetched at runtime from `out/static/` (copied by `build.js`) — no CDN. |
 | `static/prod.keys` | - | - | Nintendo Switch keys file (user-provided) |
 
 AES-CTR uses native crypto — Node.js `crypto.createCipheriv` or browser Web Crypto API. No external AES library needed.
 
-To update dependencies: `npm install zstddec@x.x.x` then copy files to `static/`
+To update dependencies: `npm install @tootallnate/zstd-wasm@x.x.x` then `cp node_modules/@tootallnate/zstd-wasm/dist/zstd.wasm static/zstd.wasm`
 
 ### Test Files
 
@@ -270,8 +269,7 @@ The implementation includes full key derivation from prod.keys:
 - Web Crypto API support
 
 ### Node.js
-- Node.js 14+ with ES module support
-- `zstd` CLI binary in PATH (for streaming decompression) or falls back to zstddec WASM
+- Node.js 22.11+ with ES module support (native zstd in `node:zlib` for both compression and decompression — no CLI binary or WASM fallback needed)
 
 ## Implementation Notes
 

@@ -124,6 +124,32 @@ Reference `Little Nightmares II` (5.02 GiB NCZ): ~684 MB/s best-of-3 on the Node
 
 ---
 
+### verify_zstd.mjs (Node.js — zstd frame cross-validation)
+**Location:** `scripts/verify_zstd.mjs`
+**Purpose:** Cross-validates `crypto/zstd.js` frame inspection (`inspectFrame`) against the reference decoder (the `@tootallnate/zstd-wasm` streaming decoder — raw `ZSTD_decompressStream` via `decompress_stream`) for every zstd 1.5.7 frame header encoding: FCS field sizes 0/1/2/4 (size matrix 0 B → 1 MiB hitting each boundary), single/multi-segment, hand-built RLE/multi-block/window-descriptor/checksum frames, and negative cases (truncation, trailing garbage, two frames, skippable frame, reserved bit, zero-size compressed block, no last block, 2-byte RLE body). Also roundtrips the forced-WASM `compressBlock` output (multi-segment frames with no FCS) through both the wasm reference and the node:zlib decoders, and runs the forced-WASM `decompressStream` on every case.
+
+**How to run:**
+```bash
+node scripts/verify_zstd.mjs
+```
+
+74 checks; no external files needed (frames are synthesized in-process).
+
+---
+
+### verify_wasm_real_nsz.mjs (Node.js — forced-WASM real-file A/B)
+**Location:** `scripts/verify_wasm_real_nsz.mjs`
+**Purpose:** Decompresses a real `.nsz` through the **forced-WASM** path (the exact browser code path: a true streaming push through the tootallnate wasm decoder — `ZSTD_decompressStream` fed chunk by chunk, output yielded as produced) and proves byte-correctness — against an expected payload SHA-256 when given, or as an A/B against the native `node:zlib` path otherwise (payload = NCA bytes 0x4000..ncaSize, sections decrypted per the NCZSECTN table).
+
+**How to run:**
+```bash
+node scripts/verify_wasm_real_nsz.mjs path/to/file.nsz [expected-payload-sha256]
+```
+
+Reference `base.nsz` (streaming-mode NCZ, 406 MB compressed → 920 MB payload): forced-WASM ≡ node:zlib byte-identical, payload SHA-256 `22a105a2bd2527d2f6adafc2a1726f013fa327fe4ef43060b498c262b8480448` (~235 MB/s WASM, ~2.2 s node).
+
+---
+
 ### bench_own_bktr_phases.mjs (Node.js — Real-pipeline phase baseline)
 **Location:** `scripts/bench_own_bktr_phases.mjs`
 **Purpose:** Per-phase timing of the own-BKTR two-pass path (`fs/bktr-pack.js`) on the real Stardew NSZ, seekable-no-read (FSA-shaped) output. Uses the `setBktrPhaseHook` instrumentation hook added to `bktr-pack.js` (no-op unless set). **Mode-aware:** detects whether the seekable branch emits the Tier-1 single-pass layout (no Pass-1 sha phases — current, since #138) or the old two-walk layout, and prints a comparison against the committed #137 baseline. Unlike `test_twopass_fsa_sim.mjs` it does no byte-compare and uses a preallocated-doubling writable (the test's `FsaSim` regrows per write — O(n²) — inflating Pass 2: ~88–94 s vs ~10.2 s here). Output is an in-memory throwaway (never written to disk).
@@ -311,6 +337,8 @@ Analysis tools (persisted forensics): `scripts/diag_ln2_reloc.mjs` (LN2 reloc ta
 | PFS0 parsing | - | ✅ test_convert.mjs | - |
 | Ticket key analysis | - | ✅ test_ticket_keys.mjs | - |
 | AES-CTR + zstd | - | ✅ test_convert.mjs | - |
+| zstd frame inspection (all FCS encodings + negative cases) | - | ✅ verify_zstd.mjs (74 checks, wasm reference) | - |
+| forced-WASM (browser path) ≡ node:zlib on real NSZ | - | ✅ verify_wasm_real_nsz.mjs (A/B or expected hash) | ✅ Playwright smoke (fetch + roundtrip) |
 | NSP/XCI merge (union + dedup, XCI inputs) | ✅ FinalRom merger | ✅ CLI (synthetic NSP + XCI) | ✅ browser/Playwright |
 | NSZ/XCZ merge (NCZ decompression to .nca) | - | ✅ test_merge_ncz.mjs (streaming + NCZBLOCK) | ✅ browser/Playwright |
 | NSP split (CNMT grouping, per-title NSP) | ✅ FinalRom unmerger | ✅ CLI (synthetic NSP + real keys) | ✅ browser/Playwright |
@@ -375,6 +403,9 @@ node scripts/test-ncz.mjs
 
 # Truncated-container diagnostics (synthetic PFS0 + short NCA-header reads)
 node scripts/test_truncated_container.mjs
+
+# zstd frame cross-validation (74 checks, frames synthesized in-process)
+node scripts/verify_zstd.mjs
 ```
 
 ### Require NSZ file input:
@@ -387,6 +418,9 @@ node scripts/test_decompress.mjs input.nsz [working.nsp]
 
 # Ticket key and section analysis
 node scripts/test_ticket_keys.mjs input.nsz [working.nsp]
+
+# forced-WASM (browser code path) real-file verify: A/B vs node:zlib, or expected hash
+node scripts/verify_wasm_real_nsz.mjs path/to/file.nsz [expected-payload-sha256]
 ```
 
 ### Browser tests:

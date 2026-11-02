@@ -244,6 +244,12 @@ class NCZDecompressor {
         let pos = headerEnd;
         let toRead = remaining;
         let decompOffset = UNCOMPRESSABLE_HEADER_SIZE;
+        // The payload covers 0x4000..ncaSize, so its decompressed size is the
+        // sum of all section sizes = ncaSize - 0x4000. The strict WASM backend
+        // uses expectedSize to gate the output byte count exactly (the tootallnate
+        // frames here carry no content size — multi-segment, no FCS field);
+        // inputSize is the compressed payload length (an input upper-bound check).
+        // The Node backend ignores both hints.
         for await (const chunk of decompressStream(async () => {
             if (toRead <= 0) return null;
             const size = Math.min(toRead, READ_CHUNK_SIZE);
@@ -251,7 +257,7 @@ class NCZDecompressor {
             pos += data.length;
             toRead -= data.length;
             return data;
-        })) {
+        }, ncaSize - UNCOMPRESSABLE_HEADER_SIZE, remaining)) {
             decompOffset = await processChunk(chunk, decompOffset);
         }
     }
@@ -363,7 +369,7 @@ class AsyncBlockDecompressorReader {
         // no zstd decode is needed. The raw fast path returns the bytes
         // directly (no Promise), so it stays free of a per-block microtask.
         if (compressedSize < decompressedSize) {
-            this.currentBlock = await decompressBlock(compressedData);
+            this.currentBlock = await decompressBlock(compressedData, decompressedSize);
         } else {
             this.currentBlock = compressedData;
         }
