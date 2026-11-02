@@ -27,6 +27,20 @@
 // The [0x4000, firstSection) gap is plaintext; the decompressor inserts a
 // FakeSection for it, so the compressor writes only the real sections.
 //
+// ── Re-compression (.nsz/.xcz as compress input) ────────────────────────────
+// Python nsz does NOT re-compress (its compressors only accept .nsp/.xci; the
+// CLI skips isCompressedGame inputs) — this is our extension. .ncz members are
+// re-compressed with the SAME skip rules as .nca: their original NCA bytes are
+// presented by an NczNcaReader (fs/ncz.js) — raw 0x4000 header verbatim +
+// payload zstd-decompressed + re-encrypted per the member's own NCZSECTN
+// table — and run through the identical per-NCA pipeline (analyzeNca →
+// compressNcaToWriter). The member name stays .ncz; the CONTAINER file name
+// is <stem>_blockcomp<ext> / <stem>_solidcomp<ext> (compressedOutputName —
+// the same name EVERY compression output gets, so the output never collides
+// with the input or a Python-nsz <stem>.nsz in the same directory). The
+// output layout (level/block size/mode) comes from the CLI options, so
+// re-compression can change level, block size and mode.
+//
 // ── Skip rules (match python + keep the round-trip lossless) ───────────────
 //   - only PROGRAM(0) / PUBLIC_DATA(5) NCAs, size > 0x4000
 //   - "packed": the fs sections (fsType != NONE) are contiguous from the first
@@ -38,7 +52,7 @@
 
 import { compressBlock, createSolidCompressor } from '../crypto/zstd.js';
 import { isNode } from '../crypto/platform.js';
-import { UNCOMPRESSABLE_HEADER_SIZE, NCZ_CRYPTO_TYPE, NCZ_SECTN_ENTRY } from './ncz.js';
+import { UNCOMPRESSABLE_HEADER_SIZE, NCZ_CRYPTO_TYPE, NCZ_SECTN_ENTRY, NczNcaReader } from './ncz.js';
 import { readLeU64, writeU32LE, writeU64LE } from './bytes.js';
 import { NCAHeader, decryptNcaSection } from './nca.js';
 import {
@@ -89,6 +103,33 @@ export function normalizeCompressOptions(opts = {}) {
         throw new Error(`${ldm ? 'Long mode (LDM)' : 'Solid mode'} is CLI-only: ${ldm ? 'the browser zstd wasm exposes no compressor parameters' : 'solid mode is not wired into the browser path yet'}`);
     }
     return { level, blockSizeExponent, ldm, mode };
+}
+
+// Output file name for EVERY compression: <stem>_blockcomp<outExt> /
+// <stem>_solidcomp<outExt>. The derived-name convention of this project
+// (_merged / _updated), extended with the compression mode, so (a) a block
+// and a solid compression of the same input can coexist, (b) the output never
+// collides with the input or with a Python-nsz-produced <stem>.nsz in the
+// same directory, and (c) the file name states its layout. outExt defaults
+// to the input's own extension (re-compression: .nsz → .nsz).
+// Idempotent PER MODE on re-compression — a previous compression output
+// (.nsz/.xcz input) re-compressed in the same mode keeps its name (no
+// _blockcomp_blockcomp growth); switching modes yields the other name.
+// ldm/level/block size are payload parameters, not layout, so they don't
+// appear in the name.
+export function compressedOutputName(name, mode = 'block', outExt = '') {
+    const m = name.match(/^(.*?)(\.[^.]+)$/);
+    if (!m) return name;
+    let stem = m[1];
+    const inExt = m[2].toLowerCase();
+    const lower = stem.toLowerCase();
+    // The strip (idempotency) applies only when the input is itself a
+    // compression output (.nsz/.xcz) — a coincidental _blockcomp stem on a
+    // fresh .nsp/.xci input is part of the name and is kept.
+    if ((inExt === '.nsz' || inExt === '.xcz') && (lower.endsWith('_blockcomp') || lower.endsWith('_solidcomp'))) {
+        stem = stem.slice(0, -10);
+    }
+    return stem + (mode === 'solid' ? '_solidcomp' : '_blockcomp') + (outExt || m[2]);
 }
 
 // Raw NCA FsHeader crypto byte values (python nsz Type.Crypto numbering — this is
@@ -486,12 +527,25 @@ export async function compressNcaToBuffer(ncaReader, ncaSize, analysis, opts = {
 async function planMembers(files, { reader, keys, byRightsId, byTitleId, keep, log, labelOf = (f) => f.name }) {
     const plan = [];
     for (const f of files) {
-        if (!f.name.toLowerCase().endsWith('.nca')) {
+        const lower = f.name.toLowerCase();
+        let nczReader = null;   // .ncz members: a virtual NCA view over the NCZ
+        let ncaSize = f.size;
+        if (lower.endsWith('.ncz')) {
+            // Re-compression (our extension — python nsz never re-compresses):
+            // present the member's original NCA bytes through an NczNcaReader
+            // and run the identical per-NCA pipeline. Strict: a .ncz member
+            // that is not a valid NCZ throws, like the decompress path.
+            const scoped = { read: (offset, size) => reader.read(f.offset + offset, size), length: f.size };
+            nczReader = new NczNcaReader(scoped);
+            await nczReader.ensure();
+            ncaSize = nczReader.length; // the true NCA size, not the .ncz file size
+            log('info', `[RECOMPRESS] ${labelOf(f)}: .ncz member, NCA size ${ncaSize} (file ${f.size})`);
+        } else if (!lower.endsWith('.nca')) {
             plan.push({ file: f, compress: false, outName: f.name });
             continue;
         }
-        const memberReader = { read: (offset, size) => reader.read(f.offset + offset, size) };
-        const analysis = await analyzeNca(memberReader, f.size, keys);
+        const ncaReader = nczReader || { read: (offset, size) => reader.read(f.offset + offset, size) };
+        const analysis = await analyzeNca(ncaReader, ncaSize, keys);
 
         // Delta fragments (DATA NCAs) are dropped from the output unless keep
         // (python nsz default; --keep retains them for bit-identical output).
@@ -501,18 +555,30 @@ async function planMembers(files, { reader, keys, byRightsId, byTitleId, keep, l
             continue;
         }
 
+        const outName = nczReader ? f.name : f.name.replace(/\.nca$/i, '.ncz'); // .ncz stays .ncz
         if (analysis.compressible) {
-            plan.push({ file: f, compress: true, analysis, outName: f.name.replace(/\.nca$/i, '.ncz') });
+            plan.push({ file: f, compress: true, analysis, outName, ncaSize, nczReader });
         } else if (analysis.needsTitlekey) {
             // The NCA is otherwise fully compressible but its titlekey is not
-            // in the header key area (rights-managed). Resolve it from the
-            // container's tickets (the XCI db is global, across partitions);
-            // if no ticket matches, fail loudly rather than silently emit a
-            // bloated output with the NCA copied verbatim.
-            const resolved = await resolveTitlekeyFromTik(analysis, keys, byRightsId, byTitleId);
+            // in the header key area (rights-managed). For .ncz members the
+            // input's own NCZSECTN table carries the titlekey in every entry
+            // (python writes it into ALL entries, plaintext included) — it is
+            // the key the payload is encrypted with, so it is the only choice
+            // that guarantees a lossless round-trip; prefer it over the
+            // container's tickets (retail NSZs often carry no .tik at all).
+            // For .nca members resolve from the tickets (the XCI db is global,
+            // across partitions); if nothing matches, fail loudly rather than
+            // silently emit a bloated output with the NCA copied verbatim.
+            let resolved = null;
+            if (nczReader) {
+                const parsed = await nczReader.ensure();
+                const src = parsed.sections.find(s => s.cryptoKey && s.cryptoKey.some(b => b !== 0));
+                if (src) resolved = { titlekey: src.cryptoKey, tikName: `${f.name} section table` };
+            }
+            if (!resolved) resolved = await resolveTitlekeyFromTik(analysis, keys, byRightsId, byTitleId);
             if (resolved) {
                 log('info', `[TITLEKEY]   ${labelOf(f)}: from ${resolved.tikName}`);
-                plan.push({ file: f, compress: true, analysis: { ...analysis, compressible: true, needsTitlekey: false, titlekey: resolved.titlekey }, outName: f.name.replace(/\.nca$/i, '.ncz') });
+                plan.push({ file: f, compress: true, analysis: { ...analysis, compressible: true, needsTitlekey: false, titlekey: resolved.titlekey }, outName, ncaSize, nczReader });
             } else {
                 throw new Error(
                     `Missing title key for ${labelOf(f)} (titleId=${analysis.titleId}, rightsId=${analysis.rightsId}). ` +
@@ -578,13 +644,16 @@ export async function compressNSPtoNSZ(reader, output, options = {}) {
         const f = p.file;
         const writePos = dataStart + relPos;
         if (p.compress) {
-            log('info', `[COMPRESS]   ${f.name} → ${p.outName}`);
+            log('info', `[COMPRESS]   ${f.name} → ${p.outName}${p.nczReader ? ' (re-compress)' : ''}`);
             const t0 = performance.now();
+            // p.nczReader: the member is an .ncz — its original NCA bytes via
+            // the virtual reader, ncaSize from the parsed NCZSECTN table.
+            const ncaReader = p.nczReader || { read: (offset, size) => reader.read(f.offset + offset, size) };
+            const ncaSize = p.ncaSize ?? f.size;
             const nczSize = await compressNcaToWriter(
-                { read: (offset, size) => reader.read(f.offset + offset, size) },
-                f.size, p.analysis, compressOpts,
+                ncaReader, ncaSize, p.analysis, compressOpts,
                 (off, data) => adapter.write(writePos + off, data),
-                (frac) => progress(dataDone / totalInput + (frac * f.size) / totalInput, `Compressing ${f.name}...`),
+                (frac) => progress(dataDone / totalInput + (frac * ncaSize) / totalInput, `Compressing ${f.name}...`),
             );
             writer.add(p.outName, nczSize);
             relPos += nczSize;
@@ -733,13 +802,14 @@ export async function compressXCItoXCZ(reader, output, options = {}) {
             const f = p.file;
             const writePos = partStart + XCI_LAYOUT.PARTITION_HEADER_SIZE + relPos;
             if (p.compress) {
-                log('info', `[COMPRESS]   ${pi.entry.name}/${f.name} → ${p.outName}`);
+                log('info', `[COMPRESS]   ${pi.entry.name}/${f.name} → ${p.outName}${p.nczReader ? ' (re-compress)' : ''}`);
                 const t0 = performance.now();
+                const ncaReader = p.nczReader || { read: (offset, size) => reader.read(f.offset + offset, size) };
+                const ncaSize = p.ncaSize ?? f.size;
                 const nczSize = await compressNcaToWriter(
-                    { read: (offset, size) => reader.read(f.offset + offset, size) },
-                    f.size, p.analysis, compressOpts,
+                    ncaReader, ncaSize, p.analysis, compressOpts,
                     (off, data) => adapter.write(writePos + off, data),
-                    (frac) => progress(totalInput > 0 ? dataDone / totalInput + (frac * f.size) / totalInput : 1, `Compressing ${f.name}...`),
+                    (frac) => progress(totalInput > 0 ? dataDone / totalInput + (frac * ncaSize) / totalInput : 1, `Compressing ${f.name}...`),
                 );
                 p.outSize = nczSize;
                 relPos += nczSize;

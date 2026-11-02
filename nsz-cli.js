@@ -11,7 +11,7 @@ import { extractContentHashMap } from './fs/cnmt-hashes.js';
 import { mergeNSP as mergeNSPFile } from './fs/merge.js';
 import { splitNSP as splitNSPFile } from './fs/split.js';
 import { update as updateFile } from './fs/update.js';
-import { compressNSPtoNSZ as compressNSPtoNSZFile, compressXCItoXCZ as compressXCItoXCZFile } from './fs/compress.js';
+import { compressNSPtoNSZ as compressNSPtoNSZFile, compressXCItoXCZ as compressXCItoXCZFile, compressedOutputName } from './fs/compress.js';
 import { formatBytes } from './fs/format.js';
 
 class FileDescriptorReader extends DataReader {
@@ -119,7 +119,7 @@ async function main() {
         console.log('  node nsz-cli.js --merge <nsp|nsz|xci|xcz> <nsp|nsz|xci|xcz> [...] [options] merge NSPs/NSZs/XCIs/XCZs into one .nsp (base+update+dlc)');
         console.log('  node nsz-cli.js --update <base> <update> [options]   physically apply update to base: one patched program NCA, single .nsp (requires --keys)');
         console.log('  node nsz-cli.js --split <nsp> [keys.txt] [options]  split a merged NSP into one .nsp per title');
-        console.log('  node nsz-cli.js --compress <nsp|xci> [options]     compress .nsp -> .nsz or .xci -> .xcz (PROGRAM/PUBLIC_DATA NCAs to NCZ, zstd level 18, block mode; requires --keys)');
+        console.log('  node nsz-cli.js --compress <nsp|nsz|xci|xcz> [options] compress .nsp/.nsz -> .nsz or .xci/.xcz -> .xcz (PROGRAM/PUBLIC_DATA NCAs to NCZ, zstd level 18, block mode; output named <name>_blockcomp/<name>_solidcomp; .nsz/.xcz inputs re-compress their .ncz members; requires --keys)');
         console.log('');
         console.log('Input formats:');
         console.log('  .nsz   -> .nsp');
@@ -134,7 +134,7 @@ async function main() {
         console.log('  --keys <file>        Keys file (required for --split CNMT parsing and --compress NCA header decryption; used by decompress --verify for CNMT hash checks)');
         console.log('  -n, --nodelta        Exclude delta-fragment NCAs [merge]: drop NCAs referenced as DeltaFragment (ContentInfo type 6) in CNMTs (requires --keys)');
         console.log('  --update             Apply update to base physically: output a single .nsp with one patched program NCA');
-        console.log('  --compress           Compress .nsp -> .nsz / .xci -> .xcz: NCZ-compress PROGRAM/PUBLIC_DATA NCAs (zstd level 18, 1 MiB blocks, block mode by default), copy the rest; .xci: only the "secure" partition is compressed (matching Python nsz)');
+        console.log('  --compress           Compress .nsp/.nsz -> .nsz / .xci/.xcz -> .xcz: NCZ-compress PROGRAM/PUBLIC_DATA NCAs (zstd level 18, 1 MiB blocks, block mode by default), copy the rest; the output is named <name>_blockcomp.<ext> / <name>_solidcomp.<ext> (the mode in the name — the _merged/_updated convention, idempotent per mode), so in-place is safe and it never collides with a Python-nsz <name>.<ext>; an input already named with the same mode suffix is refused; .nsz/.xcz inputs re-compress their .ncz members (level/block size/mode can change — an extension, Python nsz never re-compresses); .xci: only the "secure" partition is compressed (matching Python nsz)');
         console.log('  -K, --keep           Keep delta-fragment NCAs in the compressed output [compress] (dropped by default, matching Python nsz)');
         console.log('  -l, --level <n>      zstd compression level 1-22 [compress] (default 18, matching Python nsz -l)');
         console.log('  -s, --bs <exp>       NCZ block size 2^exp, exp 14-32 [compress] (default 20 = 1 MiB, matching Python nsz -s); block mode only');
@@ -224,8 +224,8 @@ async function main() {
             process.exit(1);
         }
         const ext = path.extname(inputPath).toLowerCase();
-        if (ext !== '.nsp' && ext !== '.xci') {
-            console.error(`Error: --compress supports .nsp and .xci inputs only: ${inputPath}`);
+        if (ext !== '.nsp' && ext !== '.xci' && ext !== '.nsz' && ext !== '.xcz') {
+            console.error(`Error: --compress supports .nsp/.nsz and .xci/.xcz inputs: ${inputPath}`);
             process.exit(1);
         }
         if (solid && block) {
@@ -256,7 +256,7 @@ async function main() {
         }
         const input = openInputReader(inputPath);
         try {
-            if (ext === '.xci') await compressXCI(input, inputPath, outputDir, keys, compressOpts, overwrite, rmSource);
+            if (ext === '.xci' || ext === '.xcz') await compressXCI(input, inputPath, outputDir, keys, compressOpts, overwrite, rmSource);
             else await compressNSP(input, inputPath, outputDir, keys, compressOpts, overwrite, rmSource);
         } finally {
             fs.closeSync(input.fd);
@@ -455,9 +455,21 @@ async function updateNSPs(inputPaths, outputDir, overwrite, rmSource, keysPath, 
 async function runCompress(inFdInfo, inputPath, outputDir, keys, compressOpts, overwrite, rmSource, label, outExt, compressFile) {
     console.log(`=== COMPRESS ${label} ===`);
     console.log(`Options: level=${compressOpts.level ?? 18}, bs=2^${compressOpts.blockSizeExponent ?? 20}, long=${compressOpts.ldm ? 'yes' : 'no'}, mode=${compressOpts.mode}`);
-    const stem = path.basename(inputPath, path.extname(inputPath));
-    const outName = `${stem}${outExt}`;
+    // EVERY compression output is named <stem>_blockcomp<outExt> /
+    // <stem>_solidcomp<outExt> (compressedOutputName — the _merged/_updated
+    // derived-name convention + the mode), so writing next to the input is
+    // SAFE and the output never collides with a Python-nsz <stem>.nsz in the
+    // same directory.
+    const outName = compressedOutputName(path.basename(inputPath), compressOpts.mode, outExt);
     const outPath = outputDir ? path.join(outputDir, outName) : path.join(path.dirname(inputPath), outName);
+
+    // Backstop (pathological): the input is already named with this mode's
+    // re-compression suffix, so the idempotent name lands on the input itself
+    // — writing in place would truncate the input still being read.
+    if (path.resolve(outPath) === path.resolve(inputPath)) {
+        console.error(`Error: output ${outPath} would overwrite the input file — the input is already named ${outName}; rename it or use -o <dir> to place the output elsewhere.`);
+        process.exit(1);
+    }
 
     if (!overwrite && fs.existsSync(outPath)) {
         console.error(`Error: ${outPath} already exists. Use -w/--overwrite to overwrite.`);
@@ -499,13 +511,15 @@ async function runCompress(inFdInfo, inputPath, outputDir, keys, compressOpts, o
 }
 
 async function compressNSP(inFdInfo, inputPath, outputDir, keys, compressOpts, overwrite, rmSource) {
+    const re = path.extname(inputPath).toLowerCase() === '.nsz';
     await runCompress(inFdInfo, inputPath, outputDir, keys, compressOpts, overwrite, rmSource,
-        'NSP -> NSZ', '.nsz', compressNSPtoNSZFile);
+        re ? 'NSZ -> NSZ (re-compress)' : 'NSP -> NSZ', '.nsz', compressNSPtoNSZFile);
 }
 
 async function compressXCI(inFdInfo, inputPath, outputDir, keys, compressOpts, overwrite, rmSource) {
+    const re = path.extname(inputPath).toLowerCase() === '.xcz';
     await runCompress(inFdInfo, inputPath, outputDir, keys, compressOpts, overwrite, rmSource,
-        'XCI -> XCZ', '.xcz', compressXCItoXCZFile);
+        re ? 'XCZ -> XCZ (re-compress)' : 'XCI -> XCZ', '.xcz', compressXCItoXCZFile);
 }
 
 async function splitNSP(inFdInfo, inputPath, outputDir, keys, overwrite, rmSource) {

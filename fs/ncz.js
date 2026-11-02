@@ -355,6 +355,15 @@ function parseBlockSchedule(blockSizeExponent, numberOfBlocks, decompressedSize,
     return { sizes, relOffsets, blockSize, remainder };
 }
 
+function concatParts(parts) {
+    let total = 0;
+    for (const p of parts) total += p.length;
+    const out = new Uint8Array(total);
+    let o = 0;
+    for (const p of parts) { out.set(p, o); o += p.length; }
+    return out;
+}
+
 class AsyncBlockDecompressorReader {
     constructor(reader, baseOffset, blockSizeExponent, numberOfBlocks, decompressedSize, sizeListData) {
         this.reader = reader;
@@ -414,6 +423,254 @@ class AsyncBlockDecompressorReader {
 
     close() {
         // No resources to release
+    }
+}
+
+// ── Virtual NCA view over an NCZ (re-compression) ───────────────────────────
+// Presents the ORIGINAL NCA's bytes — the raw 0x4000 header verbatim + the
+// payload zstd-decompressed and re-encrypted per the NCZSECTN table — to code
+// that expects an NCA reader (fs/compress.js: analyzeNca, expandBktr,
+// fillPlaintextBlock), so an .ncz member can be re-compressed without ever
+// materializing the whole NCA.
+//
+// The compressor's read pattern is: raw header, one DEEP read (the BKTR
+// subsection table near the end of the payload), then a sequential walk from
+// 0x4000. The backward jump after the deep read is handled by restarting the
+// internal stream — block-mode frames are independent (the wanted frame is
+// just (re-)decompressed on demand, last one cached); the solid frame is
+// re-fed from its start. Memory is O(1 input block / output chunk).
+//
+// Re-encryption: ONE AesCtr per CTR/BKTR section (cheap small allocs),
+// seek()ed to the absolute NCA offset at the start of every sub-run — exactly
+// the keystream the decompressor re-applies (CTR encrypt == decrypt). Seeked
+// per sub-run, so discarded fast-forward chunks need no crypto at all.
+export class NczNcaReader extends DataReader {
+    constructor(reader) {
+        super();
+        this.reader = reader;
+        this._parsed = null;
+        this._sections = null;
+        this._schedule = null;    // block mode: { sizes, relOffsets, blockSize, remainder, baseOffset }
+        this._solid = false;
+        this._gen = null;         // solid mode: decompressStream generator
+        this._streamNext = 0;     // solid mode: NCA offset of the next chunk
+        this._filePos = 0;        // solid mode: compressed-input cursor
+        this._pending = null;     // { data, pos } — re-encrypted plaintext not yet served
+        this._lastBlock = -1;     // block mode: cached block index
+        this._lastBlockData = null;
+    }
+
+    // Parse the NCZSECTN table + payload layout (idempotent). Strict: a member
+    // named .ncz that is not a valid NCZ throws (same stance as the decompress
+    // path — a raw NCA under a .ncz name is an error, not a silent copy).
+    async ensure() {
+        if (this._parsed) return this._parsed;
+        const parsed = await parseNczSections(this.reader);
+        this._parsed = parsed;
+        this._sections = [...parsed.sections].sort((a, b) => a.offset - b.offset);
+        for (const s of this._sections) {
+            if (s.cryptoType === NCZ_CRYPTO_TYPE.CTR || s.cryptoType === NCZ_CRYPTO_TYPE.BKTR) {
+                s._ctr = new AesCtr(s.cryptoKey, s.cryptoCounter, 0, aesBackend());
+            }
+        }
+        const { headerEnd } = parsed;
+        if (headerEnd >= this.reader.length) return parsed; // header-only NCA, no payload
+        const magic = bytesToAscii(await this.reader.read(headerEnd, 8), 0, 8);
+        if (magic === 'NCZBLOCK') {
+            const bh = new NCZBlockHeader(await this.reader.read(headerEnd, 24), 0);
+            if (bh.blockSizeExponent < 14 || bh.blockSizeExponent > 32) {
+                throw new Error(`Corrupted NCZBLOCK header: Block size must be between 14 and 32, got ${bh.blockSizeExponent}`);
+            }
+            const sizeList = await this.reader.read(headerEnd + 24, bh.numberOfBlocks * 4);
+            this._schedule = {
+                ...parseBlockSchedule(bh.blockSizeExponent, bh.numberOfBlocks, bh.decompressedSize, sizeList),
+                baseOffset: headerEnd,
+            };
+        } else {
+            this._solid = true;
+            // First-pull cursor: the compressed frame starts at headerEnd
+            // (_resetSolid restores exactly this state on backward seeks).
+            this._filePos = headerEnd;
+            this._streamNext = UNCOMPRESSABLE_HEADER_SIZE;
+        }
+        return parsed;
+    }
+
+    // The VIRTUAL NCA size (the parsed sections' end), not the .ncz file size.
+    get length() {
+        return this._parsed ? this._parsed.ncaSize : this.reader.length;
+    }
+
+    // Read `size` bytes of the virtual NCA at absolute NCA offset.
+    async read(absOffset, size) {
+        await this.ensure();
+        const { ncaSize } = this._parsed;
+        if (size <= 0 || absOffset >= ncaSize) return new Uint8Array(0);
+        const end = Math.min(ncaSize, absOffset + size);
+        if (end <= UNCOMPRESSABLE_HEADER_SIZE) {
+            // Raw NCA header region — verbatim the .ncz's first 0x4000 bytes.
+            return await this.reader.read(absOffset, end - absOffset);
+        }
+        if (absOffset < UNCOMPRESSABLE_HEADER_SIZE) {
+            // Straddles the header/payload boundary.
+            const head = await this.reader.read(absOffset, UNCOMPRESSABLE_HEADER_SIZE - absOffset);
+            const tail = await this._readPayload(UNCOMPRESSABLE_HEADER_SIZE, end);
+            return concatParts([head, tail]);
+        }
+        return await this._readPayload(absOffset, end);
+    }
+
+    async _readPayload(off, end) {
+        if (this._schedule) return await this._readBlocks(off, end);
+        if (!this._solid) return new Uint8Array(0); // header-only NCZ
+        return await this._readSolid(off, end);
+    }
+
+    // ── Block mode: independent frames, decompressed on demand ───────────────
+    async _readBlocks(off, end) {
+        const { blockSize, sizes } = this._schedule;
+        const ncaSize = this._parsed.ncaSize;
+        const parts = [];
+        let pos = off;
+        while (pos < end) {
+            const i = Math.floor((pos - UNCOMPRESSABLE_HEADER_SIZE) / blockSize);
+            const blockStart = UNCOMPRESSABLE_HEADER_SIZE + i * blockSize;
+            const blockEnd = Math.min(blockStart + blockSize, ncaSize);
+            const plain = await this._blockPlain(i);
+            const take = Math.min(end, blockEnd) - pos;
+            parts.push(plain.subarray(pos - blockStart, pos - blockStart + take));
+            pos += take;
+        }
+        return parts.length === 1 ? parts[0] : concatParts(parts);
+    }
+
+    async _blockPlain(i) {
+        if (this._lastBlock === i) return this._lastBlockData;
+        const { blockSize, sizes, relOffsets, remainder, baseOffset } = this._schedule;
+        const compressedSize = sizes[i];
+        const dSize = (i === sizes.length - 1 && remainder > 0) ? remainder : blockSize;
+        let plain;
+        if (compressedSize < dSize) {
+            // A zstd frame — the raw-stored case can never be ≥ the plaintext.
+            const frame = await this.reader.read(baseOffset + relOffsets[i], compressedSize);
+            plain = await decompressBlock(frame, dSize);
+        } else {
+            // Stored raw (incompressible): the bytes ARE the plaintext.
+            plain = await this.reader.read(baseOffset + relOffsets[i], compressedSize);
+        }
+        plain = await this._reencrypt(plain, UNCOMPRESSABLE_HEADER_SIZE + i * blockSize);
+        this._lastBlock = i;
+        this._lastBlockData = plain;
+        return plain;
+    }
+
+    // ── Solid mode: one frame, re-fed from the start on backward seeks ───────
+    async _readSolid(off, end) {
+        const want = end - off;
+        // Position the internal stream at (or before) off.
+        if (this._pending && (off < this._pending.pos || off >= this._pending.pos + this._pending.data.length)) {
+            this._resetSolid();
+        } else if (!this._pending && this._gen && this._streamNext > off) {
+            this._resetSolid();
+        }
+        // Discard pending that lies wholly before off.
+        while (this._pending && this._pending.pos + this._pending.data.length <= off) this._pending = null;
+        if (this._pending) {
+            const skip = off - this._pending.pos;
+            if (skip > 0) this._pending = { data: this._pending.data.subarray(skip), pos: off };
+        }
+        // Fast-forward the stream to off. Whole chunks landing before off are
+        // discarded WITHOUT crypto (never served — the per-sub-run seek() makes
+        // skipping safe and saves a full AES pass); the one straddling chunk is
+        // re-encrypted — its [off, ...) tail becomes the served pending.
+        while (!this._pending && (!this._gen || this._streamNext < off)) {
+            const c = await this._solidPull(false);
+            if (!c) throw new Error('NCZ solid frame is shorter than the declared payload size');
+            if (c.pos + c.data.length <= off) continue; // whole chunk before off — discard
+            const enc = await this._reencrypt(c.data, c.pos);
+            this._pending = { data: enc.subarray(off - c.pos), pos: off };
+        }
+        const parts = [];
+        let got = 0;
+        while (got < want) {
+            if (this._pending) {
+                const take = Math.min(want - got, this._pending.data.length);
+                parts.push(this._pending.data.subarray(0, take));
+                got += take;
+                this._pending = take < this._pending.data.length
+                    ? { data: this._pending.data.subarray(take), pos: this._pending.pos + take }
+                    : null;
+                continue;
+            }
+            const c = await this._solidPull(true);
+            if (!c) throw new Error('NCZ solid frame is shorter than the declared payload size');
+            const take = Math.min(want - got, c.data.length);
+            parts.push(c.data.subarray(0, take));
+            got += take;
+            if (take < c.data.length) this._pending = { data: c.data.subarray(take), pos: c.pos + take };
+        }
+        return parts.length === 1 ? parts[0] : concatParts(parts);
+    }
+
+    _resetSolid() {
+        this._gen = null;
+        this._pending = null;
+        this._streamNext = UNCOMPRESSABLE_HEADER_SIZE;
+        this._filePos = this._parsed.headerEnd;
+    }
+
+    // Next chunk of the solid frame at this._streamNext (or null at end).
+    // doCrypto=false for fast-forward discards (never served — the per-sub-run
+    // seek() makes skipping crypto safe and saves a full AES pass).
+    async _solidPull(doCrypto) {
+        if (!this._gen) {
+            const headerEnd = this._parsed.headerEnd;
+            const inputSize = this.reader.length - headerEnd;
+            // expectedSize is authoritative (the tootallnate frames carry no
+            // content size) — the strict gate catches silent truncation.
+            this._gen = decompressStream(async () => {
+                if (this._filePos >= this.reader.length) return null;
+                const n = Math.min(READ_CHUNK_SIZE, this.reader.length - this._filePos);
+                const data = await this.reader.read(this._filePos, n);
+                this._filePos += data.length;
+                return data;
+            }, this._parsed.ncaSize - UNCOMPRESSABLE_HEADER_SIZE, inputSize);
+            this._streamNext = UNCOMPRESSABLE_HEADER_SIZE;
+        }
+        const next = await this._gen.next();
+        if (next.done) return null;
+        const pos = this._streamNext;
+        this._streamNext += next.value.length;
+        return { data: doCrypto ? await this._reencrypt(next.value, pos) : next.value, pos };
+    }
+
+    // Re-encrypt (CTR decrypt) a plaintext slice starting at absolute NCA
+    // offset `start`, per the NCZSECTN table. The sections cover [0x4000,
+    // ncaSize) contiguously (the parser inserts a FakeSection for the leading
+    // gap), so every byte belongs to exactly one section.
+    async _reencrypt(plain, start) {
+        const sections = this._sections;
+        let anyCtr = false;
+        for (const s of sections) if (s._ctr) { anyCtr = true; break; }
+        if (!anyCtr) return plain;
+        const out = new Uint8Array(plain.length);
+        let i = 0;
+        let si = 0;
+        while (i < plain.length) {
+            const pos = start + i;
+            while (si < sections.length - 1 && pos >= sections[si].offset + sections[si].size) si++;
+            const s = sections[si];
+            const take = Math.min(plain.length - i, s.offset + s.size - pos);
+            const slice = plain.subarray(i, i + take);
+            if (s._ctr) {
+                s._ctr.seek(pos);
+                out.set(await s._ctr.decrypt(slice), i);
+            } else {
+                out.set(slice, i);
+            }
+            i += take;
+        }
+        return out;
     }
 }
 

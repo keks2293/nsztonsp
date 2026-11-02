@@ -23,7 +23,7 @@ A **100% local** pure JavaScript converter for Nintendo Switch compressed game f
 
 1. Open `index.html` in a modern web browser
 2. Drag and drop files or click to select
-3. Pick the operation: **Decompress** (`.nsz`/`.xcz` → decompress), **Compress** (a single `.nsp`/`.xci` → `.nsz`/`.xcz`; requires keys — load them first; a **Keep Deltas** toggle retains delta fragments; a **Compression** row sets the zstd level 1-22 and the NCZ block size 64 KiB-16 MiB), **Merge** or **Update**
+3. Pick the operation: **Decompress** (`.nsz`/`.xcz` → decompress), **Compress** (a single `.nsp`/`.nsz`/`.xci`/`.xcz` → `.nsz`/`.xcz`; the output is named `<name>_blockcomp.<ext>` — the browser is block mode only; a `.nsz`/`.xcz` input is RE-COMPRESSED — its `.ncz` members are decompressed and re-compressed with the selected options; requires keys — load them first; a **Keep Deltas** toggle retains delta fragments; a **Compression** row sets the zstd level 1-22 and the NCZ block size 64 KiB-16 MiB), **Merge** or **Update**
 4. Click the operation button to run. Compress needs a seekable output — use File System or Blob download mode (SW streaming is refused with an actionable error)
 
 ### Node.js Version
@@ -33,7 +33,7 @@ node nsz-cli.js <input> [keys.txt] [options]          # decompress .nsz -> .nsp,
 node nsz-cli.js --merge <nsp|nsz|xci|xcz> [...]      # merge containers into one .nsp
 node nsz-cli.js --update <base> <update>             # physically apply update to base
 node nsz-cli.js --split <nsp>                        # split a merged NSP into one .nsp per title
-node nsz-cli.js --compress <nsp|xci>                 # compress .nsp -> .nsz / .xci -> .xcz (requires --keys)
+node nsz-cli.js --compress <nsp|nsz|xci|xcz>         # compress .nsp/.nsz -> .nsz / .xci/.xcz -> .xcz (requires --keys; output named <name>_blockcomp/<name>_solidcomp; .nsz/.xcz inputs re-compress their .ncz members)
 ```
 
 Options:
@@ -43,7 +43,7 @@ Options:
 - `--keys <path>` - Path to prod.keys file (required for `--split`/`--compress`; used by decompress verification for CNMT hash checks)
 - `--no-verify, -nv` - Skip SHA256 verification (faster) [decompress]
 - `--fix-padding, -p` - Use 0x20-byte alignment (default: reuse input string-table size, matching Python nsz) [decompress]
-- `--compress` - Compress PROGRAM/PUBLIC_DATA NCAs to NCZ (zstd level 18, 1 MiB blocks, block mode by default), copy the rest; for `.xci` only the "secure" partition is compressed (matching Python nsz)
+- `--compress` - Compress PROGRAM/PUBLIC_DATA NCAs to NCZ (zstd level 18, 1 MiB blocks, block mode by default), copy the rest; for `.xci` only the "secure" partition is compressed (matching Python nsz). The output is named `<name>_blockcomp.<ext>` / `<name>_solidcomp.<ext>` (the mode in the name — the `_merged`/`_updated` convention, idempotent per mode), so in-place is safe and it never collides with a Python-nsz `<name>.<ext>`; an input already named with the same mode suffix is refused. `.nsz`/`.xcz` inputs are re-compressed: their `.ncz` members run through the same pipeline with the selected level/block size/mode (an extension — Python nsz never re-compresses)
 - `-K, --keep` - Keep delta-fragment NCAs in the compressed output (dropped by default, matching Python nsz) [compress]
 - `-l, --level <n>` - zstd compression level 1-22 (default 18, matching Python nsz `-l`) [compress]
 - `-s, --bs <exp>` - NCZ block size 2^exp, exp 14-32 (default 20 = 1 MiB, matching Python nsz `-s`) [compress, block mode]

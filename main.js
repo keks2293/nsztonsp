@@ -1,6 +1,7 @@
 import { NSZConverter } from './converter.js';
 import { SWDownloader } from './sw-downloader.js';
 import { formatBytes } from './fs/format.js';
+import { compressedOutputName } from './fs/compress.js';
 
 // The SW stream is sequential and the main thread never observes the actual
 // delivered byte count — the success log shows the *expected* size. Compare the
@@ -140,10 +141,12 @@ async function main() {
             const lower = name.toLowerCase();
             return lower.endsWith('.nsp') || lower.endsWith('.nsz') || lower.endsWith('.xci') || lower.endsWith('.xcz');
         }
-        // split takes a single .nsp; compress takes a single .nsp or .xci
+        // split takes a single .nsp; compress takes a single .nsp/.nsz or .xci/.xcz
+        // (.nsz/.xcz inputs are re-compressed — their .ncz members run through
+        // the same per-NCA pipeline with new level/block size/mode options)
         if (mode === 'compress') {
             const lower = name.toLowerCase();
-            return lower.endsWith('.nsp') || lower.endsWith('.xci');
+            return lower.endsWith('.nsp') || lower.endsWith('.xci') || lower.endsWith('.nsz') || lower.endsWith('.xcz');
         }
         return name.toLowerCase().endsWith('.nsp');
     }
@@ -903,9 +906,31 @@ async function main() {
         const directoryHandle = await pickOrAbort();
         if (directoryHandle === 'ABORT') return;
 
-        const isXci = files[0].name.toLowerCase().endsWith('.xci');
-        const outputName = files[0].name.replace(/\.(nsp|xci)$/i, isXci ? '.xcz' : '.nsz');
+        const inputName = files[0].name.toLowerCase();
+        const isXci = inputName.endsWith('.xci') || inputName.endsWith('.xcz');
+        // The output is named <stem>_blockcomp<ext> (compressedOutputName —
+        // the same naming as the CLI; the browser is block mode only), so it
+        // never collides with the input in any download mode. The FSA check
+        // below is the backstop for the one remaining collision: the input
+        // itself already carries that suffix (the browser hides the input's
+        // path, so same-name + same-size in the picked directory is the only
+        // signal).
+        const reCompress = inputName.endsWith('.nsz') || inputName.endsWith('.xcz');
+        const outputName = compressedOutputName(files[0].name, 'block', isXci ? '.xcz' : '.nsz');
         const compressFn = isXci ? converter.compressXCItoXCZ.bind(converter) : converter.compressNSPtoNSZ.bind(converter);
+        if (reCompress) {
+            addLog('info', `Re-compression: .ncz members are decompressed and re-compressed with the selected options (output ${outputName}).`);
+            if (downloadMode === 'fsa' && directoryHandle) {
+                try {
+                    const existing = await (await directoryHandle.getFileHandle(outputName)).getFile();
+                    if (existing.size === files[0].size) {
+                        addLog('error', `Refusing: the output directory already contains ${outputName} (${formatBytes(existing.size)}) — same name and size as the input, so writing it would overwrite the input file. Rename the input or pick a different output directory.`);
+                        endRun();
+                        return;
+                    }
+                } catch { /* no file by that name — proceed */ }
+            }
+        }
         let writable = null;
         if (downloadMode === 'fsa') {
             const out = await openFSAOutput(outputName, directoryHandle);
