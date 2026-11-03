@@ -197,6 +197,19 @@ export function inspectFrame(data) {
 
 // ---------- raw-driver core ops (fresh context per op; `$` is the instance) ----------
 
+// Write the shared 6×u32 LE cursor struct (wrapper.c `JsBuf`) in place:
+// SRC, SRC_SIZE, SRC_POS, DST, DST_SIZE, and DST_POS reset to 0 (the driver
+// appends to DST_POS, so it must start empty on every call).
+function setCursor($, bufP, inP, size, srcPos, outP, outCap) {
+    const view = new DataView($.memory.buffer, bufP, BUF.SIZE);
+    view.setUint32(BUF.SRC, inP, true);
+    view.setUint32(BUF.SRC_SIZE, size, true);
+    view.setUint32(BUF.SRC_POS, srcPos, true);
+    view.setUint32(BUF.DST, outP, true);
+    view.setUint32(BUF.DST_SIZE, outCap, true);
+    view.setUint32(BUF.DST_POS, 0, true);
+}
+
 // Drive the compressor over one input slice (already copied into
 // [inP, inP+size)) with the given endOp (0 = continue, 2 = end), calling
 // onOutput with each non-empty Uint8Array view produced. Ported from
@@ -205,17 +218,11 @@ export function inspectFrame(data) {
 function runCompress($, cctx, inP, outP, bufP, outCap, size, endOp, onOutput) {
     let srcPos = 0;
     for (;;) {
-        let view = new DataView($.memory.buffer, bufP, BUF.SIZE);
-        view.setUint32(BUF.SRC, inP, true);
-        view.setUint32(BUF.SRC_SIZE, size, true);
-        view.setUint32(BUF.SRC_POS, srcPos, true);
-        view.setUint32(BUF.DST, outP, true);
-        view.setUint32(BUF.DST_SIZE, outCap, true);
-        view.setUint32(BUF.DST_POS, 0, true);
+        setCursor($, bufP, inP, size, srcPos, outP, outCap);
         const ret = $.compress_stream(cctx, bufP, endOp);
         checkError($, ret);
         // Memory may have grown — refresh the view before reading it back.
-        view = new DataView($.memory.buffer, bufP, BUF.SIZE);
+        const view = new DataView($.memory.buffer, bufP, BUF.SIZE);
         const dstPos = view.getUint32(BUF.DST_POS, true);
         if (dstPos > 0) onOutput(new Uint8Array($.memory.buffer, outP, dstPos));
         srcPos = view.getUint32(BUF.SRC_POS, true);
@@ -270,38 +277,6 @@ function compressWith($, data, level) {
     }
 }
 
-// Drive the decoder over one input slice (already copied into
-// [inP, inP+size)) until it is fully consumed, calling onOutput with each
-// non-empty Uint8Array view produced. Ported from @tootallnate/zstd-wasm (MIT),
-// tightened: a frame that ends before the slice is exhausted is trailing
-// garbage (the streaming path relies on this; the one-shot path is already
-// gated by inspectFrame). Views are re-acquired every iteration.
-function runDecompress($, dctx, inP, outP, bufP, outCap, size, onOutput) {
-    let srcPos = 0;
-    while (srcPos < size) {
-        let view = new DataView($.memory.buffer, bufP, BUF.SIZE);
-        view.setUint32(BUF.SRC, inP, true);
-        view.setUint32(BUF.SRC_SIZE, size, true);
-        view.setUint32(BUF.SRC_POS, srcPos, true);
-        view.setUint32(BUF.DST, outP, true);
-        view.setUint32(BUF.DST_SIZE, outCap, true);
-        view.setUint32(BUF.DST_POS, 0, true);
-        const ret = $.decompress_stream(dctx, bufP);
-        checkError($, ret);
-        // Memory may have grown — refresh the view before reading it back.
-        view = new DataView($.memory.buffer, bufP, BUF.SIZE);
-        const dstPos = view.getUint32(BUF.DST_POS, true);
-        if (dstPos > 0) onOutput(new Uint8Array($.memory.buffer, outP, dstPos));
-        const newSrcPos = view.getUint32(BUF.SRC_POS, true);
-        if (newSrcPos === srcPos && dstPos === 0) throw new Error('zstd: decoder made no progress');
-        srcPos = newSrcPos;
-        if (ret === 0) { // frame fully decoded
-            if (srcPos < size) throw new Error('zstd: trailing bytes after frame end');
-            break;
-        }
-    }
-}
-
 // One-shot decompress. expectedSize: the exact decompressed size (authoritative
 // container metadata); when 0, the frame's declared content size is the gate.
 // Fresh dctx, freed when done.
@@ -321,21 +296,29 @@ function decompressWith($, data, expectedSize = 0) {
         throw new Error('zstd wasm: failed to allocate streaming buffers');
     }
     try {
-        const parts = [];
+        // cap > 0 (the pipeline always passes the exact size — NCZ block
+        // size / solid payload): PREALLOCATE the output and copy each chunk
+        // straight into it — one copy per byte. drainDecode then yields raw
+        // heap views (copy = false), safe because this sync for-of consumes
+        // each view before the next wasm call (the only point where a heap
+        // growth detaches it). cap === 0 (size unknown — compat facade /
+        // tests) keeps the parts+assembly fallback.
+        const pre = cap > 0 ? new Uint8Array(cap) : null;
+        const parts = pre ? null : [];
         let total = 0;
-        const onOutput = (view) => {
-            const copy = new Uint8Array(view);
-            parts.push(copy);
-            total += copy.length;
-            if (cap > 0 && total > cap) throw new Error(`zstd: decompressed size exceeds expected (${cap})`);
-        };
         // Same inCap slicing rule as the compressor.
         for (let off = 0; off < data.length; off += inCap) {
             const take = Math.min(data.length - off, inCap);
             new Uint8Array($.memory.buffer).set(data.subarray(off, off + take), inP);
-            runDecompress($, dctx, inP, outP, bufP, outCap, take, onOutput);
+            for (const out of drainDecode($, dctx, inP, outP, bufP, outCap, take, pre === null)) {
+                if (cap > 0 && total + out.length > cap) throw new Error(`zstd: decompressed size exceeds expected (${cap})`);
+                if (pre) pre.set(out, total);
+                else parts.push(out);
+                total += out.length;
+            }
         }
         if (cap > 0 && total !== cap) throw new Error(`zstd: size mismatch (got ${total}, expected ${cap})`);
+        if (pre) return pre;
         const out = new Uint8Array(total);
         let o = 0;
         for (const p of parts) { out.set(p, o); o += p.length; }
@@ -489,7 +472,10 @@ async function* decompressNodeStream(readChunk) {
 //   comp.finish();                 // no more input
 //   await pump;                    // resolves when the frame is fully flushed
 // On error: comp.abort() to tear the compressor down, then rethrow.
-// Buffers are COPIED on write() — the caller may reuse its own buffers.
+// Buffers are NOT copied on write() — the caller must not mutate or reuse a
+// written buffer until the compressor consumes it (at most QUEUE_MAX = 8
+// chunks in flight); the production feed (fs/compress.js) allocates a fresh
+// buffer per chunk for exactly this reason.
 //
 // The producer (write) and the compressor are decoupled by a bounded queue
 // (QUEUE_MAX chunks, 16 MiB each by convention), so peak memory is
@@ -534,7 +520,9 @@ async function createNodeSolidCompressor({ level, ldm }) {
             });
             if (aborted) throw new Error('zstd solid compressor: aborted');
         }
-        queue.push(new Uint8Array(chunk)); // copy — the caller may reuse its buffer
+        queue.push(chunk); // NOT copied — the caller must not mutate/reuse
+                           // the buffer until the feed loop consumes it (at
+                           // most QUEUE_MAX chunks in flight)
         wake();
     };
 
@@ -670,7 +658,9 @@ async function createWasmSolidCompressor(level) {
             });
             if (aborted) throw new Error('zstd solid compressor: aborted');
         }
-        queue.push(new Uint8Array(chunk)); // copy — the caller may reuse its buffer
+        queue.push(chunk); // NOT copied — the caller must not mutate/reuse
+                           // the buffer until the feed loop consumes it (at
+                           // most QUEUE_MAX chunks in flight)
         wake();
     };
 
@@ -826,24 +816,25 @@ export async function* decompressStream(readChunk, expectedSize = 0, inputSize =
 }
 
 // Drain one inCap-sized slice (in [inP, inP+size)) through `dctx`, yielding
-// non-empty Uint8Array COPIES of the decompressed output. A sync generator:
-// the wasm calls are synchronous; the surrounding async generator interleaves
-// the readChunk() awaits between slices.
-function* drainDecode($, dctx, inP, outP, bufP, outCap, size) {
+// non-empty Uint8Arrays of the decompressed output. A sync generator: the
+// wasm calls are synchronous; the surrounding async generator interleaves the
+// readChunk() awaits between slices. copy (default): yield COPIES — the
+// stream consumer may hold a chunk across later wasm calls (and the SW output
+// adapter may transfer/detach it). copy = false: yield the raw HEAP VIEW —
+// the consumer must copy it out synchronously before the next iteration,
+// because the next wasm call's heap growth detaches it.
+function* drainDecode($, dctx, inP, outP, bufP, outCap, size, copy = true) {
     let srcPos = 0;
     while (srcPos < size) {
-        let view = new DataView($.memory.buffer, bufP, BUF.SIZE);
-        view.setUint32(BUF.SRC, inP, true);
-        view.setUint32(BUF.SRC_SIZE, size, true);
-        view.setUint32(BUF.SRC_POS, srcPos, true);
-        view.setUint32(BUF.DST, outP, true);
-        view.setUint32(BUF.DST_SIZE, outCap, true);
-        view.setUint32(BUF.DST_POS, 0, true);
+        setCursor($, bufP, inP, size, srcPos, outP, outCap);
         const ret = $.decompress_stream(dctx, bufP);
         checkError($, ret);
-        view = new DataView($.memory.buffer, bufP, BUF.SIZE);
+        const view = new DataView($.memory.buffer, bufP, BUF.SIZE);
         const dstPos = view.getUint32(BUF.DST_POS, true);
-        if (dstPos > 0) yield new Uint8Array($.memory.buffer, outP, dstPos).slice();
+        if (dstPos > 0) {
+            const chunk = new Uint8Array($.memory.buffer, outP, dstPos);
+            yield copy ? chunk.slice() : chunk;
+        }
         const newSrcPos = view.getUint32(BUF.SRC_POS, true);
         if (newSrcPos === srcPos && dstPos === 0) throw new Error('zstd: decoder made no progress');
         srcPos = newSrcPos;

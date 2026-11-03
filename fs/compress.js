@@ -448,10 +448,10 @@ export async function compressNcaToWriter(ncaReader, ncaSize, analysis, opts, wr
             let pos = UNCOMPRESSABLE_HEADER_SIZE;
             while (pos < ncaSize) {
                 const n = Math.min(CHUNK, ncaSize - pos);
-                // FRESH buffer per chunk: the memory output adapter references
-                // chunk buffers in place (no copy), and the compressor/queue
-                // hold the buffers past write() — a reused buffer would
-                // corrupt earlier output.
+                // FRESH buffer per chunk: createSolidCompressor does NOT copy
+                // on write() — its queue holds the buffer until the feed loop
+                // consumes it (up to QUEUE_MAX = 8 chunks in flight), so a
+                // reused or mutated buffer would corrupt the compressed output.
                 const buf = new Uint8Array(n);
                 runIdx = await fillPlaintextBlock(ncaReader, runs, pos, n, buf, runIdx);
                 await comp.write(buf);
